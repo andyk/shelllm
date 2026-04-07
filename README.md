@@ -9,7 +9,7 @@ ___        |  ___|| | | ||  ___|| | | |  |  \  /  |
 /__ /      |_____||_| |_||_____||_____|
 ```
 
-A recursive LLM that lives inside a bash shell. It thinks by writing code, runs it, sees the output, and iterates until it has an answer. Give it a task — it figures out the rest.
+A recursive LLM that lives inside a bash shell. It thinks by writing bash script, running it, looking the output, and iterating until it has an answer.
 
 ## How it works
 
