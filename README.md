@@ -16,7 +16,7 @@ A recursive LLM that lives inside a bash shell. It thinks by writing bash script
 shell<sup>LM</sup> runs a loop:
 
 1. Sends your context to Claude with a system prompt that says "write bash code"
-2. Claude responds with a `\`\`\`bash` code block
+2. Claude responds with a ` ```bash ` code block
 3. shell<sup>LM</sup> executes the code (in Docker if available, locally otherwise)
 4. Output streams back to Claude as the next message
 5. Repeat until the code sets `FINAL="answer"` or hits max iterations
