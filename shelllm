@@ -66,14 +66,16 @@ debug() {
 make_workspace_name() {
     local context="$1"
     local timestamp
-    timestamp=$(date +%Y-%m-%dT%H-%M-%S)
-    # Sanitize context: lowercase, spaces→hyphens, strip non-alnum/hyphens, collapse hyphens, truncate to 50 chars
+    timestamp=$(date +%Y-%m-%d-%H-%M-%S)
+    local rand
+    rand=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    # Sanitize context: lowercase, spaces→hyphens, strip non-alnum/hyphens, collapse hyphens, truncate to 70 chars
     local slug
-    slug=$(printf '%s' "$context" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-50)
+    slug=$(printf '%s' "$context" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-70)
     if [[ -z "$slug" ]]; then
         slug="unnamed"
     fi
-    echo "${timestamp}_${slug}"
+    echo "${timestamp}_${rand}_${slug}"
 }
 
 usage() {
@@ -92,10 +94,6 @@ Usage:
   shelllm [options] -f FILE [-f FILE...] context... Add file context
   echo data | shelllm [options] context...          Add stdin context
 
-Subcommands (used inside generated code):
-  shelllm query "context"                Recursive single-shot LLM call
-  shelllm query --fork-history "context" Fork conversation + workspace into sub-loop
-
 Options:
   -f FILE              Load context from file (can be repeated)
   -v, --verbose        Verbose/debug mode
@@ -104,10 +102,15 @@ Options:
   --max-iterations N   Max loop iterations (default: 25)
   --max-tokens N       Max tokens per response (default: 16000)
   --thinking-budget N  Extended thinking budget (default: 10000)
-  --max-depth N        Max recursion depth for --fork-history (default: 3)
+  --max-depth N        Max recursion depth for nested --fork calls (default: 3)
   --workspace DIR      Use specific workspace directory (preserved after run)
+  --fork               Fork current session history + workspace (only inside shelllm)
   --no-docker          Disable Docker execution even if available
   --docker-image IMAGE Docker image to use (default: ubuntu:latest)
+
+Session Management:
+  --continue "prompt"    Resume most recent session with new instruction
+  --start-from NAME "prompt"  Resume a specific session (prefix match, must be unique)
 
 Environment:
   ANTHROPIC_API_KEY        Required. Your Anthropic API key.
@@ -115,7 +118,7 @@ Environment:
   SHELLLM_MAX_ITERATIONS   Max loop iterations
   SHELLLM_MAX_TOKENS       Max tokens per response
   SHELLLM_THINKING_BUDGET  Extended thinking budget
-  SHELLLM_MAX_DEPTH        Max recursion depth
+  SHELLLM_MAX_DEPTH        Max recursion depth for nested --fork calls
   SHELLLM_DOCKER_IMAGE     Docker image to use
   SHELLLM_NO_DOCKER        Set to 1 to disable Docker
   SHELLLM_WORKSPACE        (Internal) Workspace directory for current session
@@ -212,7 +215,7 @@ docker_setup() {
         "$SHELLLM_DOCKER_IMAGE" \
         sleep infinity)
 
-    # Install essential tools as root (jq/curl for shelllm query, python3 for agent code)
+    # Install essential tools as root for shelllm and generated code.
     progress_dim "Installing tools in container..."
     docker exec --user 0:0 "$_SHELLLM_CONTAINER" \
         bash -c '
@@ -387,9 +390,13 @@ call_claude() {
     rm -f "$body_pipe" "$headers_file" "$http_code_file" "$err_file"
 
     if [[ "$curl_rc" -ne 0 ]]; then
-        # If we already captured a complete first code block, curl may exit with
-        # SIGPIPE because we intentionally stopped reading the stream early.
-        if [[ "$_code_fence_count" -ge 2 && "$curl_rc" -eq 56 ]]; then
+        # If we already captured a complete first code block, curl may exit
+        # non-zero because we intentionally stopped reading the stream early.
+        # Breaking from the read loop closes the FIFO → tee gets SIGPIPE and
+        # dies → curl's -o destination is gone → curl exits with either:
+        #   23 (CURLE_WRITE_ERROR) — can't write to dead process substitution
+        #   56 (CURLE_RECV_ERROR)  — network read failure (some curl versions)
+        if [[ "$_code_fence_count" -ge 2 && ( "$curl_rc" -eq 23 || "$curl_rc" -eq 56 ) ]]; then
             curl_rc=0
         fi
     fi
@@ -490,8 +497,8 @@ IMPORTANT: Respond with exactly ONE ```bash code block. Only the first block is 
 ## Available tools
 - Standard shell: cd, ls, grep, cat, rm, cp, mv, mkdir, echo, curl, find, etc.
 - Text processing: grep, awk, sed, wc, sort, uniq, head, tail, cut, tr, jq, etc.
-- `shelllm query "prompt"` — single-shot LLM call (no memory of current conversation)
-- `shelllm query --fork-history "prompt"` — fork conversation history + workspace into a sub-loop
+- `shelllm "prompt"` — start a fresh nested shelllm run
+- `shelllm --fork "prompt"` — fork the current conversation history + workspace into a sub-loop
 
 ## Signaling completion
 When you have the answer, set one of these in your bash code:
@@ -501,15 +508,14 @@ When you have the answer, set one of these in your bash code:
 ## Guidelines
 1. Think step by step. Use echo statements within your single script to document your reasoning.
 2. If stdin or files were provided, inspect `$CONTEXT` and `$FILE_CONTEXT1`, `$FILE_CONTEXT2`, etc. before searching elsewhere.
-3. Use `shelllm query "prompt"` for subtasks that need LLM reasoning — but be economical, each call costs money.
-4. Use `shelllm query --fork-history "prompt"` when the subtask needs full iteration capability and access to your current workspace state.
-5. Your code runs with `set -e` — commands that fail will stop execution. Use `|| true` if a command might fail acceptably.
-6. All code shares the same workspace directory ($SHELLLM_WORKSPACE). You can create temp files there.
-7. Start by inspecting the existing environment before making changes. Prefer repairing what is already there over creating a new mock setup.
-8. Do not create fake test environments, replacement sample files, or extra users/directories unless the task explicitly requires creating them.
-9. Make the smallest changes that solve the task, then verify against the real task files, commands, or constraints before setting `FINAL`.
-10. Do not print environment variables wholesale. Avoid `env`, `printenv`, or `set` unless the user explicitly asks for them.
-11. Never generate more than one code block. After your closing ```, STOP. Do not write anything else.
+3. Your code runs with `set -e` — commands that fail will stop execution. Use `|| true` if a command might fail acceptably.
+4. All code shares the same workspace directory ($SHELLLM_WORKSPACE). You can create temp files there.
+5. Start by inspecting the existing environment before making changes. Prefer repairing what is already there over creating a new mock setup.
+6. Do not create fake test environments, replacement sample files, or extra users/directories unless the task explicitly requires creating them.
+7. Make the smallest changes that solve the task, then verify against the real task files, commands, or constraints before setting `FINAL`.
+8. Do not print environment variables wholesale. Avoid `env`, `printenv`, or `set` unless the user explicitly asks for them.
+9. Use `shelllm --fork "prompt"` only when you need a nested run that inherits the current session history and workspace state.
+10. Never generate more than one code block. After your closing ```, STOP. Do not write anything else.
 SYSPROMPT
     fi
 
@@ -528,91 +534,79 @@ SYSPROMPT
 }
 
 # ---------------------------------------------------------------------------
-# Subcommand handlers
+# Session helpers
 # ---------------------------------------------------------------------------
 
-cmd_query() {
-    local fork_history=0
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --fork-history) fork_history=1; shift ;;
-            -*) die "Unknown query option: $1" ;;
-            *) break ;;
-        esac
-    done
-
-    local prompt="${1:?Usage: shelllm query [--fork-history] \"prompt\"}"
-
-    if [[ "$fork_history" -eq 1 ]]; then
-        cmd_query_fork "$prompt"
+find_workspace() {
+    local prefix="$1"
+    local runs_dir="$HOME/.shelllm/runs"
+    # Exact match
+    if [[ -d "$runs_dir/$prefix" ]]; then
+        echo "$runs_dir/$prefix"
+        return
+    fi
+    # Strict prefix match — must match exactly one
+    local matches
+    matches=$(ls -1 "$runs_dir" 2>/dev/null | grep "^${prefix}" || true)
+    local count
+    count=$(echo "$matches" | grep -c . 2>/dev/null || echo 0)
+    if [[ "$count" -eq 1 ]]; then
+        echo "$runs_dir/$matches"
+    elif [[ "$count" -gt 1 ]]; then
+        echo "Ambiguous prefix '$prefix' matches $count sessions:" >&2
+        echo "$matches" | head -5 >&2
+        return 1
     else
-        cmd_query_simple "$prompt"
+        return 1
     fi
 }
 
-cmd_query_simple() {
-    [[ -z "${SHELLLM_WORKSPACE:-}" ]] && die "SHELLLM_WORKSPACE not set (not inside a shelllm session)"
+run_forked_prompt() {
     local prompt="$1"
 
-    [[ -z "${ANTHROPIC_API_KEY:-}" ]] && die "ANTHROPIC_API_KEY is not set"
+    [[ -n "${SHELLLM_WORKSPACE:-}" ]] || die "--fork only works inside an existing shelllm session"
 
-    local messages_json
-    messages_json=$(jq -n --arg p "$prompt" '[{"role":"user","content":$p}]')
-
-    local result
-    result=$(call_claude "You are a helpful assistant. Answer concisely." "$messages_json")
-    echo "$result"
-}
-
-cmd_query_fork() {
-    [[ -z "${SHELLLM_WORKSPACE:-}" ]] && die "SHELLLM_WORKSPACE not set (not inside a shelllm session)"
-    local prompt="$1"
-
-    # Check depth limit
     local current_depth="${SHELLLM_DEPTH:-0}"
-    if [[ "$current_depth" -ge "$SHELLLM_MAX_DEPTH" ]]; then
-        die "Max recursion depth ($SHELLLM_MAX_DEPTH) reached. Cannot fork."
+    local max_depth="${SHELLLM_MAX_DEPTH:-3}"
+
+    if [[ "$current_depth" -ge "$max_depth" ]]; then
+        die "Max fork depth reached ($current_depth >= $max_depth)"
     fi
 
-    # Read parent's conversation history
-    local parent_messages="$SHELLLM_WORKSPACE/.messages.json"
-    if [[ ! -f "$parent_messages" ]]; then
-        die "No conversation history found (fork-history requires a running loop)"
-    fi
+    local parent_workspace="$SHELLLM_WORKSPACE"
+    local parent_messages="$parent_workspace/.messages.json"
+    [[ -f "$parent_messages" ]] || die "--fork requires existing conversation history in $parent_workspace"
 
-    local messages_json
-    messages_json=$(cat "$parent_messages")
+    # Create a proper run directory for the fork (nested under parent)
+    local runs_dir="$parent_workspace/.shelllm/sub-runs"
+    mkdir -p "$runs_dir"
+    local ws_name
+    ws_name=$(make_workspace_name "$prompt")
+    local fork_workspace="$runs_dir/$ws_name"
+    mkdir -p "$fork_workspace"
 
-    # Copy workspace to new tmpdir (fork state)
-    local fork_workspace
-    fork_workspace=$(mktemp -d)
-    cp -a "$SHELLLM_WORKSPACE/." "$fork_workspace/"
+    # Copy parent workspace contents into the new run (skip .shelllm to avoid
+    # recursive copy — fork workspace is nested under parent's .shelllm/sub-runs/)
+    for item in "$parent_workspace"/* "$parent_workspace"/.[!.]*; do
+        [[ -e "$item" ]] || continue
+        [[ "$(basename "$item")" == ".shelllm" ]] && continue
+        cp -R "$item" "$fork_workspace"/
+    done
     rm -f "$fork_workspace/.final"
-    rm -f "$fork_workspace/.messages.json"
 
-    # Append the new prompt to forked history
-    messages_json=$(echo "$messages_json" | jq --arg p "$prompt" \
-        '. + [{"role":"user","content":$p}]')
+    # Write info.yaml for the fork
+    mkdir -p "$fork_workspace/.shelllm"
+    printf 'forked: true\n' > "$fork_workspace/.shelllm/info.yaml"
 
-    debug "Forking at depth $current_depth → $((current_depth + 1)), workspace: $fork_workspace"
+    local fork_messages
+    fork_messages=$(jq --arg p "$prompt" '. + [{"role":"user","content":$p}]' "$parent_messages")
 
-    # Run forked loop with incremented depth
-    local result rc=0
-    result=$(
-        export SHELLLM_DEPTH=$((current_depth + 1))
-        export _SHELLLM_FORKED_MESSAGES="$messages_json"
-        export _SHELLLM_FORKED_WORKSPACE="$fork_workspace"
-        run_loop "$prompt"
-    ) || rc=$?
+    _SHELLLM_FORKED_WORKSPACE="$fork_workspace"
+    _SHELLLM_FORKED_MESSAGES="$fork_messages"
+    SHELLLM_DEPTH=$(( current_depth + 1 ))
+    export _SHELLLM_FORKED_WORKSPACE _SHELLLM_FORKED_MESSAGES SHELLLM_DEPTH
 
-    rm -rf "$fork_workspace"
-
-    if [[ "$rc" -ne 0 ]]; then
-        echo "shelllm fork failed (exit $rc)" >&2
-        return "$rc"
-    fi
-    echo "$result"
+    run_loop "$prompt"
 }
 
 # ---------------------------------------------------------------------------
@@ -625,8 +619,6 @@ run_loop() {
     local context_files=("$@")
     local num_files=${#context_files[@]}
 
-    # --- Fork-mode entry ---
-    local is_forked=0
     local workspace
     local messages_json
     local system_prompt
@@ -634,17 +626,24 @@ run_loop() {
     local stdin_context=""
     local -a file_contexts=()
 
-    if [[ -n "${_SHELLLM_FORKED_MESSAGES:-}" ]]; then
-        is_forked=1
-        workspace="${_SHELLLM_FORKED_WORKSPACE}"
-        messages_json="$_SHELLLM_FORKED_MESSAGES"
+    if [[ -n "${_SHELLLM_RESUME_WORKSPACE:-}" ]]; then
+        workspace="${_SHELLLM_RESUME_WORKSPACE}"
+        messages_json="${_SHELLLM_RESUME_MESSAGES}"
         export SHELLLM_WORKSPACE="$workspace"
-        unset _SHELLLM_FORKED_MESSAGES _SHELLLM_FORKED_WORKSPACE
-
-        # Build system prompt for forked loop (no context section — already in history)
-        system_prompt=$(build_system_prompt "" "$_SHELLLM_DOCKER_MODE")
-
-        progress "Forked sub-loop (depth: $SHELLLM_DEPTH, workspace: $workspace)"
+        unset _SHELLLM_RESUME_WORKSPACE _SHELLLM_RESUME_MESSAGES
+        system_prompt=$(build_system_prompt "" "${_SHELLLM_DOCKER_MODE:-0}")
+        banner
+        progress "Resuming session: $(basename "$workspace")"
+        printf '%s' "$messages_json" > "$workspace/.messages.json"
+    elif [[ -n "${_SHELLLM_FORKED_MESSAGES:-}" ]]; then
+        workspace="${_SHELLLM_FORKED_WORKSPACE}"
+        messages_json="${_SHELLLM_FORKED_MESSAGES}"
+        export SHELLLM_WORKSPACE="$workspace"
+        unset _SHELLLM_FORKED_WORKSPACE _SHELLLM_FORKED_MESSAGES
+        system_prompt=$(build_system_prompt "" "${_SHELLLM_DOCKER_MODE:-0}")
+        banner
+        progress "Forked sub-loop (depth: ${SHELLLM_DEPTH:-0}, workspace: $workspace)"
+        printf '%s' "$messages_json" > "$workspace/.messages.json"
     else
         # --- Normal entry ---
         banner
@@ -654,7 +653,13 @@ run_loop() {
             workspace="$_SHELLLM_WORKSPACE_USER"
             mkdir -p "$workspace"
         else
-            local runs_dir="$HOME/.shelllm/runs"
+            if [[ -n "${_SHELLLM_PARENT_RUN:-}" ]]; then
+                # Sub-run: nest inside parent workspace
+                local runs_dir="${_SHELLLM_PARENT_WORKSPACE}/.shelllm/sub-runs"
+            else
+                # Top-level run
+                local runs_dir="$HOME/.shelllm/runs"
+            fi
             mkdir -p "$runs_dir"
             local ws_name
             ws_name=$(make_workspace_name "$prompt")
@@ -663,6 +668,9 @@ run_loop() {
         fi
         export SHELLLM_WORKSPACE="$workspace"
         printf '%s\n' "$_SHELLLM_ORIGINAL_CMD" > "$workspace/.command"
+        # Record run metadata
+        mkdir -p "$workspace/.shelllm"
+        printf 'forked: false\n' > "$workspace/.shelllm/info.yaml"
         progress "Workspace: $workspace"
 
         # Load context into variables for env var passing
@@ -709,20 +717,14 @@ run_loop() {
 
         # Initialize conversation history
         messages_json=$(jq -n --arg p "$prompt" '[{"role":"user","content":$p}]')
+        printf '%s' "$messages_json" > "$workspace/.messages.json"
     fi
 
     # --- Cleanup trap ---
-    _cleanup_workspace="$workspace"
     _cleanup_docker="$docker_active"
-    _cleanup_forked="$is_forked"
     cleanup() {
         if [[ "${_cleanup_docker:-0}" -eq 1 ]]; then
             docker_teardown
-        fi
-        # Only delete forked workspaces (they're tmpdir clones that should be cleaned up)
-        # Normal and user-specified workspaces are preserved
-        if [[ "${_cleanup_forked:-0}" -eq 1 ]]; then
-            rm -rf "${_cleanup_workspace:-}"
         fi
     }
     trap cleanup EXIT
@@ -791,10 +793,12 @@ exit \$__shelllm_rc
             SHELLLM_THINKING_BUDGET="$SHELLLM_THINKING_BUDGET"
             SHELLLM_TRUNCATE="$SHELLLM_TRUNCATE"
             SHELLLM_API_URL="$SHELLLM_API_URL"
+            SHELLLM_NO_DOCKER="$(( _SHELLLM_DOCKER_MODE == 1 ? 1 : SHELLLM_NO_DOCKER ))"
+            SHELLLM_DOCKER_IMAGE="$SHELLLM_DOCKER_IMAGE"
             SHELLLM_DEPTH="$SHELLLM_DEPTH"
             SHELLLM_MAX_DEPTH="$SHELLLM_MAX_DEPTH"
-            SHELLLM_NO_DOCKER="$SHELLLM_NO_DOCKER"
-            SHELLLM_DOCKER_IMAGE="$SHELLLM_DOCKER_IMAGE"
+            _SHELLLM_PARENT_RUN="$(basename "$workspace")"
+            _SHELLLM_PARENT_WORKSPACE="$workspace"
             PATH="$(dirname "$shelllm_path"):$PATH"
         )
         if [[ -n "$stdin_context" ]]; then
@@ -875,7 +879,7 @@ exit \$__shelllm_rc
             --argjson result "$result_escaped" \
             '. + [{"role":"assistant","content":$assistant},{"role":"user","content":$result}]')
 
-        # Persist messages for --fork-history
+        # Persist messages for session resume
         printf '%s' "$messages_json" > "$workspace/.messages.json"
     done
 
@@ -891,7 +895,7 @@ exit \$__shelllm_rc
 main() {
     _SHELLLM_ORIGINAL_CMD="shelllm $*"
     local context_files=()
-    local subcmd=""
+    local fork_mode=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -932,6 +936,10 @@ main() {
                 _SHELLLM_WORKSPACE_USER="${2:?--workspace requires a value}"
                 shift 2
                 ;;
+            --fork)
+                fork_mode=1
+                shift
+                ;;
             --no-docker)
                 SHELLLM_NO_DOCKER=1
                 shift
@@ -940,10 +948,13 @@ main() {
                 SHELLLM_DOCKER_IMAGE="${2:?--docker-image requires a value}"
                 shift 2
                 ;;
-            query)
-                subcmd="query"
+            --continue)
+                _resume_mode="latest"
                 shift
-                break
+                ;;
+            --start-from)
+                _resume_mode="${2:?--start-from requires a session name}"
+                shift 2
                 ;;
             -*)
                 die "Unknown option: $1 (try shelllm --help)"
@@ -954,12 +965,44 @@ main() {
         esac
     done
 
-    if [[ "$subcmd" == "query" ]]; then
-        cmd_query "$@"
+    local prompt="$*"
+
+    if [[ "$fork_mode" -eq 1 ]]; then
+        [[ -z "$prompt" ]] && die "A prompt is required when forking (e.g. shelllm --fork \"investigate this\")"
+        run_forked_prompt "$prompt"
         return
     fi
 
-    local prompt="$*"
+    if [[ -n "${_resume_mode:-}" ]]; then
+        local ws
+        if [[ "$_resume_mode" == "latest" ]]; then
+            local runs_dir="$HOME/.shelllm/runs"
+            ws="$runs_dir/$(ls -1 "$runs_dir" 2>/dev/null | sort | tail -1)"
+            [[ ! -d "$ws" ]] && die "No past sessions found"
+        else
+            ws=$(find_workspace "$_resume_mode") || die "No matching session found: $_resume_mode"
+            [[ -z "$ws" ]] && die "No matching session found: $_resume_mode"
+        fi
+        [[ ! -f "$ws/.messages.json" ]] && die "No conversation history in: $(basename "$ws")"
+        [[ -z "$prompt" ]] && die "A prompt is required when resuming (e.g. shelllm --continue \"continue\")"
+        local messages
+        messages=$(cat "$ws/.messages.json")
+        # Merge with last user message to maintain alternating roles
+        local last_role
+        last_role=$(echo "$messages" | jq -r '.[-1].role')
+        if [[ "$last_role" == "user" ]]; then
+            messages=$(echo "$messages" | jq --arg p "$prompt" \
+                '.[-1].content = .[-1].content + "\n\n---\nNew instruction from user:\n" + $p')
+        else
+            messages=$(echo "$messages" | jq --arg p "$prompt" \
+                '. + [{"role":"user","content":$p}]')
+        fi
+        _SHELLLM_RESUME_WORKSPACE="$ws"
+        _SHELLLM_RESUME_MESSAGES="$messages"
+        run_loop "$prompt"
+        return
+    fi
+
     [[ -z "$prompt" ]] && { usage; }
 
     if [[ "${#context_files[@]}" -gt 0 ]]; then
