@@ -977,7 +977,7 @@ main() {
         local ws
         if [[ "$_resume_mode" == "latest" ]]; then
             local runs_dir="$HOME/.shelllm/runs"
-            ws="$runs_dir/$(ls -1 "$runs_dir" 2>/dev/null | sort | tail -1)"
+            ws="$runs_dir/$(ls -1t "$runs_dir" 2>/dev/null | head -1)"
             [[ ! -d "$ws" ]] && die "No past sessions found"
         else
             ws=$(find_workspace "$_resume_mode") || die "No matching session found: $_resume_mode"
