@@ -20,6 +20,7 @@ SHELLLM_NO_DOCKER="${SHELLLM_NO_DOCKER:-0}"
 SHELLLM_DEPTH="${SHELLLM_DEPTH:-0}"
 SHELLLM_MAX_DEPTH="${SHELLLM_MAX_DEPTH:-3}"
 VERBOSE=0
+QUIET=0
 
 # Internal state (not user-configurable)
 _SHELLLM_DOCKER_MODE=0
@@ -41,6 +42,7 @@ fi
 die() { echo "shelllm: error: $*" >&2; exit 1; }
 
 banner() {
+    [[ "$QUIET" -eq 1 ]] && return
     cat <<'BANNER' >&2
            ______  _   _  _____ _______   __    __
 ___        |  ___|| | | ||  ___|| | | |  |  \  /  |
@@ -54,8 +56,8 @@ BANNER
 }
 
 # Dim gray for debug, bold for status, colors for code/output
-progress() { echo -e "\033[1;34m▶ $*\033[0m" >&2; }
-progress_dim() { echo -e "\033[90m  $*\033[0m" >&2; }
+progress() { [[ "$QUIET" -eq 1 ]] && return; echo -e "\033[1;34m▶ $*\033[0m" >&2; }
+progress_dim() { [[ "$QUIET" -eq 1 ]] && return; echo -e "\033[90m  $*\033[0m" >&2; }
 
 debug() {
     if [[ "$VERBOSE" -eq 1 ]]; then
@@ -97,6 +99,7 @@ Usage:
 Options:
   -f FILE              Load context from file (can be repeated)
   -v, --verbose        Verbose/debug mode
+  -q, --quiet          Suppress all progress/streaming output (stderr), keep only final answer
   -h, --help           Show this help
   --model MODEL        Model to use (default: claude-opus-4-6)
   --max-iterations N   Max loop iterations (default: 25)
@@ -104,6 +107,7 @@ Options:
   --thinking-budget N  Extended thinking budget (default: 10000)
   --max-depth N        Max recursion depth for nested --fork calls (default: 3)
   --workspace DIR      Use specific workspace directory (preserved after run)
+  --system-prompt FILE Override the default system prompt with contents of FILE
   --fork               Fork current session history + workspace (only inside shelllm)
   --no-docker          Disable Docker execution even if available
   --docker-image IMAGE Docker image to use (default: ubuntu:latest)
@@ -119,6 +123,7 @@ Environment:
   SHELLLM_MAX_TOKENS       Max tokens per response
   SHELLLM_THINKING_BUDGET  Extended thinking budget
   SHELLLM_MAX_DEPTH        Max recursion depth for nested --fork calls
+  SHELLLM_SYSTEM_PROMPT    Override the default system prompt text
   SHELLLM_DOCKER_IMAGE     Docker image to use
   SHELLLM_NO_DOCKER        Set to 1 to disable Docker
   SHELLLM_WORKSPACE        (Internal) Workspace directory for current session
@@ -194,6 +199,8 @@ should_use_docker() {
 docker_setup() {
     local workspace="$1"
     local shelllm_path="$2"
+    shift 2
+    local context_files=("$@")
 
     progress "Setting up Docker container (image: $SHELLLM_DOCKER_IMAGE)..."
 
@@ -204,12 +211,32 @@ docker_setup() {
         docker pull "$SHELLLM_DOCKER_IMAGE" >/dev/null 2>&1
     fi
 
+    # Build mount flags for -f file directories
+    local -a extra_mounts=()
+    local -a seen_dirs=()
+    for f in "${context_files[@]+"${context_files[@]}"}"; do
+        local abs_path abs_dir
+        abs_path=$(realpath "$f")
+        abs_dir=$(dirname "$abs_path")
+        # Skip if under workspace (already mounted)
+        [[ "$abs_dir" == "$workspace"* ]] && continue
+        # Skip duplicates
+        local already=0
+        for d in "${seen_dirs[@]+"${seen_dirs[@]}"}"; do
+            [[ "$d" == "$abs_dir" ]] && { already=1; break; }
+        done
+        [[ "$already" -eq 1 ]] && continue
+        seen_dirs+=("$abs_dir")
+        extra_mounts+=(-v "$abs_dir:$abs_dir:ro")
+    done
+
     # Create and start container with workspace + shelllm mounted
     _SHELLLM_CONTAINER=$(docker run -d \
         --name "shelllm-$$" \
         --user "$(id -u):$(id -g)" \
         -v "$workspace:$workspace" \
         -v "$shelllm_path:/usr/local/bin/shelllm:ro" \
+        "${extra_mounts[@]+"${extra_mounts[@]}"}" \
         -w "$workspace" \
         -e "HOME=$workspace" \
         "$SHELLLM_DOCKER_IMAGE" \
@@ -342,20 +369,20 @@ call_claude() {
             *'"content_block_start"'*)
                 if [[ "$json" == *'"thinking"'* ]]; then
                     _stream_block="thinking"
-                    printf '\033[90m  ◐ Thinking...\n\033[0m' >&2
+                    [[ "$QUIET" -eq 0 ]] && printf '\033[90m  ◐ Thinking...\n\033[0m' >&2
                 elif [[ "$json" == *'"text"'* ]]; then
                     _stream_block="text"
                 fi
                 ;;
             *'"content_block_delta"'*)
                 if [[ "$_stream_block" == "thinking" ]]; then
-                    printf '%s' "$json" | jq -j '.delta.thinking // empty' >&2
+                    [[ "$QUIET" -eq 0 ]] && printf '%s' "$json" | jq -j '.delta.thinking // empty' >&2
                 elif [[ "$_stream_block" == "text" ]]; then
                     local _chunk
                     _chunk=$(printf '%s' "$json" | jq -j '.delta.text // empty')
                     if [[ -n "$_chunk" ]]; then
                         printf '%s' "$_chunk" >> "$text_file"
-                        printf '%s' "$_chunk" >&2
+                        [[ "$QUIET" -eq 0 ]] && printf '%s' "$_chunk" >&2
                         # Count ``` fences to detect when first code block closes.
                         # After 2 fences (open + close), stop reading — the first
                         # block is complete. Curl gets SIGPIPE and exits.
@@ -363,7 +390,7 @@ call_claude() {
                         _fence_matches=$(printf '%s' "$_chunk" | grep -c '```' || true)
                         _code_fence_count=$(( _code_fence_count + _fence_matches ))
                         if [[ $_code_fence_count -ge 2 ]]; then
-                            printf '\n' >&2
+                            [[ "$QUIET" -eq 0 ]] && printf '\n' >&2
                             break
                         fi
                     fi
@@ -371,7 +398,7 @@ call_claude() {
                 ;;
             *'"content_block_stop"'*)
                 if [[ -n "$_stream_block" ]]; then
-                    printf '\n' >&2
+                    [[ "$QUIET" -eq 0 ]] && printf '\n' >&2
                 fi
                 _stream_block=""
                 ;;
@@ -686,19 +713,24 @@ run_loop() {
             fi
         fi
 
-        # Read each -f file
+        # Read each -f file (resolve to absolute paths for Docker mount compatibility)
         local i=1
         if [[ "$num_files" -gt 0 ]]; then
+            local resolved_files=()
             for f in "${context_files[@]}"; do
+                local abs_path
+                abs_path=$(realpath "$f")
+                resolved_files+=("$abs_path")
                 local content
-                content=$(cat "$f")
+                content=$(cat "$abs_path")
                 file_contexts+=("$content")
                 local fc_chars=${#content}
-                progress "File context $i loaded: $f ($fc_chars chars)"
+                progress "File context $i loaded: $abs_path ($fc_chars chars)"
                 context_info="${context_info:+$context_info
-}- \$FILE_CONTEXT$i: $f ($fc_chars chars)"
+}- \$FILE_CONTEXT$i: $abs_path ($fc_chars chars)"
                 i=$((i + 1))
             done
+            context_files=("${resolved_files[@]}")
         fi
 
         # (no message needed when only inline context — the prompt is the context)
@@ -708,7 +740,7 @@ run_loop() {
         shelllm_path=$(realpath "$0")
 
         if should_use_docker; then
-            docker_setup "$workspace" "$shelllm_path"
+            docker_setup "$workspace" "$shelllm_path" "${context_files[@]+"${context_files[@]}"}"
             docker_active=1
         fi
 
@@ -739,7 +771,7 @@ run_loop() {
     while [[ "$iteration" -lt "$SHELLLM_MAX_ITERATIONS" ]]; do
         iteration=$((iteration + 1))
         debug "=== Iteration $iteration / $SHELLLM_MAX_ITERATIONS ==="
-        echo >&2
+        [[ "$QUIET" -eq 0 ]] && echo >&2
         progress "Iteration $iteration/$SHELLLM_MAX_ITERATIONS — calling Claude API..."
 
         # Call Claude
@@ -820,12 +852,14 @@ exit \$__shelllm_rc
                 local redacted_line
                 redacted_line=$(redact_sensitive "$line")
                 printf '%s\n' "$redacted_line" >> "$output_file"
-                if [[ "$redacted_line" == +* ]]; then
-                    # xtrace: show the command being run (cyan)
-                    printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
-                else
-                    # regular output (dim)
-                    printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
+                if [[ "$QUIET" -eq 0 ]]; then
+                    if [[ "$redacted_line" == +* ]]; then
+                        # xtrace: show the command being run (cyan)
+                        printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
+                    else
+                        # regular output (dim)
+                        printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
+                    fi
                 fi
             done
         exit_code=${PIPESTATUS[0]}
@@ -846,7 +880,7 @@ exit \$__shelllm_rc
 
         # Check for final answer
         if [[ -f "$workspace/.final" ]]; then
-            echo >&2
+            [[ "$QUIET" -eq 0 ]] && echo >&2
             progress "Final answer received"
             redact_sensitive "$(cat "$workspace/.final")"
             return 0
@@ -883,7 +917,7 @@ exit \$__shelllm_rc
         printf '%s' "$messages_json" > "$workspace/.messages.json"
     done
 
-    echo >&2
+    [[ "$QUIET" -eq 0 ]] && echo >&2
     progress "\033[1;31mMax iterations ($SHELLLM_MAX_ITERATIONS) reached without final answer\033[0m"
     return 1
 }
@@ -904,6 +938,10 @@ main() {
                 ;;
             -v|--verbose)
                 VERBOSE=1
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=1
                 shift
                 ;;
             -f)
@@ -934,6 +972,12 @@ main() {
                 ;;
             --workspace)
                 _SHELLLM_WORKSPACE_USER="${2:?--workspace requires a value}"
+                shift 2
+                ;;
+            --system-prompt)
+                local sp_file="${2:?--system-prompt requires a file path}"
+                [[ -f "$sp_file" ]] || die "System prompt file not found: $sp_file"
+                SHELLLM_SYSTEM_PROMPT=$(cat "$sp_file")
                 shift 2
                 ;;
             --fork)

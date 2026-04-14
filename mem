@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mem — CLI memory store
+# Stores memories as individual markdown files with YAML frontmatter.
+# Uses shelllm for semantic search. No databases — just files.
+
+# ---------------------------------------------------------------------------
+# Config & defaults
+# ---------------------------------------------------------------------------
+
+MEM_VERSION="0.1.0"
+MEM_DIR="${MEM_DIR:-./.memories}"
+VERBOSE=0
+MEM_TYPE="memory"
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+die() { echo "mem: error: $*" >&2; exit 1; }
+
+debug() {
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        printf '[mem debug] %s\n' "$*" >&2
+    fi
+}
+
+ensure_dir() {
+    mkdir -p "$MEM_DIR"
+}
+
+slugify() {
+    local text="$1"
+    printf '%s' "$text" \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr -cs 'a-z0-9' '-' \
+        | sed 's/^-//; s/-$//' \
+        | cut -c1-40
+}
+
+# Extract a field from YAML frontmatter.
+# Usage: frontmatter_field <file> <field>
+frontmatter_field() {
+    local file="$1" field="$2"
+    sed -n '/^---$/,/^---$/p' "$file" \
+        | grep "^${field}:" \
+        | head -1 \
+        | sed "s/^${field}:[[:space:]]*//" \
+        | sed "s/^[\"']\(.*\)[\"']$/\1/"
+}
+
+# Resolve a name/prefix to a memory file path.
+# Matches exact filename, then prefix/substring on slug portion.
+find_memory() {
+    local name="$1"
+
+    # Exact match (with .md)
+    [[ -f "$MEM_DIR/${name}.md" ]] && { echo "$MEM_DIR/${name}.md"; return; }
+
+    # Prefix/substring match
+    local matches
+    matches=$(ls -1 "$MEM_DIR"/*.md 2>/dev/null | xargs -I{} basename {} .md | grep "${name}" | head -2) || true
+    local count
+    count=$(printf '%s' "$matches" | grep -c . 2>/dev/null) || count=0
+
+    [[ "$count" -eq 1 ]] && { echo "$MEM_DIR/${matches}.md"; return; }
+    [[ "$count" -gt 1 ]] && die "Ambiguous: '$name' matches multiple memories"
+    die "Memory not found: $name"
+}
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+action_add() {
+    local text="$*"
+
+    # Read from stdin if no text arg
+    if [[ -z "$text" ]]; then
+        text=$(cat)
+        [[ -z "$text" ]] && die "No text provided"
+    fi
+
+    ensure_dir
+
+    local timestamp slug filename summary created
+    timestamp=$(date +%Y-%m-%d-%H-%M-%S)
+    slug=$(slugify "$text")
+    filename="${timestamp}_${slug}"
+    summary=$(printf '%s' "$text" | head -1 | cut -c1-80)
+    created=$(date +%Y-%m-%dT%H:%M:%S)
+
+    cat > "$MEM_DIR/${filename}.md" << EOF
+---
+summary: $summary
+type: $MEM_TYPE
+created: $created
+---
+
+$text
+EOF
+
+    debug "Created: $MEM_DIR/${filename}.md"
+    printf '%s\n' "$filename"
+}
+
+action_search() {
+    local query="$1"
+
+    local count
+    count=$(ls -1 "$MEM_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" -eq 0 ]] && { echo "No memories stored." >&2; return 0; }
+
+    # Concatenate all memories with filenames as headers and pipe to shelllm,
+    # so it works regardless of Docker sandboxing.
+    local memories=""
+    local f
+    for f in "$MEM_DIR"/*.md; do
+        memories+="=== $(basename "$f") ===
+$(cat "$f")
+
+"
+    done
+
+    printf '%s' "$memories" | shelllm --quiet "Here are memory files. Search them for: ${query}
+Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body.
+Return ONLY the filenames and summaries of semantically matching memories, one per line.
+If nothing matches, say 'No matches found.'"
+}
+
+action_list() {
+    local count
+    count=$(ls -1 "$MEM_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ') || count=0
+    [[ "$count" -eq 0 ]] && { echo "No memories stored." >&2; return 0; }
+
+    local f base date slug
+    for f in "$MEM_DIR"/*.md; do
+        base=$(basename "$f" .md)
+        date="${base%%_*}"
+        slug="${base#*_}"
+        printf '%s  %s\n' "$date" "$slug"
+    done
+}
+
+action_dump() {
+    local count
+    count=$(ls -1 "$MEM_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ') || count=0
+    [[ "$count" -eq 0 ]] && { echo "No memories stored." >&2; return 0; }
+
+    local f summary
+    for f in "$MEM_DIR"/*.md; do
+        summary=$(frontmatter_field "$f" "summary")
+        [[ -n "$summary" ]] && printf -- '- %s\n' "$summary"
+    done
+}
+
+action_forget() {
+    local name="$1"
+    local file
+    file=$(find_memory "$name")
+
+    debug "Deleting: $file"
+    rm "$file"
+    echo "Forgotten: $(basename "$file" .md)" >&2
+}
+
+action_edit() {
+    local name="$1"; shift
+    local file
+    file=$(find_memory "$name")
+
+    local text="$*"
+    if [[ -z "$text" ]]; then
+        text=$(cat)
+        [[ -z "$text" ]] && die "No text provided"
+    fi
+
+    local now
+    now=$(date +%Y-%m-%dT%H:%M:%S)
+
+    # Extract frontmatter fields
+    local summary type created
+    summary=$(frontmatter_field "$file" "summary")
+    type=$(frontmatter_field "$file" "type")
+    created=$(frontmatter_field "$file" "created")
+
+    # Build updated: field — collect existing entries and append new one
+    local updated_block=""
+    local existing_updated
+    existing_updated=$(sed -n '/^---$/,/^---$/p' "$file" | grep "^updated:" | sed 's/^updated:[[:space:]]*//' || true)
+    local existing_list
+    existing_list=$(sed -n '/^---$/,/^---$/p' "$file" | grep "^  - " || true)
+
+    if [[ -n "$existing_list" ]]; then
+        # Already a list — append
+        updated_block=$(printf 'updated:\n%s\n  - %s' "$existing_list" "$now")
+    elif [[ -n "$existing_updated" ]]; then
+        # Single value — convert to list
+        updated_block=$(printf 'updated:\n  - %s\n  - %s' "$existing_updated" "$now")
+    else
+        # No updated field yet
+        updated_block=$(printf 'updated: %s' "$now")
+    fi
+
+    # Reconstruct the file
+    cat > "$file" << EOF
+---
+summary: $summary
+type: $type
+created: $created
+$updated_block
+---
+
+$text
+EOF
+
+    debug "Updated: $file"
+    echo "Updated: $(basename "$file" .md)" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+mem — CLI memory store
+
+Usage:
+  mem add [--type TYPE] <text>   Add a memory (or pipe text via stdin)
+  mem search <query>             Semantic search via shelllm
+  mem list                       List memories (dates + slugs)
+  mem dump                       List all memory summaries
+  mem forget <name>              Delete a memory by name/prefix
+  mem edit <name> <text>         Update a memory's body (or pipe via stdin)
+
+Types:
+  todo, objective, value, belief, fact, preference, note (default: note)
+
+Options:
+  --dir DIR          Override memory directory (default: ./.memories)
+  -v, --verbose      Verbose/debug mode
+  -h, --help         Show help
+  --version          Show version
+
+Environment:
+  MEM_DIR   Override memory directory (default: ./.memories)
+EOF
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing & dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+    # Parse global flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                ;;
+            --version)
+                echo "mem $MEM_VERSION"
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --dir)
+                MEM_DIR="${2:?--dir requires a path}"
+                shift 2
+                ;;
+            -*)
+                # Could be --type inside add, so break and let subcommand handle
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    local cmd="${1:-}"
+    [[ -n "$cmd" ]] && shift
+
+    case "$cmd" in
+        add)
+            # Parse --type flag
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --type)
+                        MEM_TYPE="${2:?--type requires a value}"
+                        shift 2
+                        ;;
+                    *)
+                        break
+                        ;;
+                esac
+            done
+            action_add "$@"
+            ;;
+        search)
+            [[ $# -lt 1 ]] && die "Usage: mem search <query>"
+            action_search "$*"
+            ;;
+        list)
+            action_list
+            ;;
+        dump)
+            action_dump
+            ;;
+        forget)
+            [[ $# -lt 1 ]] && die "Usage: mem forget <name>"
+            action_forget "$1"
+            ;;
+        edit)
+            [[ $# -lt 1 ]] && die "Usage: mem edit <name> [text]"
+            local name="$1"; shift
+            action_edit "$name" "$@"
+            ;;
+        "")
+            usage
+            ;;
+        *)
+            die "Unknown command: $cmd (try mem --help)"
+            ;;
+    esac
+}
+
+main "$@"
