@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# skills — Skills manager for shelllm
+# Manages a local directory of skills following the Agent Skills open
+# standard (SKILL.md format). Pure bash, no external dependencies beyond
+# bash 4+, jq, curl, and git.
+
+# ---------------------------------------------------------------------------
+# Config & defaults
+# ---------------------------------------------------------------------------
+
+SKILLS_VERSION="0.1.0"
+SKILLS_DIR="${SKILLS_DIR:-$HOME/.skills}"
+VERBOSE=0
+
+# Load .env if present
+if [[ -f ".env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+die() { echo "skills: error: $*" >&2; exit 1; }
+
+# Color output (respects NO_COLOR env var)
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    _bold='\033[1m'
+    _dim='\033[90m'
+    _blue='\033[1;34m'
+    _cyan='\033[36m'
+    _reset='\033[0m'
+else
+    _bold='' _dim='' _blue='' _cyan='' _reset=''
+fi
+
+info() { printf "${_blue}▶${_reset} %b\n" "$*" >&2; }
+dim() { printf "${_dim}  %s${_reset}\n" "$*" >&2; }
+
+debug() {
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        printf "${_dim}[skills debug] %s${_reset}\n" "$*" >&2
+    fi
+}
+
+# Extract a field from SKILL.md YAML frontmatter.
+# Usage: frontmatter_field <file> <field>
+# Handles unquoted, double-quoted, and single-quoted values.
+frontmatter_field() {
+    local file="$1" field="$2"
+    sed -n '/^---$/,/^---$/p' "$file" \
+        | grep "^${field}:" \
+        | sed "s/^${field}:[[:space:]]*//" \
+        | sed "s/^[\"']\(.*\)[\"']$/\1/"
+}
+
+# Resolve the skills directory (project-level or global).
+skills_dir() {
+    local project="${1:-0}"
+    if [[ "$project" -eq 1 ]]; then
+        echo ".skills"
+    else
+        echo "$SKILLS_DIR"
+    fi
+}
+
+# Find a skill directory by name. Checks project-level first, then global.
+# Matches against the frontmatter `name` field, then the directory name.
+# Prints the path to stdout, or returns 1 if not found.
+find_skill() {
+    local name="$1"
+    local dir skill_dir skill_name
+
+    for dir in ".skills" "$SKILLS_DIR"; do
+        [[ -d "$dir" ]] || continue
+
+        # Match by directory name
+        if [[ -d "$dir/$name" && -f "$dir/$name/SKILL.md" ]]; then
+            echo "$dir/$name"
+            return
+        fi
+
+        # Match by frontmatter name field
+        for skill_dir in "$dir"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            skill_name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
+            if [[ "$skill_name" == "$name" ]]; then
+                printf '%s' "${skill_dir%/}"
+                return
+            fi
+        done
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+action_list() {
+    local found=0
+    local dir label skill_dir name desc
+
+    for dir_info in ".skills:project" "$SKILLS_DIR:global"; do
+        dir="${dir_info%%:*}"
+        label="${dir_info##*:}"
+        [[ -d "$dir" ]] || continue
+
+        for skill_dir in "$dir"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            found=1
+
+            name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
+            desc=$(frontmatter_field "${skill_dir}SKILL.md" "description")
+            [[ -z "$name" ]] && name=$(basename "$skill_dir")
+            [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
+
+            printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n" \
+                "$name" "${_dim}${desc}" "$label"
+        done
+    done
+
+    if [[ "$found" -eq 0 ]]; then
+        echo "No skills installed." >&2
+        printf "  Run ${_bold}skills --init${_reset} to create one, or ${_bold}skills <query>${_reset} to search.\n" >&2
+    fi
+}
+
+action_list_json() {
+    local dir skill_dir name desc body
+    local first=1
+
+    printf '['
+    for dir in ".skills" "$SKILLS_DIR"; do
+        [[ -d "$dir" ]] || continue
+        for skill_dir in "$dir"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
+            desc=$(frontmatter_field "${skill_dir}SKILL.md" "description")
+            [[ -z "$name" ]] && name=$(basename "$skill_dir")
+            body=$(sed -n '/^---$/,/^---$/d; p' "${skill_dir}SKILL.md")
+
+            [[ "$first" -eq 1 ]] && first=0 || printf ','
+            jq -n --arg n "$name" --arg d "$desc" --arg b "$body" \
+                '{name: $n, description: $d, instructions: $b}'
+        done
+    done
+    printf ']\n'
+}
+
+action_search() {
+    local query="$1"
+    local found_local=0
+    local dir skill_dir name desc
+
+    # --- Local matches ---
+    printf "${_bold}Installed${_reset}\n"
+
+    for dir in ".skills" "$SKILLS_DIR"; do
+        [[ -d "$dir" ]] || continue
+        for skill_dir in "$dir"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
+            desc=$(frontmatter_field "${skill_dir}SKILL.md" "description")
+            [[ -z "$name" ]] && name=$(basename "$skill_dir")
+
+            if printf '%s %s' "$name" "$desc" | grep -qi "$query"; then
+                found_local=1
+                printf "  ${_bold}%-20s${_reset} %s\n" "$name" "$desc"
+            fi
+        done
+    done
+
+    [[ "$found_local" -eq 0 ]] && printf "  ${_dim}No local matches.${_reset}\n"
+    echo ""
+
+    # --- Remote matches (GitHub) ---
+    printf "${_bold}Available${_reset}\n"
+
+    local encoded_query
+    encoded_query=$(printf '%s' "$query" | jq -sRr @uri)
+    local api_url="https://api.github.com/search/repositories?q=${encoded_query}+filename:SKILL.md&per_page=10&sort=stars&order=desc"
+    debug "GitHub API: $api_url"
+
+    local response
+    response=$(curl -sS --max-time 10 "$api_url" 2>/dev/null) || {
+        printf "  ${_dim}GitHub search failed (network error).${_reset}\n"
+        return 0
+    }
+
+    local api_msg
+    api_msg=$(printf '%s' "$response" | jq -r '.message // empty' 2>/dev/null)
+    if [[ -n "$api_msg" ]]; then
+        printf "  ${_dim}GitHub API: %s${_reset}\n" "$api_msg"
+        return 0
+    fi
+
+    local count
+    count=$(printf '%s' "$response" | jq '.items | length' 2>/dev/null) || count=0
+
+    if [[ "$count" -eq 0 ]]; then
+        printf "  ${_dim}No remote matches.${_reset}\n"
+        return 0
+    fi
+
+    printf '%s' "$response" | jq -r '.items[] | "\(.full_name)\t\(.description // "—")\t★ \(.stargazers_count)\t\(.html_url)"' \
+        | while IFS=$'\t' read -r repo rdesc stars url; do
+            [[ ${#rdesc} -gt 50 ]] && rdesc="${rdesc:0:47}..."
+            printf "  ${_bold}%-30s${_reset} %-50s ${_dim}%s${_reset}\n" "$repo" "$rdesc" "$stars"
+            dim "  $url"
+        done
+}
+
+action_install() {
+    local source="$1"
+    local project="$2"
+    local target_dir
+    target_dir=$(skills_dir "$project")
+    mkdir -p "$target_dir"
+
+    local skill_src=""
+    local cloned=0
+
+    if [[ -d "$source" ]]; then
+        # --- Local path ---
+        [[ -f "$source/SKILL.md" ]] || die "No SKILL.md found in: $source"
+        skill_src="$source"
+    else
+        # --- GitHub (shorthand or URL) ---
+        local repo_url="$source"
+        if [[ "$source" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+            repo_url="https://github.com/$source"
+        fi
+        [[ "$repo_url" =~ ^https?://github\.com/ ]] || die "Invalid source: $source (expected owner/repo, GitHub URL, or local path)"
+
+        skill_src=$(mktemp -d)
+        cloned=1
+
+        info "Cloning $repo_url..."
+        git clone --depth 1 --quiet "$repo_url" "$skill_src" 2>/dev/null \
+            || { rm -rf "$skill_src"; die "Failed to clone: $repo_url"; }
+
+        [[ -f "$skill_src/SKILL.md" ]] || { rm -rf "$skill_src"; die "No SKILL.md found in repository: $repo_url"; }
+    fi
+
+    # Read skill metadata
+    local skill_name skill_desc
+    skill_name=$(frontmatter_field "$skill_src/SKILL.md" "name")
+    skill_desc=$(frontmatter_field "$skill_src/SKILL.md" "description")
+    [[ -z "$skill_name" ]] && skill_name=$(basename "$source" .git)
+
+    local install_dir="$target_dir/$skill_name"
+    if [[ -d "$install_dir" ]]; then
+        [[ "$cloned" -eq 1 ]] && rm -rf "$skill_src"
+        die "Skill '$skill_name' already installed at: $install_dir"
+    fi
+
+    if [[ "$cloned" -eq 1 ]]; then
+        mv "$skill_src" "$install_dir"
+    else
+        cp -R "$source" "$install_dir"
+    fi
+
+    rm -rf "$install_dir/.git"
+
+    info "Installed: ${_bold}$skill_name${_reset}"
+    [[ -n "$skill_desc" ]] && dim "$skill_desc"
+}
+
+action_remove() {
+    local name="$1"
+    local force="$2"
+
+    local skill_dir
+    skill_dir=$(find_skill "$name") || die "Skill not found: $name"
+
+    if [[ "$force" -eq 0 ]]; then
+        printf "Remove skill '%s' from %s? [y/N] " "$name" "$skill_dir" >&2
+        local reply
+        read -r reply
+        [[ "$reply" =~ ^[Yy]$ ]] || { echo "Cancelled." >&2; return 0; }
+    fi
+
+    rm -rf "$skill_dir"
+    info "Removed: $name"
+}
+
+action_show() {
+    local name="$1"
+
+    local skill_dir
+    skill_dir=$(find_skill "$name") || die "Skill not found: $name"
+    cat "$skill_dir/SKILL.md"
+}
+
+action_init() {
+    local name="$1"
+    local desc="$2"
+    local project="${3:-0}"
+
+    # Prompt interactively if not provided
+    if [[ -z "$name" ]]; then
+        printf "Skill name: " >&2
+        read -r name
+        [[ -z "$name" ]] && die "Name is required"
+    fi
+
+    if [[ -z "$desc" ]]; then
+        printf "Description: " >&2
+        read -r desc
+    fi
+
+    local target_dir
+    target_dir=$(skills_dir "$project")
+    local skill_dir="$target_dir/$name"
+    [[ -d "$skill_dir" ]] && die "Directory already exists: $skill_dir"
+
+    mkdir -p "$skill_dir"/{scripts,references,assets}
+
+    cat > "$skill_dir/SKILL.md" << EOF
+---
+name: $name
+description: $desc
+---
+
+# $name
+
+## Instructions
+
+<!-- Describe what this skill does and how an LLM should use it. -->
+EOF
+
+    info "Created skill scaffold: ${_bold}$skill_dir/${_reset}"
+    dim "SKILL.md"
+    dim "scripts/"
+    dim "references/"
+    dim "assets/"
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+skills — Skills manager for shelllm
+
+Usage:
+  skills                                  List all installed skills
+  skills <query>                          Search installed + remote skills
+  skills --install <owner/repo|url|path>  Install a skill
+  skills --remove <name>                  Remove an installed skill
+  skills --show <name>                    Print a skill's full SKILL.md
+  skills --init [name]                    Scaffold a new skill in current dir
+  skills --list-json                      List skills as JSON (for programmatic use)
+
+Options:
+  --dir DIR          Use DIR as the skills directory (default: ~/.skills)
+  --project          Target project-level .skills/ instead of global
+  --force            Skip confirmation prompts
+  --name NAME        Skill name (for --init)
+  --description DESC Skill description (for --init)
+  -v, --verbose      Verbose/debug mode
+  -h, --help         Show help
+  --version          Show version
+
+Environment:
+  SKILLS_DIR   Override global skills directory (default: ~/.skills)
+  NO_COLOR     Disable color output
+EOF
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing & dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+    local action=""
+    local action_arg=""
+    local project=0
+    local force=0
+    local init_name=""
+    local init_desc=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                ;;
+            --version)
+                echo "skills $SKILLS_VERSION"
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --dir)
+                SKILLS_DIR="${2:?--dir requires a path}"
+                shift 2
+                ;;
+            --project)
+                project=1
+                shift
+                ;;
+            --force)
+                force=1
+                shift
+                ;;
+            --install)
+                action="install"
+                action_arg="${2:?--install requires a source (owner/repo, URL, or path)}"
+                shift 2
+                ;;
+            --remove)
+                action="remove"
+                action_arg="${2:?--remove requires a skill name}"
+                shift 2
+                ;;
+            --show)
+                action="show"
+                action_arg="${2:?--show requires a skill name}"
+                shift 2
+                ;;
+            --list-json)
+                action="list-json"
+                shift
+                ;;
+            --init)
+                action="init"
+                if [[ $# -gt 1 && "${2:0:1}" != "-" ]]; then
+                    init_name="$2"
+                    shift
+                fi
+                shift
+                ;;
+            --name)
+                init_name="${2:?--name requires a value}"
+                shift 2
+                ;;
+            --description)
+                init_desc="${2:?--description requires a value}"
+                shift 2
+                ;;
+            -*)
+                die "Unknown option: $1 (try skills --help)"
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    local remaining="$*"
+
+    case "$action" in
+        install)   action_install "$action_arg" "$project" ;;
+        remove)    action_remove "$action_arg" "$force" ;;
+        show)      action_show "$action_arg" ;;
+        list-json) action_list_json ;;
+        init)
+            [[ -z "$init_name" && -n "$remaining" ]] && init_name="$remaining"
+            action_init "$init_name" "$init_desc" "$project"
+            ;;
+        "")
+            if [[ -n "$remaining" ]]; then
+                action_search "$remaining"
+            else
+                action_list
+            fi
+            ;;
+    esac
+}
+
+main "$@"
