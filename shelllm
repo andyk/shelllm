@@ -534,7 +534,7 @@ When you have the answer, set one of these in your bash code:
 
 ## Guidelines
 1. Think step by step. Use echo statements within your single script to document your reasoning.
-2. If stdin or files were provided, inspect `$CONTEXT` and `$FILE_CONTEXT1`, `$FILE_CONTEXT2`, etc. before searching elsewhere.
+2. Always start by inspecting `$CONTEXT` and `$FILE_CONTEXT1`, `$FILE_CONTEXT2`, if they were provided
 3. Your code runs with `set -e` — commands that fail will stop execution. Use `|| true` if a command might fail acceptably.
 4. All code shares the same workspace directory ($SHELLLM_WORKSPACE). You can create temp files there.
 5. Start by inspecting the existing environment before making changes. Prefer repairing what is already there over creating a new mock setup.
@@ -661,6 +661,7 @@ run_loop() {
         system_prompt=$(build_system_prompt "" "${_SHELLLM_DOCKER_MODE:-0}")
         banner
         progress "Resuming session: $(basename "$workspace")"
+        rm -f "$workspace/.final"
         printf '%s' "$messages_json" > "$workspace/.messages.json"
     elif [[ -n "${_SHELLLM_FORKED_MESSAGES:-}" ]]; then
         workspace="${_SHELLLM_FORKED_WORKSPACE}"
@@ -1019,7 +1020,10 @@ main() {
 
     if [[ -n "${_resume_mode:-}" ]]; then
         local ws
-        if [[ "$_resume_mode" == "latest" ]]; then
+        if [[ -n "$_SHELLLM_WORKSPACE_USER" ]]; then
+            # --workspace provided: use it directly as the workspace to resume
+            ws="$_SHELLLM_WORKSPACE_USER"
+        elif [[ "$_resume_mode" == "latest" ]]; then
             local runs_dir="$HOME/.shelllm/runs"
             ws="$runs_dir/$(ls -1t "$runs_dir" 2>/dev/null | head -1)"
             [[ ! -d "$ws" ]] && die "No past sessions found"
