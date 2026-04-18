@@ -375,7 +375,7 @@ You can also put settings in a `.env` file in the working directory:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
-SHELLLM_MODEL=claude-sonnet-4-5-20250929
+SHELLLM_MODEL=claude-opus-4-7-20250715
 SHELLLM_MAX_ITERATIONS=10
 ```
 
