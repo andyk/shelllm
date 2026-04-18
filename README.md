@@ -9,9 +9,15 @@ ___        |  ___|| | | ||  ___|| | | |  |  \  /  |
 /__ /      |_____||_| |_||_____||_____|
 ```
 
-A recursive LLM that lives inside a bash shell. It thinks by writing bash script, running it, looking at the output, and iterating until it has an answer.
+A bash-native AI agent that thinks by writing shell commands, running them, and iterating until it has an answer.
 
-shell<sup>LM</sup> is four tools that compose together:
+## Why the shell?
+
+LLMs are text-in, text-out. The Unix shell is an environment where *everything* is text — stdin, stdout, pipes, files, environment variables. That structural alignment turns out to be deep.
+
+Most agent frameworks give the LLM a curated menu of function calls: `search_web`, `read_file`, `run_sql`. If your menu doesn't include a capability, the model can't do it. The shell inverts this. Instead of enumerating tools, you drop the LLM into a composable environment and let it figure out what to do. `curl` is the HTTP client. `jq` is the JSON processor. `python3 -c` is the escape hatch. No schemas to define, no wrappers to write — the model composes tools the same way a human would, by piping them together.
+
+shell<sup>LM</sup> takes this idea seriously. It's four small, composable tools — all pure bash — that together form a full agent stack. Each one does one thing well. They compose through the filesystem and environment variables, just like Unix intended.
 
 | Tool | What it does |
 |------|-------------|
@@ -20,17 +26,7 @@ shell<sup>LM</sup> is four tools that compose together:
 | **mem** | CLI memory store — markdown files with YAML frontmatter, no database |
 | **skills** | Skill manager — install, create, and use SKILL.md-based agent abilities |
 
-## How it works
-
-shell<sup>LM</sup> runs a loop:
-
-1. Sends your context to Claude with a system prompt that says "write bash code"
-2. Claude responds with a ` ```bash ` code block
-3. shell<sup>LM</sup> executes the code (in Docker if available, locally otherwise)
-4. Output streams back to Claude as the next message
-5. Repeat until the code sets `FINAL="answer"` or hits max iterations
-
-The LLM has full shell access. It can curl APIs, parse data with jq, write Python scripts, call itself recursively, install packages — whatever it takes to solve the task.
+shelllm is the engine at the center. The other three build on it to get from a stateless tool to a stateful agent — with memory, learned abilities, and persistent identity across sessions.
 
 ## Install
 
@@ -61,7 +57,19 @@ shelllm -f paper.pdf -f notes.txt compare these documents
 shelllm research the latest advances in protein folding and write a summary
 ```
 
-## What you see
+## How shelllm works
+
+shelllm runs a loop:
+
+1. Sends your context to Claude with a system prompt that says "write bash code"
+2. Claude responds with a ` ```bash ` code block
+3. shelllm executes the code (in Docker if available, locally otherwise)
+4. Output streams back to Claude as the next message
+5. Repeat until the code sets `FINAL="answer"` or hits max iterations
+
+The LLM has full shell access. It can curl APIs, parse data with jq, write Python scripts, call itself recursively, install packages — whatever it takes to solve the task.
+
+### What you see
 
 shell<sup>LM</sup> streams everything live. Commands show in cyan, output in dim:
 
@@ -82,139 +90,26 @@ Found 42 results
 
 If a command hangs (waiting for interactive input), the inactivity watchdog kills it after `SHELLLM_INACTIVITY_TIMEOUT` seconds (default 30) and gives the LLM structured feedback on what went wrong.
 
-## shelly
+### Completion signals
 
-shelly is an interactive conversational agent built on shelllm. It has persistent identity, memory, and skills across sessions.
-
-```bash
-# Start the REPL
-shelly
-
-# Or send a single message
-shelly send "what's the weather in SF?"
-
-# Send with piped input
-cat report.csv | shelly send "summarize this report"
-```
-
-### REPL
-
-```
-shelly repl (Ctrl+C to interrupt, Ctrl+D to exit)
-> hello! who are you?
-I'm shelly, an AI with a life context — memories, values, skills...
-> /help
-```
-
-Ctrl+C interrupts a running response and returns to the prompt. Ctrl+D exits.
-
-### Sessions
-
-shelly keeps conversation history per session:
+The LLM signals it has an answer by setting one of these in its bash code:
 
 ```bash
-shelly new              # Start a new session
-shelly sessions         # List all sessions
-shelly switch <id>      # Switch to a session (prefix match)
-shelly history          # Show conversation history
-shelly reset            # Clear current session
-shelly compact          # Summarize and compact long history
+# Short answer
+FINAL="The answer is 42"
+
+# Long answer from a file
+echo "detailed report..." > report.txt
+FINAL_FILE=report.txt
 ```
 
-### Slash commands (in REPL)
-
-| Command | Description |
-|---------|-------------|
-| `/new` | Start a new session |
-| `/sessions` | List sessions |
-| `/switch <id>` | Switch session |
-| `/history` | Show history |
-| `/reset` | Clear session |
-| `/compact` | Compact history |
-| `/context` | Show assembled system prompt |
-| `/mem ...` | Memory commands (see below) |
-| `/skills ...` | Skills commands (see below) |
-| `/quit` | Exit |
-
-## mem
-
-A file-based memory store. Each memory is a markdown file with YAML frontmatter (date, type, slug). No database needed.
+shell<sup>LM</sup> captures the value and prints it to stdout. Everything else (progress, commands, debug) goes to stderr, so you can pipe the final answer:
 
 ```bash
-# Add memories with a type
-mem add "the user prefers dark mode"
-mem add --type todo "buy groceries"
-mem add --type value "always be honest"
-mem add --type fact "the project uses React 19"
-
-# Search and browse
-mem list                    # List all (date + slug)
-mem dump                    # Print all summaries
-mem search "user prefs"     # Semantic search (uses shelllm)
-
-# Edit and remove
-mem edit <name> "new text"  # Update a memory
-mem forget <name>           # Delete by name or prefix
+shelllm -f data.csv compute the average > result.txt
 ```
 
-Types: `memory`, `todo`, `objective`, `value`, `belief`, `fact`, `preference`, `note`
-
-Memories are stored as individual `.md` files in `MEM_DIR` (default: `./.memories/`). shelly uses per-session memory directories so each conversation has its own context.
-
-## skills
-
-A manager for SKILL.md-based agent abilities. Skills are directories containing a `SKILL.md` file with YAML frontmatter (name, description) and markdown instructions.
-
-```bash
-# List installed skills
-skills
-
-# Search installed and remote (GitHub) skills
-skills "web research"
-
-# Install from GitHub
-skills --install owner/repo
-
-# Show a skill's full instructions
-skills --show web-research
-
-# Create a new skill
-skills --init my-new-skill
-
-# Remove a skill
-skills --remove old-skill
-```
-
-Skills live in `SKILLS_DIR` (default: `~/.skills/`). shelly also has per-session skills in `.shelly/sessions/<id>/skills/`.
-
-When shelly uses a skill, it reads the SKILL.md and follows its instructions as part of its code generation loop.
-
-## Docker sandboxing
-
-If Docker is running, shell<sup>LM</sup> automatically executes code inside a container. This means:
-
-- The LLM can't accidentally modify your host system
-- It can install packages (`apt-get install`) without affecting your machine
-- The container comes with bash, python3, jq, curl, and tmux pre-installed
-- Your workspace directory is mounted in, so files persist across iterations
-
-```bash
-# Auto-detected (default)
-shelllm do something risky
-
-# Force local execution
-shelllm --no-docker do something risky
-
-# Use a different base image
-shelllm --docker-image python:3.12-slim write a flask app
-```
-
-Docker detection works like this:
-- If Docker daemon is running and `--no-docker` isn't set → uses Docker
-- If already inside a Docker container (e.g. CI) → runs locally (no nesting)
-- If Docker isn't installed → runs locally
-
-## Context
+### Context
 
 There are three ways to pass context:
 
@@ -245,45 +140,9 @@ These can be combined:
 cat errors.log | shelllm -f config.yaml diagnose why the service is failing
 ```
 
-## Completion signals
+### Nested calls
 
-The LLM signals it has an answer by setting one of these in its bash code:
-
-```bash
-# Short answer
-FINAL="The answer is 42"
-
-# Long answer from a file
-echo "detailed report..." > report.txt
-FINAL_FILE=report.txt
-```
-
-shell<sup>LM</sup> captures the value and prints it to stdout. Everything else (progress, commands, debug) goes to stderr, so you can pipe the final answer:
-
-```bash
-shelllm -f data.csv compute the average > result.txt
-```
-
-## Interactive command handling
-
-Generated code runs with stdin connected to `/dev/null`. Interactive prompts (password dialogs, `[y/N]` confirmations, `read` commands) get immediate EOF instead of hanging.
-
-If a process produces no output for `SHELLLM_INACTIVITY_TIMEOUT` seconds (default 30), the watchdog kills it and sends the LLM structured feedback:
-
-```
-Execution was KILLED after 30 seconds of inactivity
-(likely waiting for interactive input that will never arrive).
-stdin is connected to /dev/null.
-
-DETECTED: Confirmation prompt. Retry with --yes, -y, --force,
---assume-yes, --non-interactive, or equivalent flag.
-```
-
-The LLM sees this and retries with non-interactive flags. For commands that truly need interaction, the LLM can use tmux to create a PTY session and interact with it step by step.
-
-## Nested calls
-
-Code generated by shell<sup>LM</sup> can call shell<sup>LM</sup> itself:
+Code generated by shelllm can call shelllm itself:
 
 **`shelllm "prompt"`** — starts a fresh nested run. The child gets its own conversation history and workspace. Good for independent subtasks:
 
@@ -303,9 +162,51 @@ result=$(shelllm --fork "now take the data we found and build a visualization")
 
 Nesting depth is capped by `--max-depth` (default 3) to prevent runaway costs. Sub-runs are stored inside the parent workspace under `.shelllm/sub-runs/`.
 
-## Workspace
+### Interactive command handling
 
-Each shell<sup>LM</sup> run gets a persistent workspace directory under `~/.shelllm/runs/<timestamp>_<slug>/`:
+Generated code runs with stdin connected to `/dev/null`. Interactive prompts (password dialogs, `[y/N]` confirmations, `read` commands) get immediate EOF instead of hanging.
+
+If a process produces no output for `SHELLLM_INACTIVITY_TIMEOUT` seconds (default 30), the watchdog kills it and sends the LLM structured feedback:
+
+```
+Execution was KILLED after 30 seconds of inactivity
+(likely waiting for interactive input that will never arrive).
+stdin is connected to /dev/null.
+
+DETECTED: Confirmation prompt. Retry with --yes, -y, --force,
+--assume-yes, --non-interactive, or equivalent flag.
+```
+
+The LLM sees this and retries with non-interactive flags. For commands that truly need interaction, the LLM can use tmux to create a PTY session and interact with it step by step.
+
+### Docker sandboxing
+
+If Docker is running, shelllm automatically executes code inside a container. This means:
+
+- The LLM can't accidentally modify your host system
+- It can install packages (`apt-get install`) without affecting your machine
+- The container comes with bash, python3, jq, curl, and tmux pre-installed
+- Your workspace directory is mounted in, so files persist across iterations
+
+```bash
+# Auto-detected (default)
+shelllm do something risky
+
+# Force local execution
+shelllm --no-docker do something risky
+
+# Use a different base image
+shelllm --docker-image python:3.12-slim write a flask app
+```
+
+Docker detection works like this:
+- If Docker daemon is running and `--no-docker` isn't set → uses Docker
+- If already inside a Docker container (e.g. CI) → runs locally (no nesting)
+- If Docker isn't installed → runs locally
+
+### Workspace
+
+Each shelllm run gets a persistent workspace directory under `~/.shelllm/runs/<timestamp>_<slug>/`:
 
 - All generated code executes in `$SHELLLM_WORKSPACE`
 - Files created by the agent persist across iterations
@@ -325,7 +226,7 @@ shelllm --workspace ./my-run research something complex
 
 With Docker, the workspace is bind-mounted into the container at the same path, so files written inside the container appear on the host and vice versa.
 
-## Session management
+### Session management
 
 You can resume past sessions to continue where you left off:
 
@@ -338,6 +239,115 @@ shelllm --start-from 2025-01-15 "try a different approach"
 ```
 
 The resumed session picks up the full conversation history, so the LLM remembers everything from the previous run.
+
+## From tool to agent: shelly, mem, and skills
+
+shelllm is a powerful primitive, but it's stateless. Each run starts fresh — no memory of what happened last time, no learned abilities, no persistent identity. To get from a tool to an agent, you need memory, skills, and a way to tie them together across conversations.
+
+### mem
+
+A file-based memory store. Each memory is a markdown file with YAML frontmatter (date, type, slug). No database needed.
+
+```bash
+# Add memories with a type
+mem add "the user prefers dark mode"
+mem add --type todo "buy groceries"
+mem add --type value "always be honest"
+mem add --type fact "the project uses React 19"
+
+# Search and browse
+mem list                    # List all (date + slug)
+mem dump                    # Print all summaries
+mem search "user prefs"     # Semantic search (uses shelllm)
+
+# Edit and remove
+mem edit <name> "new text"  # Update a memory
+mem forget <name>           # Delete by name or prefix
+```
+
+Types: `memory`, `todo`, `objective`, `value`, `belief`, `fact`, `preference`, `note`
+
+Memories are stored as individual `.md` files in `MEM_DIR` (default: `./.memories/`). Every piece of state is a text file — inspectable, greppable, editable with any editor.
+
+### skills
+
+A manager for SKILL.md-based agent abilities. Skills are directories containing a `SKILL.md` file with YAML frontmatter (name, description) and markdown instructions. They're reusable instruction sets that encode how to do specific things well — no plugin API, no SDK, just text files the LLM reads and follows.
+
+```bash
+# List installed skills
+skills
+
+# Search installed and remote (GitHub) skills
+skills "web research"
+
+# Install from GitHub
+skills --install owner/repo
+
+# Show a skill's full instructions
+skills --show web-research
+
+# Create a new skill
+skills --init my-new-skill
+
+# Remove a skill
+skills --remove old-skill
+```
+
+Skills live in `SKILLS_DIR` (default: `~/.skills/`). shelly also has per-session skills in `.shelly/sessions/<id>/skills/`.
+
+### shelly
+
+shelly ties it all together. It's an interactive conversational agent that wraps shelllm, mem, and skills into a stateful chat experience with session management.
+
+```bash
+# Start the REPL
+shelly
+
+# Or send a single message
+shelly send "what's the weather in SF?"
+
+# Send with piped input
+cat report.csv | shelly send "summarize this report"
+```
+
+#### REPL
+
+```
+shelly repl (Ctrl+C to interrupt, Ctrl+D to exit)
+> hello! who are you?
+I'm shelly, an AI with a life context — memories, values, skills...
+> /help
+```
+
+Ctrl+C interrupts a running response and returns to the prompt. Ctrl+D exits.
+
+#### Sessions
+
+shelly keeps conversation history per session:
+
+```bash
+shelly new              # Start a new session
+shelly sessions         # List all sessions
+shelly switch <id>      # Switch to a session (prefix match)
+shelly history          # Show conversation history
+shelly reset            # Clear current session
+shelly compact          # Summarize and compact long history
+```
+
+#### Slash commands (in REPL)
+
+| Command | Description |
+|---------|-------------|
+| `/new` | Start a new session |
+| `/sessions` | List sessions |
+| `/switch <id>` | Switch session |
+| `/history` | Show history |
+| `/reset` | Clear session |
+| `/compact` | Compact history |
+| `/context` | Show assembled system prompt |
+| `/mem ...` | Memory commands (see above) |
+| `/skills ...` | Skills commands (see above) |
+| `/quit` | Exit |
 
 ## Options
 
@@ -382,15 +392,6 @@ SHELLLM_MAX_ITERATIONS=10
 - lynx — for web scraping tasks
 
 ## Examples
-
-### Compelling use cases
-
-- "What are the five most important AI launches from the last 7 days?" Let shell<sup>LM</sup> search the web, compare sources, dedupe overlapping coverage, and produce a ranked brief with links and one-sentence significance for each item.
-- "Find the cheapest flight patterns for a long weekend in Japan this fall." Let it crawl airline and travel sites, compare date windows, and return a table of likely best departure/return combinations with caveats.
-- "Research the best open-source observability stacks for a 20-person startup." Let it gather docs, GitHub signals, blog posts, and pricing pages, then produce a recommendation memo with tradeoffs.
-- "Map the competitive landscape for AI coding agents." Let it find vendors, pricing, core capabilities, and recent launches, then write a comparison matrix with notable gaps.
-- "Track a developing story across multiple sources." Let it follow reporting from major outlets, reconstruct a timeline, and highlight where accounts agree or diverge.
-- "Split up a research task into sub-agents." Let one branch collect raw facts, another branch normalize them into a table, and a third draft the final summary via nested `shelllm` calls.
 
 ```bash
 # Weekly research brief
