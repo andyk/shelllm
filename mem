@@ -3,7 +3,7 @@ set -euo pipefail
 
 # mem — CLI memory store
 # Stores memories as individual markdown files with YAML frontmatter.
-# Uses shelllm for semantic search. No databases — just files.
+# Uses shellm for semantic search. No databases — just files.
 
 # ---------------------------------------------------------------------------
 # Config & defaults
@@ -13,6 +13,15 @@ MEM_VERSION="0.1.0"
 MEM_DIR="${MEM_DIR:-./.memories}"
 VERBOSE=0
 MEM_TYPE="memory"
+
+# Source per-repo rc file (flags > env vars > rc file)
+if [[ -f ".memrc" ]]; then
+    _pre_env=$(env | grep '^MEM_') || true
+    source .memrc
+    while IFS='=' read -r k v; do
+        [[ -n "$k" ]] && export "$k=$v"
+    done <<< "$_pre_env"
+fi
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -112,7 +121,7 @@ action_search() {
     count=$(ls -1 "$MEM_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
     [[ "$count" -eq 0 ]] && { echo "No memories stored." >&2; return 0; }
 
-    # Concatenate all memories with filenames as headers and pipe to shelllm,
+    # Concatenate all memories with filenames as headers and pipe to shellm,
     # so it works regardless of Docker sandboxing.
     local memories=""
     local f
@@ -123,7 +132,7 @@ $(cat "$f")
 "
     done
 
-    printf '%s' "$memories" | shelllm --quiet "Here are memory files. Search them for: ${query}
+    printf '%s' "$memories" | shellm --quiet "Here are memory files. Search them for: ${query}
 Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body.
 Return ONLY the filenames and summaries of semantically matching memories, one per line.
 If nothing matches, say 'No matches found.'"
@@ -248,7 +257,7 @@ mem — CLI memory store
 
 Usage:
   mem add [--type TYPE] <text>   Add a memory (or pipe text via stdin)
-  mem search <query>             Semantic search via shelllm
+  mem search <query>             Semantic search via shellm
   mem list [N]                   List memories (dates + slugs), last N if given
   mem dump [N]                   Print all memories (date, type, summary), last N if given
   mem forget <name>              Delete a memory by name/prefix

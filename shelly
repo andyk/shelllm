@@ -2,18 +2,28 @@
 set -euo pipefail
 
 # shelly — Interactive conversational agent
-# A thin CLI wrapper around shelllm, mem, and skills that provides
-# multi-turn conversation with session management.
+# A thin CLI wrapper around shellm, mem, and skills that provides
+# multi-turn conversation with identity management.
 
 # ---------------------------------------------------------------------------
 # Config & defaults
 # ---------------------------------------------------------------------------
 
 SHELLY_DIR="${SHELLY_DIR:-.shelly}"
-SHELLY_MODEL="${SHELLY_MODEL:-${SHELLLM_MODEL:-claude-opus-4-6}}"
+SHELLY_MODEL="${SHELLY_MODEL:-${SHELLM_MODEL:-claude-opus-4-6}}"
 SHELLY_MEMORIES_DIR=""
 SHELLY_SKILLS_DIR=""
+SHELLY_KERNEL_DIR=""
 VERBOSE=0
+
+# Source per-repo rc file (flags > env vars > rc file)
+if [[ -f ".shellyrc" ]]; then
+    _pre_env=$(env | grep '^SHELLY_') || true
+    source .shellyrc
+    while IFS='=' read -r k v; do
+        [[ -n "$k" ]] && export "$k=$v"
+    done <<< "$_pre_env"
+fi
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -27,13 +37,6 @@ debug() {
     fi
 }
 
-timestamp_id() {
-    local ts rand
-    ts=$(date +%Y-%m-%d-%H-%M-%S)
-    rand=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    printf '%s_%s' "$ts" "$rand"
-}
-
 iso_timestamp() {
     date +%Y-%m-%dT%H:%M:%S
 }
@@ -43,67 +46,52 @@ json_escape() {
 }
 
 # ---------------------------------------------------------------------------
-# Session management
+# Identity management
 # ---------------------------------------------------------------------------
 
-ensure_session() {
-    mkdir -p "$SHELLY_DIR/sessions"
-    if [[ ! -L "$SHELLY_DIR/sessions/current" ]] || [[ ! -d "$SHELLY_DIR/sessions/current" ]]; then
-        cmd_new
+ensure_identity() {
+    mkdir -p "$SHELLY_DIR/identities"
+    if [[ ! -L "$SHELLY_DIR/identities/current" ]] || [[ ! -d "$SHELLY_DIR/identities/current" ]]; then
+        cmd_new "shelly"
     fi
-    # Always resolve memories/skills to current session
-    local session_dir
-    session_dir=$(resolve_session)
-    SHELLY_MEMORIES_DIR="$session_dir/memories"
-    SHELLY_SKILLS_DIR="$session_dir/skills"
-    mkdir -p "$SHELLY_MEMORIES_DIR" "$SHELLY_SKILLS_DIR"
+    # Always resolve memories/skills/kernel to current identity
+    local identity_dir
+    identity_dir=$(resolve_identity)
+    SHELLY_MEMORIES_DIR="$identity_dir/memories"
+    SHELLY_SKILLS_DIR="$identity_dir/skills"
+    SHELLY_KERNEL_DIR="$identity_dir/kernel"
+    mkdir -p "$SHELLY_MEMORIES_DIR" "$SHELLY_SKILLS_DIR" "$SHELLY_KERNEL_DIR"
+    ensure_kernel
 }
 
-resolve_session() {
-    if [[ ! -L "$SHELLY_DIR/sessions/current" ]]; then
-        die "No active session. Run: shelly new"
+resolve_identity() {
+    if [[ ! -L "$SHELLY_DIR/identities/current" ]]; then
+        die "No active identity. Run: shelly new <name>"
     fi
-    # readlink without -f for macOS compat
     local target
-    target=$(readlink "$SHELLY_DIR/sessions/current")
-    # Handle relative symlinks (current is inside sessions/)
+    target=$(readlink "$SHELLY_DIR/identities/current")
+    # Handle relative symlinks (current is inside identities/)
     if [[ "$target" != /* ]]; then
-        target="$SHELLY_DIR/sessions/$target"
+        target="$SHELLY_DIR/identities/$target"
     fi
     if [[ ! -d "$target" ]]; then
-        die "Current session directory missing: $target"
+        die "Current identity directory missing: $target"
     fi
     # Return absolute path (needed for Docker workspace mounts)
     (cd "$target" && pwd)
 }
 
-# ---------------------------------------------------------------------------
-# Context assembly
-# ---------------------------------------------------------------------------
+ensure_kernel() {
+    mkdir -p "$SHELLY_KERNEL_DIR/mem"
+    if [[ ! -f "$SHELLY_KERNEL_DIR/mem/SKILL.md" ]]; then
+        cat > "$SHELLY_KERNEL_DIR/mem/SKILL.md" << 'MEMSKILL'
+---
+name: mem
+description: Life context and memory system
+---
 
-assemble_context() {
-    local session_dir="$1"
-    local context=""
+# mem — Life context system
 
-    # 1. Personality
-    if [[ -f "$SHELLY_DIR/system_prompt.txt" ]]; then
-        context=$(cat "$SHELLY_DIR/system_prompt.txt")
-    else
-        context='I am shelly, I am an AI with an identity, life context (e.g., memory), and skills. I am concise, smart, ambitious, and empathetic.
-
-## How I work
-I am a bash script that wraps shelllm, mem, and skills into a conversational agent. My source code is at '"$(realpath "$0")"'. I can read my own code to understand how I work. I run inside shelllm, which executes my bash code blocks in a loop until I set FINAL with my answer.
-
-IMPORTANT: When setting FINAL, I MUST use a heredoc to avoid bash interpreting backticks or special characters in my response:
-```bash
-FINAL=$(cat <<'"'"'ENDOFRESPONSE'"'"'
-My response with `backticks` and $pecial characters safely here.
-ENDOFRESPONSE
-)
-```
-
-
-## My life context system
 My life context is the experience I accumulate by living in the world that is unique to me; my memories, beliefs, life lessons, values, objectives, todos, etc. It is what makes me me; my identity. These pieces of my identity, my life context (memories, values, beliefs, tasks, etc.) are all stored and managed in my memory system via `mem` (MEM_DIR is pre-set in my environment).
 
 Commands I can run:
@@ -114,29 +102,84 @@ Commands I can run:
   mem forget <name>           Delete a memory by name or prefix
   mem edit <name> <text>      Update a memory (or pipe new text via stdin)
 
-Each memory/task/etc. is stored as a markdown file in '"$(cd "$SHELLY_MEMORIES_DIR" 2>/dev/null && pwd || echo "$SHELLY_MEMORIES_DIR")"/' with YAML frontmatter.
+Each memory/task/etc. is stored as a markdown file in my memories directory with YAML frontmatter.
 
 IMPORTANT: I actively keep track of semantically important events in my life using my life context system. So I quick to create a new mem anytime something important or memorable or suprising happens.
 
 To create a new piece of life context, I use `mem add`. I can see my most recent memories below or I can use `mem search`.
+MEMSKILL
+        debug "Bootstrapped mem kernel skill"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Context assembly
+# ---------------------------------------------------------------------------
+
+assemble_context() {
+    local identity_dir="$1"
+    local context=""
+
+    # 1. Core identity — personality/self-description
+    if [[ -f "$identity_dir/system_prompt.txt" ]]; then
+        context=$(cat "$identity_dir/system_prompt.txt")
+    else
+        context='I am shelly, I am an AI with an identity, life context (e.g., memory), and skills. I am concise, smart, ambitious, and empathetic.
+
+## How I work
+I am a bash script that wraps shellm, mem, and skills into a conversational agent. My source code is at '"$(realpath "$0")"'. I can read my own code to understand how I work. I run inside shellm, which executes my bash code blocks in a loop until I set FINAL with my answer.
+
+IMPORTANT: When setting FINAL, I MUST use a heredoc to avoid bash interpreting backticks or special characters in my response:
+```bash
+FINAL=$(cat <<'"'"'ENDOFRESPONSE'"'"'
+My response with `backticks` and $pecial characters safely here.
+ENDOFRESPONSE
+)
+```'
+    fi
+
+    # 2. Skills CLI knowledge (the "kernel-kernel" — hardcoded, changes in lockstep with CLI)
+    context="$context
 
 ## My skills system
-My skills are learned abilities that let me do specific things well. They are how I grow and become more capable over time. Each skill is a set of instructions I can follow to accomplish a particular type of task — like a recipe or a playbook. I can install new skills from GitHub or create my own, and they persist as part of me just like my memories. Skills are managed via `skills` (SKILLS_DIR is pre-set in my environment).
+My skills are learned abilities that let me do specific things well. They are how I grow and become more capable over time. Each skill is a set of instructions I can follow to accomplish a particular type of task — like a recipe or a playbook. I can install new skills from GitHub or create my own, and they persist as part of me just like my memories. Skills are managed via \`skills\` (SKILLS_DIR is pre-set in my environment).
 
 Commands I can run:
   skills                              List all my installed skills
   skills <query>                      Search installed + remote skills (GitHub)
-  skills --show <name>                Print a skill'"'"'s full SKILL.md
+  skills --show <name>                Print a skill's full SKILL.md
   skills --install <owner/repo|path>  Install a skill from GitHub or local path
   skills --remove <name>              Remove an installed skill
   skills --init [name]                Scaffold a new skill
   skills --list-json                  List skills as JSON
+  skills --promote <name>             Promote a skill to my kernel (always loaded)
+  skills --demote <name>              Demote a kernel skill back to on-demand
+  skills --kernel                     Show kernel skills with token counts
 
-My skills live in '"$(cd "$SHELLY_SKILLS_DIR" 2>/dev/null && pwd || echo "$SHELLY_SKILLS_DIR")"/' and '"$HOME/.skills/"'. Each skill is a directory with a SKILL.md file containing YAML frontmatter (name, description) and markdown instructions.
-When the user asks me to use a skill, I read it with `skills --show <name>` and follow its instructions.'
+My kernel skills are always loaded into my context. Regular skills are on-demand — I load them with \`skills --show <name>\` when needed.
+When the user asks me to use a skill, I read it with \`skills --show <name>\` and follow its instructions."
+
+    # 3. Kernel skills — full content from each SKILL.md in kernel/
+    local kernel_content=""
+    if [[ -d "$SHELLY_KERNEL_DIR" ]]; then
+        local skill_dir
+        for skill_dir in "$SHELLY_KERNEL_DIR"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            local skill_body
+            # Strip YAML frontmatter (between --- markers)
+            skill_body=$(sed -n '/^---$/,/^---$/d; p' "${skill_dir}SKILL.md")
+            if [[ -n "$skill_body" ]]; then
+                kernel_content="${kernel_content}
+${skill_body}"
+            fi
+        done
+    fi
+    if [[ -n "$kernel_content" ]]; then
+        context="$context
+$kernel_content"
     fi
 
-    # 2. Memories
+    # 4. Memories — mem dump output
     local memories=""
     if command -v mem >/dev/null 2>&1; then
         memories=$(MEM_DIR="$SHELLY_MEMORIES_DIR" mem dump 2>/dev/null) || true
@@ -148,32 +191,29 @@ When the user asks me to use a skill, I read it with `skills --show <name>` and 
 $memories"
     fi
 
-    # 3. Skills
-    local skills_list=""
-    if [[ -d "$SHELLY_SKILLS_DIR" ]]; then
-        local skill_files
-        skill_files=$(ls -1 "$SHELLY_SKILLS_DIR"/*.md 2>/dev/null) || true
-        if [[ -n "$skill_files" ]]; then
-            local sf
-            for sf in $skill_files; do
-                local skill_name
-                skill_name=$(basename "$sf" .md)
-                local summary
-                summary=$(head -1 "$sf" | sed 's/^#[[:space:]]*//')
-                skills_list="${skills_list}- ${skill_name}: ${summary}
+    # 5. Available skills — summary list from identity's skills/ dir
+    local skills_summary=""
+    if [[ -d "$identity_dir/skills" ]]; then
+        local skill_dir
+        for skill_dir in "$identity_dir/skills"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            local sname sdesc
+            sname=$(sed -n '/^---$/,/^---$/{ /^name:/{ s/^name:[[:space:]]*//; s/^["'"'"']\(.*\)["'"'"']$/\1/; p; } }' "${skill_dir}SKILL.md")
+            sdesc=$(sed -n '/^---$/,/^---$/{ /^description:/{ s/^description:[[:space:]]*//; s/^["'"'"']\(.*\)["'"'"']$/\1/; p; } }' "${skill_dir}SKILL.md")
+            [[ -z "$sname" ]] && sname=$(basename "$skill_dir")
+            skills_summary="${skills_summary}  - ${sname}: ${sdesc}
 "
-            done
-        fi
+        done
     fi
-    if [[ -n "$skills_list" ]]; then
+    if [[ -n "$skills_summary" ]]; then
         context="$context
 
-## Available skills
-$skills_list"
+## Available skills (use \`skills --show <name>\` to load)
+$skills_summary"
     fi
 
     # Write assembled context
-    printf '%s' "$context" > "$session_dir/context.txt"
+    printf '%s' "$context" > "$identity_dir/context.txt"
     printf '%s' "$context"
 }
 
@@ -190,9 +230,9 @@ cmd_send() {
     fi
     [[ -z "$message" ]] && die "No message provided. Usage: shelly send <message>"
 
-    ensure_session
-    local session_dir
-    session_dir=$(resolve_session)
+    ensure_identity
+    local identity_dir
+    identity_dir=$(resolve_identity)
 
     local ts
     ts=$(iso_timestamp)
@@ -201,51 +241,57 @@ cmd_send() {
     local user_json
     user_json=$(jq -nc --arg role "user" --arg content "$message" --arg ts "$ts" \
         '{role:$role, content:$content, ts:$ts}')
-    printf '%s\n' "$user_json" >> "$session_dir/history.jsonl"
+    printf '%s\n' "$user_json" >> "$identity_dir/history.jsonl"
 
-    # Assemble context (personality, memories, skills)
+    # Assemble context (personality, kernel skills, memories, available skills)
     local context
-    context=$(assemble_context "$session_dir")
+    context=$(assemble_context "$identity_dir")
 
-    # Prepend context to user message so shelllm keeps its own system prompt
+    # Prepend context to user message so shellm keeps its own system prompt
     local full_message="<context>
 $context
 </context>
 
 $message"
 
-    # Run shelllm in background so Ctrl+C can interrupt it
-    local run_dir="$session_dir/run"
+    # Run shellm in background so Ctrl+C can interrupt it
+    local run_dir="$identity_dir/run"
     local response_file
     response_file=$(mktemp)
     local _interrupted=0
 
     # Resolve absolute paths so mem/skills work from any working directory
-    local abs_mem_dir abs_skills_dir
+    local abs_mem_dir abs_skills_dir abs_kernel_dir
     abs_mem_dir=$(cd "$SHELLY_MEMORIES_DIR" 2>/dev/null && pwd) || abs_mem_dir="$SHELLY_MEMORIES_DIR"
     abs_skills_dir=$(cd "$SHELLY_SKILLS_DIR" 2>/dev/null && pwd) || abs_skills_dir="$SHELLY_SKILLS_DIR"
+    abs_kernel_dir=$(cd "$SHELLY_KERNEL_DIR" 2>/dev/null && pwd) || abs_kernel_dir="$SHELLY_KERNEL_DIR"
+
+    local identity_name
+    identity_name=$(basename "$(readlink "$SHELLY_DIR/identities/current")")
 
     if [[ -f "$run_dir/.messages.json" ]]; then
-        debug "Resuming session with --continue"
-        SHELLLM_NO_BANNER=1 SHELLLM_MODEL="$SHELLY_MODEL" \
+        debug "Resuming identity with --continue"
+        SHELLM_NO_BANNER=1 SHELLM_MODEL="$SHELLY_MODEL" \
             MEM_DIR="$abs_mem_dir" SKILLS_DIR="$abs_skills_dir" \
-            shelllm --continue --workspace "$run_dir" "$full_message" > "$response_file" &
+            SHELLY_KERNEL_DIR="$abs_kernel_dir" \
+            shellm --workspace "$identity_name" --continue --workdir "$run_dir" "$full_message" > "$response_file" &
     else
-        debug "Starting new shelllm workspace"
-        SHELLLM_NO_BANNER=1 SHELLLM_MODEL="$SHELLY_MODEL" \
+        debug "Starting new shellm workspace"
+        SHELLM_NO_BANNER=1 SHELLM_MODEL="$SHELLY_MODEL" \
             MEM_DIR="$abs_mem_dir" SKILLS_DIR="$abs_skills_dir" \
-            shelllm --workspace "$run_dir" "$full_message" > "$response_file" &
+            SHELLY_KERNEL_DIR="$abs_kernel_dir" \
+            shellm --workspace "$identity_name" --workdir "$run_dir" "$full_message" > "$response_file" &
     fi
-    local shelllm_pid=$!
+    local shellm_pid=$!
 
-    # Trap SIGINT: kill shelllm but don't exit shelly
-    trap '_interrupted=1; kill $shelllm_pid 2>/dev/null || true' INT
-    wait "$shelllm_pid" 2>/dev/null && true || true
+    # Trap SIGINT: kill shellm but don't exit shelly
+    trap '_interrupted=1; kill $shellm_pid 2>/dev/null || true' INT
+    wait "$shellm_pid" 2>/dev/null && true || true
     trap - INT
 
     if [[ "$_interrupted" -eq 1 ]]; then
-        # Wait for shelllm to fully exit (cleanup trap, Docker teardown, etc.)
-        wait "$shelllm_pid" 2>/dev/null || true
+        # Wait for shellm to fully exit (cleanup trap, Docker teardown, etc.)
+        wait "$shellm_pid" 2>/dev/null || true
         rm -f "$response_file"
         printf '\n(interrupted)\n' >&2
         return 0
@@ -267,13 +313,13 @@ $message"
     abs_run_dir=$(cd "$run_dir" 2>/dev/null && pwd) || abs_run_dir="$run_dir"
     local assistant_json
     assistant_json=$(jq -nc --arg role "assistant" --arg content "${response:-}" \
-        --arg ts "$reply_ts" --arg shelllm_dir "$abs_run_dir" \
-        '{role:$role, content:$content, ts:$ts, shelllm_dir:$shelllm_dir}')
-    printf '%s\n' "$assistant_json" >> "$session_dir/history.jsonl"
+        --arg ts "$reply_ts" --arg shellm_dir "$abs_run_dir" \
+        '{role:$role, content:$content, ts:$ts, shellm_dir:$shellm_dir}')
+    printf '%s\n' "$assistant_json" >> "$identity_dir/history.jsonl"
 }
 
 cmd_repl() {
-    ensure_session
+    ensure_identity
 
     printf 'shelly repl (Ctrl+C to interrupt, Ctrl+D to exit)\n' >&2
 
@@ -319,29 +365,41 @@ cmd_repl() {
             /quit|/exit|/q)
                 break
                 ;;
-            /new)
-                cmd_new
-                printf 'Switched to new session.\n' >&2
+            /new\ *)
+                local new_name="${input#/new }"
+                new_name="${new_name## }"  # trim leading spaces
+                if [[ -z "$new_name" ]]; then
+                    printf 'Usage: /new <name>\n' >&2
+                else
+                    cmd_new "$new_name"
+                    printf 'Switched to new identity: %s\n' "$new_name" >&2
+                fi
                 ;;
-            /sessions)
-                cmd_sessions
+            /new)
+                printf 'Usage: /new <name>\n' >&2
+                ;;
+            /identities)
+                cmd_identities
                 ;;
             /switch\ *)
-                local switch_id="${input#/switch }"
-                cmd_switch "$switch_id"
+                local switch_name="${input#/switch }"
+                cmd_switch "$switch_name"
                 ;;
             /history)
                 cmd_history
                 ;;
             /reset)
                 cmd_reset
-                printf 'Session reset.\n' >&2
+                printf 'Identity reset.\n' >&2
                 ;;
             /compact)
                 cmd_compact
                 ;;
             /context)
                 cmd_context
+                ;;
+            /kernel)
+                cmd_kernel
                 ;;
             /mem\ *)
                 local mem_args="${input#/mem }"
@@ -352,10 +410,10 @@ cmd_repl() {
                 ;;
             /skills\ *)
                 local skills_args="${input#/skills }"
-                eval SKILLS_DIR=\"\$SHELLY_SKILLS_DIR\" skills $skills_args
+                eval SKILLS_DIR=\"\$SHELLY_SKILLS_DIR\" SHELLY_KERNEL_DIR=\"\$SHELLY_KERNEL_DIR\" skills $skills_args
                 ;;
             /skills)
-                SKILLS_DIR="$SHELLY_SKILLS_DIR" skills
+                SKILLS_DIR="$SHELLY_SKILLS_DIR" SHELLY_KERNEL_DIR="$SHELLY_KERNEL_DIR" skills
                 ;;
             /help)
                 repl_help
@@ -373,13 +431,14 @@ cmd_repl() {
 repl_help() {
     cat >&2 <<'EOF'
 Slash commands:
-  /new          Start a new session
-  /sessions     List all sessions
-  /switch <id>  Switch to a session (prefix match)
-  /history      Show conversation history
-  /reset        Reset current session
-  /compact      Summarize and compact history
-  /context      Show assembled system prompt
+  /new <name>     Create a new identity
+  /identities     List all identities
+  /switch <name>  Switch to an identity (prefix match)
+  /history        Show conversation history
+  /reset          Reset current identity
+  /compact        Summarize and compact history
+  /context        Show assembled system prompt
+  /kernel         Show kernel skills with token counts
   /mem add <text>       Add a memory
   /mem search <query>   Search memories
   /mem list             List memories (dates + slugs)
@@ -392,112 +451,129 @@ Slash commands:
   /skills --install <src> Install a skill
   /skills --remove <name> Remove a skill
   /skills --init [name] Scaffold a new skill
-  /quit         Exit the repl
+  /skills --promote <name> Promote skill to kernel
+  /skills --demote <name>  Demote kernel skill
+  /quit           Exit the repl
 EOF
 }
 
 cmd_new() {
-    local ts_id
-    ts_id=$(timestamp_id)
-    local session_dir="$SHELLY_DIR/sessions/$ts_id"
-    mkdir -p "$session_dir"
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: shelly new <name>"
+
+    # Validate name: lowercase alphanumeric + hyphens
+    if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        die "Invalid identity name: '$name' (use lowercase alphanumeric + hyphens)"
+    fi
+
+    local identity_dir="$SHELLY_DIR/identities/$name"
+    if [[ -d "$identity_dir" ]]; then
+        die "Identity '$name' already exists"
+    fi
+
+    mkdir -p "$identity_dir"
 
     # Create meta.txt
     local cwd
     cwd=$(pwd)
-    printf 'cwd=%s\nstarted=%s\n' "$cwd" "$(iso_timestamp)" > "$session_dir/meta.txt"
+    printf 'cwd=%s\nstarted=%s\n' "$cwd" "$(iso_timestamp)" > "$identity_dir/meta.txt"
 
     # Initialize empty history
-    : > "$session_dir/history.jsonl"
+    : > "$identity_dir/history.jsonl"
 
-    # Create per-session memories and skills dirs
-    mkdir -p "$session_dir/memories" "$session_dir/skills"
+    # Create per-identity dirs
+    mkdir -p "$identity_dir/memories" "$identity_dir/skills" "$identity_dir/kernel"
+
+    # Bootstrap kernel (mem SKILL.md)
+    SHELLY_KERNEL_DIR="$identity_dir/kernel"
+    ensure_kernel
 
     # Update current symlink
-    ln -sfn "$ts_id" "$SHELLY_DIR/sessions/current"
+    ln -sfn "$name" "$SHELLY_DIR/identities/current"
 
-    debug "Created session: $session_dir"
-    printf '%s\n' "$ts_id" >&2
+    # Re-resolve dirs for the new identity
+    SHELLY_MEMORIES_DIR="$identity_dir/memories"
+    SHELLY_SKILLS_DIR="$identity_dir/skills"
+
+    debug "Created identity: $name"
+    printf '%s\n' "$name" >&2
 }
 
-cmd_sessions() {
-    local sessions_dir="$SHELLY_DIR/sessions"
-    if [[ ! -d "$sessions_dir" ]]; then
-        echo "No sessions." >&2
+cmd_identities() {
+    local identities_dir="$SHELLY_DIR/identities"
+    if [[ ! -d "$identities_dir" ]]; then
+        echo "No identities." >&2
         return
     fi
 
     local dirs
-    dirs=$(ls -1r "$sessions_dir" 2>/dev/null | grep -v '^current$') || true
+    dirs=$(ls -1 "$identities_dir" 2>/dev/null | grep -v '^current$') || true
     if [[ -z "$dirs" ]]; then
-        echo "No sessions." >&2
+        echo "No identities." >&2
         return
     fi
 
-    # Find current session for marking
-    local current_id=""
-    if [[ -L "$SHELLY_DIR/sessions/current" ]]; then
+    # Find current identity for marking
+    local current_name=""
+    if [[ -L "$SHELLY_DIR/identities/current" ]]; then
         local cur_target
-        cur_target=$(readlink "$SHELLY_DIR/sessions/current")
-        current_id=$(basename "$cur_target")
+        cur_target=$(readlink "$SHELLY_DIR/identities/current")
+        current_name=$(basename "$cur_target")
     fi
 
     local d
     while IFS= read -r d; do
         local marker=" "
-        [[ "$d" == "$current_id" ]] && marker="*"
+        [[ "$d" == "$current_name" ]] && marker="*"
 
         # Get first user message as preview
         local preview=""
-        local hist="$sessions_dir/$d/history.jsonl"
+        local hist="$identities_dir/$d/history.jsonl"
         if [[ -f "$hist" ]]; then
             preview=$(head -1 "$hist" 2>/dev/null | jq -r '.content // ""' 2>/dev/null | head -c 60) || true
         fi
 
-        # Convert ID timestamp to readable format
-        local display_ts
-        display_ts=$(printf '%s' "$d" | tr 'T' ' ' | tr '-' ':' | sed 's/^\([0-9]*\):\([0-9]*\):\([0-9]*\)/\1-\2-\3/')
         printf '%s %s  %s\n' "$marker" "$d" "$preview"
     done <<< "$dirs"
 }
 
 cmd_switch() {
     local target="$1"
-    [[ -z "$target" ]] && die "Usage: shelly switch <session-id>"
+    [[ -z "$target" ]] && die "Usage: shelly switch <name>"
 
-    local sessions_dir="$SHELLY_DIR/sessions"
-    [[ ! -d "$sessions_dir" ]] && die "No sessions found"
+    local identities_dir="$SHELLY_DIR/identities"
+    [[ ! -d "$identities_dir" ]] && die "No identities found"
 
     # Try exact match first
-    if [[ -d "$sessions_dir/$target" ]]; then
-        ln -sfn "$target" "$SHELLY_DIR/sessions/current"
+    if [[ -d "$identities_dir/$target" ]]; then
+        ln -sfn "$target" "$SHELLY_DIR/identities/current"
         printf 'Switched to: %s\n' "$target" >&2
         return
     fi
 
     # Prefix/substring match
     local matches
-    matches=$(ls -1 "$sessions_dir" 2>/dev/null | grep "$target" || true)
+    matches=$(ls -1 "$identities_dir" 2>/dev/null | grep -v '^current$' | grep "$target" || true)
     local count
     count=$(printf '%s' "$matches" | grep -c . 2>/dev/null) || count=0
 
     if [[ "$count" -eq 1 ]]; then
-        ln -sfn "$matches" "$SHELLY_DIR/sessions/current"
+        ln -sfn "$matches" "$SHELLY_DIR/identities/current"
         printf 'Switched to: %s\n' "$matches" >&2
     elif [[ "$count" -gt 1 ]]; then
-        die "Ambiguous: '$target' matches multiple sessions:
+        die "Ambiguous: '$target' matches multiple identities:
 $matches"
     else
-        die "No session matching: $target"
+        die "No identity matching: $target"
     fi
 }
 
 cmd_history() {
-    ensure_session
-    local session_dir
-    session_dir=$(resolve_session)
+    ensure_identity
+    local identity_dir
+    identity_dir=$(resolve_identity)
 
-    local hist="$session_dir/history.jsonl"
+    local hist="$identity_dir/history.jsonl"
     if [[ ! -f "$hist" ]] || [[ ! -s "$hist" ]]; then
         echo "(empty history)" >&2
         return
@@ -517,25 +593,38 @@ cmd_history() {
 }
 
 cmd_reset() {
-    ensure_session
-    local session_dir
-    session_dir=$(resolve_session)
+    ensure_identity
+    local identity_dir
+    identity_dir=$(resolve_identity)
+    local identity_name
+    identity_name=$(basename "$identity_dir")
+
+    # Destroy the Docker workspace for this identity
+    local ws_dir="$HOME/.shellm/workspaces/$identity_name"
+    if [[ -d "$ws_dir" ]]; then
+        if [[ -f "$ws_dir/container_id" ]]; then
+            local cid
+            cid=$(cat "$ws_dir/container_id" 2>/dev/null || true)
+            [[ -n "$cid" ]] && docker rm -f "$cid" >/dev/null 2>&1 || true
+        fi
+        rm -rf "$ws_dir"
+    fi
 
     # Truncate history
-    : > "$session_dir/history.jsonl"
+    : > "$identity_dir/history.jsonl"
 
-    # Remove shelllm workspace
-    rm -rf "$session_dir/run"
+    # Remove shellm workdir
+    rm -rf "$identity_dir/run"
 
-    debug "Cleared session: $session_dir"
+    debug "Cleared identity: $identity_dir"
 }
 
 cmd_compact() {
-    ensure_session
-    local session_dir
-    session_dir=$(resolve_session)
+    ensure_identity
+    local identity_dir
+    identity_dir=$(resolve_identity)
 
-    local hist="$session_dir/history.jsonl"
+    local hist="$identity_dir/history.jsonl"
     if [[ ! -f "$hist" ]] || [[ ! -s "$hist" ]]; then
         echo "Nothing to compact." >&2
         return
@@ -556,12 +645,12 @@ cmd_compact() {
         fi
     done < "$hist"
 
-    # Summarize using shelllm
-    printf 'Compacting session...\n' >&2
+    # Summarize using shellm
+    printf 'Compacting history...\n' >&2
     local summary
-    summary=$(printf '%s' "$conversation" | shelllm --quiet \
+    summary=$(printf '%s' "$conversation" | shellm --quiet \
         "Summarize this conversation concisely. Capture key facts, decisions, and context. Output a brief summary paragraph.") || {
-        die "Failed to compact session"
+        die "Failed to compact history"
     }
 
     # Replace history with summary
@@ -573,19 +662,39 @@ cmd_compact() {
         '{role:$role, content:$content, ts:$ts}')
     printf '%s\n' "$sys_json" > "$hist"
 
-    # Remove old shelllm workspace (will be recreated on next send)
-    rm -rf "$session_dir/run"
+    # Destroy the Docker workspace for this identity
+    local identity_name
+    identity_name=$(basename "$identity_dir")
+    local ws_dir="$HOME/.shellm/workspaces/$identity_name"
+    if [[ -d "$ws_dir" ]]; then
+        if [[ -f "$ws_dir/container_id" ]]; then
+            local cid
+            cid=$(cat "$ws_dir/container_id" 2>/dev/null || true)
+            [[ -n "$cid" ]] && docker rm -f "$cid" >/dev/null 2>&1 || true
+        fi
+        rm -rf "$ws_dir"
+    fi
 
-    printf 'Session compacted.\n' >&2
+    # Remove old shellm workdir (will be recreated on next send)
+    rm -rf "$identity_dir/run"
+
+    printf 'History compacted.\n' >&2
 }
 
 cmd_context() {
-    ensure_session
-    local session_dir
-    session_dir=$(resolve_session)
-    assemble_context "$session_dir" >/dev/null
-    cat "$session_dir/context.txt"
+    ensure_identity
+    local identity_dir
+    identity_dir=$(resolve_identity)
+    assemble_context "$identity_dir" >/dev/null
+    cat "$identity_dir/context.txt"
     printf '\n'
+}
+
+cmd_kernel() {
+    ensure_identity
+    local abs_kernel_dir
+    abs_kernel_dir=$(cd "$SHELLY_KERNEL_DIR" 2>/dev/null && pwd) || abs_kernel_dir="$SHELLY_KERNEL_DIR"
+    SHELLY_KERNEL_DIR="$abs_kernel_dir" SKILLS_DIR="$SHELLY_SKILLS_DIR" skills --kernel
 }
 
 cmd_help() {
@@ -595,17 +704,18 @@ shelly — Interactive conversational agent
 Usage:
   shelly send <message>        Send a message (or pipe via stdin)
   shelly repl                  Start interactive REPL
-  shelly new                   Create a new session
-  shelly sessions              List all sessions
-  shelly switch <id>           Switch to a session (prefix match)
+  shelly new <name>            Create a new identity
+  shelly identities            List all identities
+  shelly switch <name>         Switch to an identity (prefix match)
   shelly history               Show conversation history
-  shelly reset                 Reset current session
+  shelly reset                 Reset current identity
   shelly compact               Summarize and compact history
   shelly context               Show assembled system prompt
+  shelly kernel                Show kernel skills with token counts
 
 Memory:
   shelly mem add <text>        Add a memory (or pipe via stdin)
-  shelly mem search <query>    Search memories (semantic via shelllm)
+  shelly mem search <query>    Search memories (semantic via shellm)
   shelly mem list              List memories (dates + slugs)
   shelly mem dump              Print all memory summaries
   shelly mem forget <name>     Delete a memory by name/prefix
@@ -618,6 +728,9 @@ Skills:
   shelly skills --install <src> Install a skill (owner/repo, URL, or path)
   shelly skills --remove <name> Remove an installed skill
   shelly skills --init [name]  Scaffold a new skill
+  shelly skills --promote <name> Promote a skill to kernel
+  shelly skills --demote <name>  Demote a kernel skill
+  shelly skills --kernel       Show kernel skills with token counts
 
 Options:
   --model MODEL           Model to use (default: claude-opus-4-6)
@@ -664,7 +777,7 @@ main() {
         esac
     done
 
-    ensure_session
+    ensure_identity
 
     local cmd="${1:-}"
     [[ -n "$cmd" ]] && shift
@@ -677,13 +790,14 @@ main() {
             cmd_repl
             ;;
         new)
-            cmd_new
+            [[ $# -eq 0 ]] && die "Usage: shelly new <name>"
+            cmd_new "$1"
             ;;
-        sessions|ls)
-            cmd_sessions
+        identities|ls)
+            cmd_identities
             ;;
         switch)
-            [[ $# -eq 0 ]] && die "Usage: shelly switch <session-id>"
+            [[ $# -eq 0 ]] && die "Usage: shelly switch <name>"
             cmd_switch "$1"
             ;;
         history)
@@ -698,11 +812,14 @@ main() {
         context)
             cmd_context
             ;;
+        kernel)
+            cmd_kernel
+            ;;
         mem)
             MEM_DIR="$SHELLY_MEMORIES_DIR" mem "$@"
             ;;
         skills)
-            SKILLS_DIR="$SHELLY_SKILLS_DIR" skills "$@"
+            SKILLS_DIR="$SHELLY_SKILLS_DIR" SHELLY_KERNEL_DIR="$SHELLY_KERNEL_DIR" skills "$@"
             ;;
         help)
             cmd_help

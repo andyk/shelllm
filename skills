@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# skills — Skills manager for shelllm
+# skills — Skills manager for shellm
 # Manages a local directory of skills following the Agent Skills open
 # standard (SKILL.md format). Pure bash, no external dependencies beyond
 # bash 4+, jq, curl, and git.
@@ -11,15 +11,19 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 SKILLS_VERSION="0.1.0"
-SKILLS_DIR="${SKILLS_DIR:-$HOME/.skills}"
+SKILLS_DIR="${SKILLS_DIR:-./.skills}"
+SHELLY_KERNEL_DIR="${SHELLY_KERNEL_DIR:-}"
+SHELLY_KERNEL_TOKEN_BUDGET="${SHELLY_KERNEL_TOKEN_BUDGET:-8000}"
+SKILLS_REMOTES="${SKILLS_REMOTES:-}"
 VERBOSE=0
 
-# Load .env if present
-if [[ -f ".env" ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
+# Source per-repo rc file (flags > env vars > rc file)
+if [[ -f ".skillsrc" ]]; then
+    _pre_env=$(env | grep '^SKILLS_') || true
+    source .skillsrc
+    while IFS='=' read -r k v; do
+        [[ -n "$k" ]] && export "$k=$v"
+    done <<< "$_pre_env"
 fi
 
 # ---------------------------------------------------------------------------
@@ -34,13 +38,15 @@ if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     _dim='\033[90m'
     _blue='\033[1;34m'
     _cyan='\033[36m'
+    _yellow='\033[33m'
     _reset='\033[0m'
 else
-    _bold='' _dim='' _blue='' _cyan='' _reset=''
+    _bold='' _dim='' _blue='' _cyan='' _yellow='' _reset=''
 fi
 
 info() { printf "${_blue}▶${_reset} %b\n" "$*" >&2; }
 dim() { printf "${_dim}  %s${_reset}\n" "$*" >&2; }
+warn() { printf "${_yellow}⚠${_reset} %b\n" "$*" >&2; }
 
 debug() {
     if [[ "$VERBOSE" -eq 1 ]]; then
@@ -59,7 +65,7 @@ frontmatter_field() {
         | sed "s/^[\"']\(.*\)[\"']$/\1/"
 }
 
-# Resolve the skills directory (project-level or global).
+# Resolve the skills directory (project-level or local).
 skills_dir() {
     local project="${1:-0}"
     if [[ "$project" -eq 1 ]]; then
@@ -69,14 +75,41 @@ skills_dir() {
     fi
 }
 
-# Find a skill directory by name. Checks project-level first, then global.
+# Build deduplicated list of skill search directories.
+# Checks: .skills (project), kernel dir (if set), SKILLS_DIR (identity/override)
+_all_skill_dirs() {
+    local d real _seen=""
+    for d in ".skills" ${SHELLY_KERNEL_DIR:+"$SHELLY_KERNEL_DIR"} "$SKILLS_DIR"; do
+        [[ -z "$d" ]] && continue
+        real=$(cd "$d" 2>/dev/null && pwd) || real="$d"
+        case "$_seen" in
+            *"|$real|"*) continue ;;
+        esac
+        _seen="${_seen}|${real}|"
+        echo "$d"
+    done
+}
+
+# Label a skill directory as project, kernel, or local.
+_skill_dir_label() {
+    local dir="$1" dreal kreal
+    dreal=$(cd "$dir" 2>/dev/null && pwd) || dreal="$dir"
+    if [[ "$dir" == ".skills" ]]; then echo "project"
+    elif [[ -n "$SHELLY_KERNEL_DIR" ]]; then
+        kreal=$(cd "$SHELLY_KERNEL_DIR" 2>/dev/null && pwd) || kreal="$SHELLY_KERNEL_DIR"
+        if [[ "$dreal" == "$kreal" ]]; then echo "kernel"; else echo "local"; fi
+    else echo "local"
+    fi
+}
+
+# Find a skill directory by name. Checks project-level first, then kernel, then local.
 # Matches against the frontmatter `name` field, then the directory name.
 # Prints the path to stdout, or returns 1 if not found.
 find_skill() {
     local name="$1"
     local dir skill_dir skill_name
 
-    for dir in ".skills" "$SKILLS_DIR"; do
+    while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
 
         # Match by directory name
@@ -94,8 +127,35 @@ find_skill() {
                 return
             fi
         done
-    done
+    done < <(_all_skill_dirs)
     return 1
+}
+
+# Estimate token count for a file (bytes / 4)
+_token_estimate() {
+    local file="$1"
+    local bytes
+    bytes=$(wc -c < "$file" | tr -d ' ')
+    echo $(( bytes / 4 ))
+}
+
+# Show kernel token budget summary
+_show_kernel_budget() {
+    [[ -z "$SHELLY_KERNEL_DIR" || ! -d "$SHELLY_KERNEL_DIR" ]] && return 0
+
+    local total=0
+    local skill_dir name tokens
+    for skill_dir in "$SHELLY_KERNEL_DIR"/*/; do
+        [[ -f "${skill_dir}SKILL.md" ]] || continue
+        tokens=$(_token_estimate "${skill_dir}SKILL.md")
+        total=$(( total + tokens ))
+    done
+
+    printf "\n"
+    printf "${_dim}Kernel total: ~%d / %d token budget${_reset}\n" "$total" "$SHELLY_KERNEL_TOKEN_BUDGET" >&2
+    if [[ "$total" -gt "$SHELLY_KERNEL_TOKEN_BUDGET" ]]; then
+        warn "Kernel exceeds token budget by ~$(( total - SHELLY_KERNEL_TOKEN_BUDGET )) tokens"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -106,10 +166,9 @@ action_list() {
     local found=0
     local dir label skill_dir name desc
 
-    for dir_info in ".skills:project" "$SKILLS_DIR:global"; do
-        dir="${dir_info%%:*}"
-        label="${dir_info##*:}"
+    while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
+        label=$(_skill_dir_label "$dir")
 
         for skill_dir in "$dir"/*/; do
             [[ -f "${skill_dir}SKILL.md" ]] || continue
@@ -123,7 +182,7 @@ action_list() {
             printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n" \
                 "$name" "${_dim}${desc}" "$label"
         done
-    done
+    done < <(_all_skill_dirs)
 
     if [[ "$found" -eq 0 ]]; then
         echo "No skills installed." >&2
@@ -136,7 +195,7 @@ action_list_json() {
     local first=1
 
     printf '['
-    for dir in ".skills" "$SKILLS_DIR"; do
+    while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
         for skill_dir in "$dir"/*/; do
             [[ -f "${skill_dir}SKILL.md" ]] || continue
@@ -149,7 +208,7 @@ action_list_json() {
             jq -n --arg n "$name" --arg d "$desc" --arg b "$body" \
                 '{name: $n, description: $d, instructions: $b}'
         done
-    done
+    done < <(_all_skill_dirs)
     printf ']\n'
 }
 
@@ -161,7 +220,7 @@ action_search() {
     # --- Local matches ---
     printf "${_bold}Installed${_reset}\n"
 
-    for dir in ".skills" "$SKILLS_DIR"; do
+    while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
         for skill_dir in "$dir"/*/; do
             [[ -f "${skill_dir}SKILL.md" ]] || continue
@@ -174,7 +233,7 @@ action_search() {
                 printf "  ${_bold}%-20s${_reset} %s\n" "$name" "$desc"
             fi
         done
-    done
+    done < <(_all_skill_dirs)
 
     [[ "$found_local" -eq 0 ]] && printf "  ${_dim}No local matches.${_reset}\n"
     echo ""
@@ -305,12 +364,14 @@ action_init() {
 
     # Prompt interactively if not provided
     if [[ -z "$name" ]]; then
-        printf "Skill name: " >&2
-        read -r name
+        if [[ -t 0 ]]; then
+            printf "Skill name: " >&2
+            read -r name
+        fi
         [[ -z "$name" ]] && die "Name is required"
     fi
 
-    if [[ -z "$desc" ]]; then
+    if [[ -z "$desc" ]] && [[ -t 0 ]]; then
         printf "Description: " >&2
         read -r desc
     fi
@@ -342,36 +403,171 @@ EOF
     dim "assets/"
 }
 
+action_promote() {
+    local name="$1"
+
+    [[ -z "$SHELLY_KERNEL_DIR" ]] && die "Not running inside shelly — kernel promotion requires an active identity"
+
+    # Check if already in kernel
+    if [[ -d "$SHELLY_KERNEL_DIR/$name" && -f "$SHELLY_KERNEL_DIR/$name/SKILL.md" ]]; then
+        die "Skill '$name' is already in the kernel"
+    fi
+
+    # Also check by frontmatter name in kernel
+    local kdir
+    for kdir in "$SHELLY_KERNEL_DIR"/*/; do
+        [[ -f "${kdir}SKILL.md" ]] || continue
+        local kname
+        kname=$(frontmatter_field "${kdir}SKILL.md" "name")
+        if [[ "$kname" == "$name" ]]; then
+            die "Skill '$name' is already in the kernel (as $(basename "$kdir"))"
+        fi
+    done
+
+    # Find skill in SKILLS_DIR (identity's skills/)
+    local skill_path=""
+    if [[ -d "$SKILLS_DIR/$name" && -f "$SKILLS_DIR/$name/SKILL.md" ]]; then
+        skill_path="$SKILLS_DIR/$name"
+    else
+        # Try frontmatter name match in SKILLS_DIR only
+        local sdir
+        for sdir in "$SKILLS_DIR"/*/; do
+            [[ -f "${sdir}SKILL.md" ]] || continue
+            local sname
+            sname=$(frontmatter_field "${sdir}SKILL.md" "name")
+            if [[ "$sname" == "$name" ]]; then
+                skill_path="${sdir%/}"
+                break
+            fi
+        done
+    fi
+
+    [[ -z "$skill_path" ]] && die "Skill '$name' not found in skills directory"
+
+    # Move to kernel
+    local dirname
+    dirname=$(basename "$skill_path")
+    mv "$skill_path" "$SHELLY_KERNEL_DIR/$dirname"
+
+    info "Promoted ${_bold}$name${_reset} to kernel"
+    _show_kernel_budget
+}
+
+action_demote() {
+    local name="$1"
+    local force="$2"
+
+    [[ -z "$SHELLY_KERNEL_DIR" ]] && die "Not running inside shelly — kernel demotion requires an active identity"
+
+    # Find skill in kernel
+    local skill_path=""
+    local actual_name=""
+    if [[ -d "$SHELLY_KERNEL_DIR/$name" && -f "$SHELLY_KERNEL_DIR/$name/SKILL.md" ]]; then
+        skill_path="$SHELLY_KERNEL_DIR/$name"
+        actual_name="$name"
+    else
+        local kdir
+        for kdir in "$SHELLY_KERNEL_DIR"/*/; do
+            [[ -f "${kdir}SKILL.md" ]] || continue
+            local kname
+            kname=$(frontmatter_field "${kdir}SKILL.md" "name")
+            if [[ "$kname" == "$name" ]]; then
+                skill_path="${kdir%/}"
+                actual_name="$name"
+                break
+            fi
+        done
+    fi
+
+    [[ -z "$skill_path" ]] && die "Skill '$name' not found in kernel"
+
+    # Refuse to demote mem unless --force
+    if [[ "$actual_name" == "mem" && "$force" -eq 0 ]]; then
+        die "Cannot demote 'mem' (core skill). Use --force to override."
+    fi
+
+    # Move to skills dir
+    local dirname
+    dirname=$(basename "$skill_path")
+    mkdir -p "$SKILLS_DIR"
+    mv "$skill_path" "$SKILLS_DIR/$dirname"
+
+    info "Demoted ${_bold}$name${_reset} from kernel"
+    _show_kernel_budget
+}
+
+action_kernel() {
+    if [[ -z "$SHELLY_KERNEL_DIR" || ! -d "$SHELLY_KERNEL_DIR" ]]; then
+        echo "No kernel directory (not running inside shelly?)." >&2
+        return 0
+    fi
+
+    local found=0
+    local total=0
+    local skill_dir name tokens
+
+    printf "${_bold}Kernel skills${_reset} ${_dim}(loaded on every turn)${_reset}\n" >&2
+
+    for skill_dir in "$SHELLY_KERNEL_DIR"/*/; do
+        [[ -f "${skill_dir}SKILL.md" ]] || continue
+        found=1
+
+        name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
+        [[ -z "$name" ]] && name=$(basename "$skill_dir")
+        tokens=$(_token_estimate "${skill_dir}SKILL.md")
+        total=$(( total + tokens ))
+
+        printf "  ${_bold}%-20s${_reset} ${_dim}~%d tokens${_reset}\n" "$name" "$tokens" >&2
+    done
+
+    if [[ "$found" -eq 0 ]]; then
+        printf "  ${_dim}(empty)${_reset}\n" >&2
+    else
+        printf "${_dim}Total: ~%d / %d token budget${_reset}\n" "$total" "$SHELLY_KERNEL_TOKEN_BUDGET" >&2
+        if [[ "$total" -gt "$SHELLY_KERNEL_TOKEN_BUDGET" ]]; then
+            warn "Kernel exceeds token budget by ~$(( total - SHELLY_KERNEL_TOKEN_BUDGET )) tokens"
+        fi
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 
 usage() {
     cat <<'EOF'
-skills — Skills manager for shelllm
+skills — Skills manager for shellm
 
 Usage:
   skills                                  List all installed skills
-  skills <query>                          Search installed + remote skills
-  skills --install <owner/repo|url|path>  Install a skill
-  skills --remove <name>                  Remove an installed skill
-  skills --show <name>                    Print a skill's full SKILL.md
-  skills --init [name]                    Scaffold a new skill in current dir
-  skills --list-json                      List skills as JSON (for programmatic use)
+  skills list                             List all installed skills
+  skills search <query>                   Search installed + remote skills
+  skills install <owner/repo|url|path>    Install a skill
+  skills remove <name>                    Remove an installed skill
+  skills show <name>                      Print a skill's full SKILL.md
+  skills init [name]                      Scaffold a new skill in current dir
+  skills list-json                        List skills as JSON (for programmatic use)
+  skills promote <name>                   Promote a skill to the kernel
+  skills demote <name>                    Demote a kernel skill back to on-demand
+  skills kernel                           Show kernel skills with token counts
 
 Options:
-  --dir DIR          Use DIR as the skills directory (default: ~/.skills)
-  --project          Target project-level .skills/ instead of global
+  --dir DIR          Use DIR as the skills directory (default: ./.skills)
+  --remotes REMOTES  Comma-separated list of remote skill sources
+  --project          Target project-level .skills/ instead of local
   --force            Skip confirmation prompts
-  --name NAME        Skill name (for --init)
-  --description DESC Skill description (for --init)
+  --name NAME        Skill name (for init)
+  --description DESC Skill description (for init)
   -v, --verbose      Verbose/debug mode
   -h, --help         Show help
   --version          Show version
 
 Environment:
-  SKILLS_DIR   Override global skills directory (default: ~/.skills)
-  NO_COLOR     Disable color output
+  SKILLS_DIR              Override skills directory (default: ./.skills)
+  SKILLS_REMOTES          Remote skill sources (comma-separated)
+  SHELLY_KERNEL_DIR       Kernel directory (set by shelly)
+  SHELLY_KERNEL_TOKEN_BUDGET  Token budget for kernel (default: 8000)
+  NO_COLOR                Disable color output
 EOF
     exit 0
 }
@@ -387,6 +583,22 @@ main() {
     local force=0
     local init_name=""
     local init_desc=""
+
+    # Parse subcommand first (if present)
+    if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
+        case "$1" in
+            list)      action="list";     shift ;;
+            search)    action="search";   shift ;;
+            install)   action="install";  shift ;;
+            remove)    action="remove";   shift ;;
+            show)      action="show";     shift ;;
+            init)      action="init";     shift ;;
+            promote)   action="promote";  shift ;;
+            demote)    action="demote";   shift ;;
+            kernel)    action="kernel";   shift ;;
+            list-json) action="list-json"; shift ;;
+        esac
+    fi
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -409,35 +621,12 @@ main() {
                 project=1
                 shift
                 ;;
+            --remotes)
+                SKILLS_REMOTES="${2:?--remotes requires a value}"
+                shift 2
+                ;;
             --force)
                 force=1
-                shift
-                ;;
-            --install)
-                action="install"
-                action_arg="${2:?--install requires a source (owner/repo, URL, or path)}"
-                shift 2
-                ;;
-            --remove)
-                action="remove"
-                action_arg="${2:?--remove requires a skill name}"
-                shift 2
-                ;;
-            --show)
-                action="show"
-                action_arg="${2:?--show requires a skill name}"
-                shift 2
-                ;;
-            --list-json)
-                action="list-json"
-                shift
-                ;;
-            --init)
-                action="init"
-                if [[ $# -gt 1 && "${2:0:1}" != "-" ]]; then
-                    init_name="$2"
-                    shift
-                fi
                 shift
                 ;;
             --name)
@@ -448,6 +637,15 @@ main() {
                 init_desc="${2:?--description requires a value}"
                 shift 2
                 ;;
+            # Legacy flag forms (still supported)
+            --install)   action="install";  shift ;;
+            --remove)    action="remove";   shift ;;
+            --show)      action="show";     shift ;;
+            --list-json) action="list-json"; shift ;;
+            --init)      action="init";     shift ;;
+            --promote)   action="promote";  shift ;;
+            --demote)    action="demote";   shift ;;
+            --kernel)    action="kernel";   shift ;;
             -*)
                 die "Unknown option: $1 (try skills --help)"
                 ;;
@@ -460,10 +658,33 @@ main() {
     local remaining="$*"
 
     case "$action" in
-        install)   action_install "$action_arg" "$project" ;;
-        remove)    action_remove "$action_arg" "$force" ;;
-        show)      action_show "$action_arg" ;;
+        list)      action_list ;;
         list-json) action_list_json ;;
+        kernel)    action_kernel ;;
+        install)
+            [[ -z "$remaining" ]] && die "install requires a source (owner/repo, URL, or path)"
+            action_install "$remaining" "$project"
+            ;;
+        remove)
+            [[ -z "$remaining" ]] && die "remove requires a skill name"
+            action_remove "$remaining" "$force"
+            ;;
+        show)
+            [[ -z "$remaining" ]] && die "show requires a skill name"
+            action_show "$remaining"
+            ;;
+        promote)
+            [[ -z "$remaining" ]] && die "promote requires a skill name"
+            action_promote "$remaining"
+            ;;
+        demote)
+            [[ -z "$remaining" ]] && die "demote requires a skill name"
+            action_demote "$remaining" "$force"
+            ;;
+        search)
+            [[ -z "$remaining" ]] && die "search requires a query"
+            action_search "$remaining"
+            ;;
         init)
             [[ -z "$init_name" && -n "$remaining" ]] && init_name="$remaining"
             action_init "$init_name" "$init_desc" "$project"

@@ -17,26 +17,26 @@ LLMs are text-in, text-out. The Unix shell is an environment where *everything* 
 
 Most agent frameworks give the LLM a curated menu of function calls: `search_web`, `read_file`, `run_sql`. If your menu doesn't include a capability, the model can't do it. The shell inverts this. Instead of enumerating tools, you drop the LLM into a composable environment and let it figure out what to do. `curl` is the HTTP client. `jq` is the JSON processor. `python3 -c` is the escape hatch. No schemas to define, no wrappers to write — the model composes tools the same way a human would, by piping them together.
 
-shell<sup>LM</sup> takes this idea seriously. It's four small, composable tools — all pure bash — that together form a full agent stack. Each one does one thing well. They compose through the filesystem and environment variables, just like Unix intended.
+shellm takes this idea seriously. It's four small, composable tools — all pure bash — that together form a full agent stack. Each one does one thing well. They compose through the filesystem and environment variables, just like Unix intended.
 
 | Tool | What it does |
 |------|-------------|
-| **shelllm** | The core loop — sends context to Claude, executes the bash it writes back, repeats |
+| **shellm** | The core loop — sends context to Claude, executes the bash it writes back, repeats |
 | **shelly** | Interactive conversational agent with identity, memory, and skills |
 | **mem** | CLI memory store — markdown files with YAML frontmatter, no database |
 | **skills** | Skill manager — install, create, and use SKILL.md-based agent abilities |
 
-shell<sup>LM</sup> is the engine at the center. The other three build on it to get from a stateless tool to a stateful agent — with memory, learned abilities, and persistent identity across sessions.
+shellm is the engine at the center. The other three build on it to get from a stateless tool to a stateful agent — with memory, learned abilities, and persistent identity across sessions.
 
 ## Install
 
 ```bash
-git clone https://github.com/andyk/shelllm.git
-cd shelllm
+git clone https://github.com/andyk/shellm.git
+cd shellm
 ./install.sh
 ```
 
-This copies `shelllm`, `shelly`, `mem`, and `skills` to `/usr/local/bin`. Use `--symlinks` to symlink instead (edits take effect without reinstalling), or `--prefix ~/.local/bin` for a different location.
+This copies `shellm`, `shelly`, `mem`, and `skills` to `/usr/local/bin`. Use `--symlinks` to symlink instead (edits take effect without reinstalling), or `--prefix ~/.local/bin` for a different location.
 
 ## Quick start
 
@@ -45,25 +45,25 @@ This copies `shelllm`, `shelly`, `mem`, and `skills` to `/usr/local/bin`. Use `-
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Run it
-shelllm what is the mass of jupiter in kilograms
+shellm what is the mass of jupiter in kilograms
 
 # Pipe data in
-cat dataset.csv | shelllm summarize this data and find outliers
+cat dataset.csv | shellm summarize this data and find outliers
 
 # Pass files
-shelllm -f paper.pdf -f notes.txt compare these documents
+shellm -f paper.pdf -f notes.txt compare these documents
 
 # Quotes are optional for inline context
-shelllm research the latest advances in protein folding and write a summary
+shellm research the latest advances in protein folding and write a summary
 ```
 
-## How shell<sup>LM</sup> works
+## How shellm works
 
-shell<sup>LM</sup> runs a loop:
+shellm runs a loop:
 
 1. Sends your context to Claude with a system prompt that says "write bash code"
 2. Claude responds with a ` ```bash ` code block
-3. shell<sup>LM</sup> executes the code (in Docker if available, locally otherwise)
+3. shellm executes the code (in Docker if available, locally otherwise)
 4. Output streams back to Claude as the next message
 5. Repeat until the code sets `FINAL="answer"` or hits max iterations
 
@@ -71,7 +71,7 @@ The LLM has full shell access. It can curl APIs, parse data with jq, write Pytho
 
 ### What you see
 
-shell<sup>LM</sup> streams everything live. Commands show in cyan, output in dim:
+shellm streams everything live. Commands show in cyan, output in dim:
 
 ```
 ▶ Iteration 1/25 — calling Claude API...
@@ -88,7 +88,7 @@ shell<sup>LM</sup> streams everything live. Commands show in cyan, output in dim
 Found 42 results
 ```
 
-If a command hangs (waiting for interactive input), the inactivity watchdog kills it after `SHELLLM_INACTIVITY_TIMEOUT` seconds (default 30) and gives the LLM structured feedback on what went wrong.
+If a command hangs (waiting for interactive input), the inactivity watchdog kills it after `SHELLM_INACTIVITY_TIMEOUT` seconds (default 30) and gives the LLM structured feedback on what went wrong.
 
 ### Completion signals
 
@@ -103,10 +103,10 @@ echo "detailed report..." > report.txt
 FINAL_FILE=report.txt
 ```
 
-shell<sup>LM</sup> captures the value and prints it to stdout. Everything else (progress, commands, debug) goes to stderr, so you can pipe the final answer:
+shellm captures the value and prints it to stdout. Everything else (progress, commands, debug) goes to stderr, so you can pipe the final answer:
 
 ```bash
-shelllm -f data.csv compute the average > result.txt
+shellm -f data.csv compute the average > result.txt
 ```
 
 ### Context
@@ -116,57 +116,57 @@ There are three ways to pass context:
 **Inline** — everything after the flags is your context (quotes optional):
 
 ```bash
-shelllm explain why the sky is blue
-shelllm "explain why the sky is blue"  # same thing
+shellm explain why the sky is blue
+shellm "explain why the sky is blue"  # same thing
 ```
 
 **Files** — use `-f` one or more times. Contents become `$FILE_CONTEXT1`, `$FILE_CONTEXT2`, etc:
 
 ```bash
-shelllm -f data.json analyze this
-shelllm -f chapter1.txt -f chapter2.txt compare these chapters
+shellm -f data.json analyze this
+shellm -f chapter1.txt -f chapter2.txt compare these chapters
 ```
 
 **Stdin** — piped data becomes `$CONTEXT`:
 
 ```bash
-curl https://example.com | shelllm what is this page about
-git diff | shelllm review this diff for bugs
+curl https://example.com | shellm what is this page about
+git diff | shellm review this diff for bugs
 ```
 
 These can be combined:
 
 ```bash
-cat errors.log | shelllm -f config.yaml diagnose why the service is failing
+cat errors.log | shellm -f config.yaml diagnose why the service is failing
 ```
 
 ### Nested calls
 
-Code generated by shell<sup>LM</sup> can call shell<sup>LM</sup> itself:
+Code generated by shellm can call shellm itself:
 
-**`shelllm "prompt"`** — starts a fresh nested run. The child gets its own conversation history and workspace. Good for independent subtasks:
-
-```bash
-# Inside generated code
-category=$(shelllm "classify this text as positive/negative/neutral: $text")
-```
-
-**`shelllm --fork "prompt"`** — forks the current conversation history and workspace into a sub-loop. The child gets full context of what happened so far, plus its own copy of all workspace files:
+**`shellm "prompt"`** — starts a fresh nested run. The child gets its own conversation history and workspace. Good for independent subtasks:
 
 ```bash
 # Inside generated code
-result=$(shelllm --fork "now take the data we found and build a visualization")
+category=$(shellm "classify this text as positive/negative/neutral: $text")
 ```
 
-`--fork` is useful when a subtask needs the parent's conversation context. For independent subtasks, plain `shelllm` is simpler and avoids the child re-interpreting the parent's instructions.
+**`shellm --fork "prompt"`** — forks the current conversation history and workspace into a sub-loop. The child gets full context of what happened so far, plus its own copy of all workspace files:
 
-Nesting depth is capped by `--max-depth` (default 3) to prevent runaway costs. Sub-runs are stored inside the parent workspace under `.shelllm/sub-runs/`.
+```bash
+# Inside generated code
+result=$(shellm --fork "now take the data we found and build a visualization")
+```
+
+`--fork` is useful when a subtask needs the parent's conversation context. For independent subtasks, plain `shellm` is simpler and avoids the child re-interpreting the parent's instructions.
+
+Nesting depth is capped by `--max-depth` (default 3) to prevent runaway costs. Sub-runs are stored inside the parent workspace under `.shellm/sub-runs/`.
 
 ### Interactive command handling
 
 Generated code runs with stdin connected to `/dev/null`. Interactive prompts (password dialogs, `[y/N]` confirmations, `read` commands) get immediate EOF instead of hanging.
 
-If a process produces no output for `SHELLLM_INACTIVITY_TIMEOUT` seconds (default 30), the watchdog kills it and sends the LLM structured feedback:
+If a process produces no output for `SHELLM_INACTIVITY_TIMEOUT` seconds (default 30), the watchdog kills it and sends the LLM structured feedback:
 
 ```
 Execution was KILLED after 30 seconds of inactivity
@@ -181,7 +181,7 @@ The LLM sees this and retries with non-interactive flags. For commands that trul
 
 ### Docker sandboxing
 
-If Docker is running, shell<sup>LM</sup> automatically executes code inside a container. This means:
+If Docker is running, shellm automatically executes code inside a container. This means:
 
 - The LLM can't accidentally modify your host system
 - It can install packages (`apt-get install`) without affecting your machine
@@ -190,41 +190,56 @@ If Docker is running, shell<sup>LM</sup> automatically executes code inside a co
 
 ```bash
 # Auto-detected (default)
-shelllm do something risky
+shellm do something risky
 
-# Force local execution
-shelllm --no-docker do something risky
+# Force local execution (use the "local" workspace)
+shellm --workspace local do something risky
 
 # Use a different base image
-shelllm --docker-image python:3.12-slim write a flask app
+shellm --docker-image python:3.12-slim write a flask app
+
+# Teardown container on exit instead of persisting
+shellm --temp-docker do something risky
 ```
 
 Docker detection works like this:
-- If Docker daemon is running and `--no-docker` isn't set → uses Docker
+- If Docker daemon is running and workspace isn't `local` → uses Docker
 - If already inside a Docker container (e.g. CI) → runs locally (no nesting)
 - If Docker isn't installed → runs locally
 
-### Workspace
+### Workspaces
 
-Each shell<sup>LM</sup> run gets a persistent workspace directory under `~/.shelllm/runs/<timestamp>_<slug>/`:
+A **workspace** is a named execution environment — either a Docker container or "local" (the host machine). Multiple runs can share a workspace, so installed packages and system modifications persist across conversations.
 
-- All generated code executes in `$SHELLLM_WORKSPACE`
+Each run also has a **workdir** — a file directory under `~/.shellm/runs/<timestamp>_<slug>/`:
+
+- All generated code executes in `$SHELLM_WORKDIR`
 - Files created by the agent persist across iterations
 - `.final` holds the completion answer
 - `.messages.json` holds conversation history
-- `.shelllm/sub-runs/` contains nested child runs
+- `.shellm/sub-runs/` contains nested child runs
 
-Workspaces persist after the run ends, so you can inspect results or resume later:
+Workspace metadata is stored in `~/.shellm/workspaces/<name>/`.
 
 ```bash
-# Inspect a past run
-ls ~/.shelllm/runs/
+# Inspect past runs
+ls ~/.shellm/runs/
 
-# Use a custom workspace directory instead
-shelllm --workspace ./my-run research something complex
+# Use a custom workdir
+shellm --workdir ./my-run research something complex
+
+# Use a named workspace (Docker container persists between runs)
+shellm --workspace my-project do something
+shellm --workspace my-project --continue do something else  # reuses container
+
+# Run on host (no Docker)
+shellm --workspace local do something
+
+# Teardown container on exit
+shellm --temp-docker do something risky
 ```
 
-With Docker, the workspace is bind-mounted into the container at the same path, so files written inside the container appear on the host and vice versa.
+With Docker, the workdir is bind-mounted into the container at the same path, so files written inside the container appear on the host and vice versa.
 
 ### Session management
 
@@ -232,17 +247,17 @@ You can resume past sessions to continue where you left off:
 
 ```bash
 # Resume the most recent session
-shelllm --continue "now summarize what you found"
+shellm --continue "now summarize what you found"
 
 # Resume a specific session by name prefix
-shelllm --start-from 2025-01-15 "try a different approach"
+shellm --start-from 2025-01-15 "try a different approach"
 ```
 
 The resumed session picks up the full conversation history, so the LLM remembers everything from the previous run.
 
 ## From tool to agent: shelly, mem, and skills
 
-shell<sup>LM</sup> is a powerful primitive, but it's stateless. Each run starts fresh — no memory of what happened last time, no learned abilities, no persistent identity. To get from a tool to an agent, you need memory, skills, and a way to tie them together across conversations.
+shellm is a powerful primitive, but it's stateless. Each run starts fresh — no memory of what happened last time, no learned abilities, no persistent identity. To get from a tool to an agent, you need memory, skills, and a way to tie them together across conversations.
 
 ### mem
 
@@ -258,7 +273,7 @@ mem add --type fact "the project uses React 19"
 # Search and browse
 mem list                    # List all (date + slug)
 mem dump                    # Print all summaries
-mem search "user prefs"     # Semantic search (uses shelllm)
+mem search "user prefs"     # Semantic search (uses shellm)
 
 # Edit and remove
 mem edit <name> "new text"  # Update a memory
@@ -297,7 +312,7 @@ Skills live in `SKILLS_DIR` (default: `~/.skills/`). shelly also has per-session
 
 ### shelly
 
-shelly ties it all together. It's an interactive conversational agent that wraps shell<sup>LM</sup>, mem, and skills into a stateful chat experience with session management.
+shelly ties it all together. It's an interactive conversational agent that wraps shellm, mem, and skills into a stateful chat experience with session management.
 
 ```bash
 # Start the REPL
@@ -355,18 +370,19 @@ All configuration is available as both CLI flags and environment variables. Flag
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `--model` | `SHELLLM_MODEL` | `claude-opus-4-6` | Claude model to use |
-| `--max-iterations` | `SHELLLM_MAX_ITERATIONS` | `25` | Max loop iterations before giving up |
-| `--max-tokens` | `SHELLLM_MAX_TOKENS` | `16000` | Max tokens per API response |
-| `--thinking-budget` | `SHELLLM_THINKING_BUDGET` | `10000` | Extended thinking token budget |
-| `--max-depth` | `SHELLLM_MAX_DEPTH` | `3` | Max nesting depth for `--fork` and nested calls |
-| — | `SHELLLM_INACTIVITY_TIMEOUT` | `30` | Seconds before killing idle execution |
-| `--workspace DIR` | — | `~/.shelllm/runs/...` | Workspace directory |
-| `--fork` | — | — | Fork current session into a sub-run (inside shelllm only) |
+| `--model` | `SHELLM_MODEL` | `claude-opus-4-6` | Claude model to use |
+| `--max-iterations` | `SHELLM_MAX_ITERATIONS` | `25` | Max loop iterations before giving up |
+| `--max-tokens` | `SHELLM_MAX_TOKENS` | `16000` | Max tokens per API response |
+| `--thinking-budget` | `SHELLM_THINKING_BUDGET` | `10000` | Extended thinking token budget |
+| `--max-depth` | `SHELLM_MAX_DEPTH` | `3` | Max nesting depth for `--fork` and nested calls |
+| — | `SHELLM_INACTIVITY_TIMEOUT` | `30` | Seconds before killing idle execution |
+| `--workdir DIR` | — | `~/.shellm/runs/...` | Working directory for the run |
+| `--workspace NAME` | `SHELLM_WORKSPACE` | auto-generated | Named execution environment (Docker container or `local`) |
+| `--temp-docker` | `SHELLM_TEMP_DOCKER=1` | off | Teardown Docker container on exit |
+| `--fork` | — | — | Fork current session into a sub-run (inside shellm only) |
 | `--continue` | — | — | Resume the most recent session |
 | `--start-from NAME` | — | — | Resume a specific session (prefix match) |
-| `--no-docker` | `SHELLLM_NO_DOCKER=1` | off | Disable Docker sandboxing |
-| `--docker-image` | `SHELLLM_DOCKER_IMAGE` | `ubuntu:latest` | Docker image to use |
+| `--docker-image` | `SHELLM_DOCKER_IMAGE` | `ubuntu:latest` | Docker image to use |
 | `-f FILE` | — | — | Add file context (repeatable) |
 | `-v, --verbose` | — | off | Show debug output |
 | `-q, --quiet` | — | off | Suppress progress output, keep only final answer |
@@ -375,8 +391,8 @@ You can also put settings in a `.env` file in the working directory:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
-SHELLLM_MODEL=claude-opus-4-7-20250715
-SHELLLM_MAX_ITERATIONS=10
+SHELLM_MODEL=claude-opus-4-7-20250715
+SHELLM_MAX_ITERATIONS=10
 ```
 
 ## Prerequisites
@@ -395,28 +411,28 @@ SHELLLM_MAX_ITERATIONS=10
 
 ```bash
 # Weekly research brief
-shelllm research the five most important ai launches from the last 7 days and summarize them in a markdown table with sources
+shellm research the five most important ai launches from the last 7 days and summarize them in a markdown table with sources
 
 # Travel planning from live web data
-shelllm find the cheapest 3-night tokyo trips from san francisco in october and show the best date patterns and booking sources
+shellm find the cheapest 3-night tokyo trips from san francisco in october and show the best date patterns and booking sources
 
 # Vendor landscape research
-shelllm compare the top open-source observability stacks for a 20-person saas startup and recommend one
+shellm compare the top open-source observability stacks for a 20-person saas startup and recommend one
 
 # Competitor mapping
-shelllm map the market for ai coding agents including pricing, key features, and the most notable launches this quarter
+shellm map the market for ai coding agents including pricing, key features, and the most notable launches this quarter
 
 # Multi-source news synthesis
-shelllm reconstruct a timeline of the latest major nvidia announcements from primary sources and reputable coverage
+shellm reconstruct a timeline of the latest major nvidia announcements from primary sources and reputable coverage
 
-# Delegate subtasks to nested shelllm runs
-shelllm research the ai coding agent market, split the work into data gathering and synthesis using nested shelllm calls, and write the final report to report.md
+# Delegate subtasks to nested shellm runs
+shellm research the ai coding agent market, split the work into data gathering and synthesis using nested shellm calls, and write the final report to report.md
 ```
 
 ## Architecture
 
 ```
-shelllm                      The execution engine
+shellm                      The execution engine
 ├── run_loop()               Core iteration: call Claude → extract code → execute → repeat
 │   ├── call_claude()        Streaming API call with early code-block cutoff
 │   ├── extract_code()       Pull first ```bash block from response
@@ -431,15 +447,15 @@ shelllm                      The execution engine
 
 shelly                       Conversational agent
 ├── cmd_repl()               Interactive REPL with Ctrl+C support
-├── cmd_send()               Send message → assemble context → call shelllm
+├── cmd_send()               Send message → assemble context → call shellm
 ├── assemble_context()       Personality + memories + skills → system prompt
 ├── Session management       new, switch, history, reset, compact
-└── Passes MEM_DIR/SKILLS_DIR to shelllm environment
+└── Passes MEM_DIR/SKILLS_DIR to shellm environment
 
 mem                          File-based memory store
 ├── add / forget / edit      CRUD on markdown files with YAML frontmatter
 ├── list / dump              Browse memories
-└── search                   Semantic search via shelllm
+└── search                   Semantic search via shellm
 
 skills                       Skill manager
 ├── list / search            Browse local + GitHub skills
@@ -452,4 +468,4 @@ All pure bash. No dependencies beyond bash, jq, and curl.
 
 ## Acknowledgements
 
-shell<sup>LM</sup> is a port of [Recursive Language Models (RLM)](https://alexzhang13.github.io/blog/2025/rlm/) by Alex Zhang to bash, for bash.
+shellm is a port of [Recursive Language Models (RLM)](https://alexzhang13.github.io/blog/2025/rlm/) by Alex Zhang to bash, for bash.
