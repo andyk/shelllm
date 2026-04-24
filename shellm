@@ -9,16 +9,16 @@ set -euo pipefail
 # Config & defaults
 # ---------------------------------------------------------------------------
 
-SHELLM_MODEL="${SHELLM_MODEL:-claude-opus-4-6}"
+SHELLM_MODEL="${SHELLM_MODEL:-claude-opus-4-7}"
 SHELLM_MAX_ITERATIONS="${SHELLM_MAX_ITERATIONS:-25}"
 SHELLM_TRUNCATE="${SHELLM_TRUNCATE:-2000}"
 SHELLM_API_URL="${SHELLM_API_URL:-https://api.anthropic.com/v1/messages}"
+export LLM_API_URL="$SHELLM_API_URL"
 SHELLM_MAX_TOKENS="${SHELLM_MAX_TOKENS:-16000}"
-SHELLM_THINKING_BUDGET="${SHELLM_THINKING_BUDGET:-10000}"
+SHELLM_EFFORT="${SHELLM_EFFORT:-high}"
+SHELLM_MAX_DEPTH="${SHELLM_MAX_DEPTH:-5}"
 SHELLM_DOCKER_IMAGE="${SHELLM_DOCKER_IMAGE:-ubuntu:latest}"
 SHELLM_TEMP_DOCKER="${SHELLM_TEMP_DOCKER:-0}"
-SHELLM_DEPTH="${SHELLM_DEPTH:-0}"
-SHELLM_MAX_DEPTH="${SHELLM_MAX_DEPTH:-3}"
 SHELLM_INACTIVITY_TIMEOUT="${SHELLM_INACTIVITY_TIMEOUT:-30}"
 VERBOSE=0
 QUIET=0
@@ -94,33 +94,29 @@ Options:
   -v, --verbose        Verbose/debug mode
   -q, --quiet          Suppress all progress/streaming output (stderr), keep only final answer
   -h, --help           Show this help
-  --model MODEL        Model to use (default: claude-opus-4-6)
+  --model MODEL        Model to use (default: claude-opus-4-7)
   --max-iterations N   Max loop iterations (default: 25)
   --max-tokens N       Max tokens per response (default: 16000)
-  --thinking-budget N  Extended thinking budget (default: 10000)
-  --max-depth N        Max recursion depth for nested --fork calls (default: 3)
+  --effort LEVEL       Thinking effort: low, medium, high, xhigh, max (default: high)
+  --max-depth N        Max recursion depth for nested shellm calls (default: 5)
   --workdir DIR        Use specific working directory (preserved after run)
-  --workspace NAME     Use/create a named workspace (Docker container or local)
+  --env NAME           Use/create a named env (Docker container or local)
+  --new-env            Force creation of a new env (cannot combine with --env)
   --temp-docker        Teardown Docker container on exit (default: persist)
   --system-prompt FILE Override the default system prompt with contents of FILE
-  --fork               Fork current session history + workspace (only inside shellm)
   --docker-image IMAGE Docker image to use (default: ubuntu:latest)
   --print-system-prompt Print the system prompt and exit
-
-Session Management:
-  --continue "prompt"    Resume most recent session with new instruction
-  --start-from NAME "prompt"  Resume a specific session (prefix match, must be unique)
 
 Environment:
   ANTHROPIC_API_KEY        Required. Your Anthropic API key.
   SHELLM_MODEL            Model to use
   SHELLM_MAX_ITERATIONS   Max loop iterations
   SHELLM_MAX_TOKENS       Max tokens per response
-  SHELLM_THINKING_BUDGET  Extended thinking budget
-  SHELLM_MAX_DEPTH        Max recursion depth for nested --fork calls
+  SHELLM_EFFORT           Thinking effort level (low/medium/high/xhigh/max)
+  SHELLM_MAX_DEPTH        Max recursion depth for nested shellm calls
   SHELLM_SYSTEM_PROMPT    Override the default system prompt text
   SHELLM_DOCKER_IMAGE     Docker image to use
-  SHELLM_WORKSPACE        Named workspace (execution environment)
+  SHELLM_ENV              Named env (execution environment)
   SHELLM_TEMP_DOCKER      Set to 1 to teardown Docker container on exit
   SHELLM_INACTIVITY_TIMEOUT  Seconds before killing idle execution (default: 30)
   SHELLM_WORKDIR          (Internal) Working directory for current session
@@ -181,6 +177,49 @@ redact_sensitive() {
     fi
 
     printf '%s' "$output" | LC_ALL=C sed -E 's/sk-ant-[A-Za-z0-9._-]+/<redacted-anthropic-key>/g'
+}
+
+# ---------------------------------------------------------------------------
+# session.jsonl helpers (shellm serialization format)
+# ---------------------------------------------------------------------------
+
+_shellm_time() {
+    date +%s
+}
+
+emit_event() {
+    [[ -z "${SHELLM_CAST_FILE:-}" ]] && return
+    local etype="$1" data="$2"
+    local now elapsed
+    now=$(_shellm_time)
+    elapsed=$(( now - ${_SHELLM_START_TIME:-0} ))
+    jq -n -c \
+        --arg type "$etype" \
+        --argjson time "$elapsed" \
+        --arg data "$data" \
+        '{type:$type,time:$time,data:$data}' >> "$SHELLM_CAST_FILE"
+}
+
+emit_cast_header() {
+    local model="$1" wd="$2"
+    _SHELLM_START_TIME=$(_shellm_time)
+    local ts=${_SHELLM_START_TIME%.*}
+    jq -n -c \
+        --argjson version 1 \
+        --arg format "shellm" \
+        --argjson timestamp "$ts" \
+        --arg model "$model" \
+        --arg workdir "$wd" \
+        '{version:$version,format:$format,timestamp:$timestamp,model:$model,workdir:$workdir}' \
+        > "$SHELLM_CAST_FILE"
+}
+
+extract_reasoning() {
+    local response="$1"
+    printf '%s\n' "$response" | awk '
+        /^```(bash|sh)?[[:space:]]*$/ { exit }
+        { print }
+    '
 }
 
 # ---------------------------------------------------------------------------
@@ -307,11 +346,13 @@ docker_setup() {
         extra_mounts+=(-v "$abs_dir:$abs_dir:ro")
     done
 
-    # Create and start container with workspace + shellm mounted
+    # Mount the runs dir (parent of workspace) so the container can be reused
+    # across runs without needing new bind mounts.
+    local runs_mount="$HOME/.shellm"
     _SHELLM_CONTAINER=$(docker run -d \
         --name "shellm-$$" \
         --user "$(id -u):$(id -g)" \
-        -v "$workspace:$workspace" \
+        -v "$runs_mount:$runs_mount" \
         -v "$shellm_path:/usr/local/bin/shellm:ro" \
         "${extra_mounts[@]+"${extra_mounts[@]}"}" \
         -w "$workspace" \
@@ -319,12 +360,15 @@ docker_setup() {
         "$SHELLM_DOCKER_IMAGE" \
         sleep infinity)
 
-    # Install essential tools as root for shellm and generated code.
+    # Install essential tools as root and grant passwordless sudo.
     progress_dim "Installing tools in container..."
     docker exec --user 0:0 "$_SHELLM_CONTAINER" \
         bash -c '
         apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq jq curl python3 tmux >/dev/null 2>&1
+        apt-get install -y -qq jq curl python3 tmux sudo >/dev/null 2>&1
+        # Grant passwordless sudo to the container user
+        echo "ALL ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/shellm
+        chmod 0440 /etc/sudoers.d/shellm
         ' >/dev/null 2>&1 || {
         progress "Warning: could not install tools in container"
     }
@@ -363,17 +407,17 @@ docker_attach() {
 }
 
 # ---------------------------------------------------------------------------
-# Workspace management
+# Env management
 # ---------------------------------------------------------------------------
 
-SHELLM_WORKSPACES_DIR="$HOME/.shellm/workspaces"
+SHELLM_ENVS_DIR="$HOME/.shellm/envs"
 
-# Create or reattach to a named workspace.
+# Create or reattach to a named env.
 # Sets _SHELLM_CONTAINER and _SHELLM_DOCKER_MODE if docker type.
 # Returns 0 on success.
-workspace_resolve() {
+env_resolve() {
     local name="$1"
-    local ws_dir="$SHELLM_WORKSPACES_DIR/$name"
+    local ws_dir="$SHELLM_ENVS_DIR/$name"
     mkdir -p "$ws_dir"
 
     if [[ -f "$ws_dir/container_id" ]]; then
@@ -390,30 +434,55 @@ workspace_resolve() {
     return 1
 }
 
-# Register a workspace after docker_setup creates a container.
-workspace_register() {
+# Find any running shellm env. Prints its name and returns 0, or returns 1.
+env_find_running() {
+    [[ -d "$SHELLM_ENVS_DIR" ]] || return 1
+    local name
+    for d in "$SHELLM_ENVS_DIR"/*/; do
+        [[ -d "$d" ]] || continue
+        [[ -f "$d/container_id" ]] || continue
+        local cid
+        cid=$(cat "$d/container_id" 2>/dev/null) || continue
+        local state
+        state=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null) || continue
+        if [[ "$state" == "running" ]]; then
+            basename "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Register an env after docker_setup creates a container.
+env_register() {
     local name="$1"
-    local ws_dir="$SHELLM_WORKSPACES_DIR/$name"
+    local ws_dir="$SHELLM_ENVS_DIR/$name"
     mkdir -p "$ws_dir"
     printf '%s' "$_SHELLM_CONTAINER" > "$ws_dir/container_id"
     printf 'docker\n' > "$ws_dir/type"
     printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ws_dir/created"
+
+    # Save image metadata for reproducibility
+    printf '%s\n' "$SHELLM_DOCKER_IMAGE" > "$ws_dir/image"
+    local digest
+    digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$SHELLM_DOCKER_IMAGE" 2>/dev/null || true)
+    [[ -n "$digest" ]] && printf '%s\n' "$digest" > "$ws_dir/image_digest"
 }
 
-# Register a local (non-docker) workspace.
-workspace_register_local() {
+# Register a local (non-docker) env.
+env_register_local() {
     local name="$1"
-    local ws_dir="$SHELLM_WORKSPACES_DIR/$name"
+    local ws_dir="$SHELLM_ENVS_DIR/$name"
     mkdir -p "$ws_dir"
     printf 'local\n' > "$ws_dir/type"
     printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ws_dir/created"
     rm -f "$ws_dir/container_id"
 }
 
-# Tear down a workspace's Docker container and remove its metadata.
-workspace_destroy() {
+# Tear down an env's Docker container and remove its metadata.
+env_destroy() {
     local name="$1"
-    local ws_dir="$SHELLM_WORKSPACES_DIR/$name"
+    local ws_dir="$SHELLM_ENVS_DIR/$name"
     if [[ -f "$ws_dir/container_id" ]]; then
         local container_id
         container_id=$(cat "$ws_dir/container_id" 2>/dev/null || true)
@@ -424,8 +493,8 @@ workspace_destroy() {
     rm -rf "$ws_dir"
 }
 
-# Generate a workspace name from a prompt string.
-make_workspace_name_auto() {
+# Generate an env name from a prompt string.
+make_env_name() {
     local context="$1"
     local slug
     slug=$(printf '%s' "$context" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-40)
@@ -465,152 +534,36 @@ execute_code() {
 }
 
 # ---------------------------------------------------------------------------
-# Claude API call
+# LLM API call (delegates to the `llm` tool)
 # ---------------------------------------------------------------------------
 
-call_claude() {
+call_llm() {
     local system_prompt="$1"
     local messages_json="$2"
     local thinking_output_file="${3:-}"
 
-    [[ -z "${ANTHROPIC_API_KEY:-}" ]] && die "ANTHROPIC_API_KEY is not set"
+    local -a args=(--stream -m "$SHELLM_MODEL" -t "$SHELLM_MAX_TOKENS"
+        --effort "$SHELLM_EFFORT" --thinking -s "$system_prompt" -M "$messages_json")
 
-    local payload
-    payload=$(jq -n \
-        --arg model "$SHELLM_MODEL" \
-        --argjson max_tokens "$SHELLM_MAX_TOKENS" \
-        --argjson thinking_budget "$SHELLM_THINKING_BUDGET" \
-        --arg system "$system_prompt" \
-        --argjson messages "$messages_json" \
-        '{
-            model: $model,
-            max_tokens: $max_tokens,
-            stream: true,
-            thinking: {
-                type: "enabled",
-                budget_tokens: $thinking_budget
-            },
-            system: $system,
-            messages: $messages
-        }')
-
-    # Stream response from API while also capturing the raw body so we can
-    # report non-SSE HTTP errors clearly.
-    local text_file raw_file headers_file http_code_file err_file body_pipe
+    local text_file
     text_file=$(mktemp)
-    raw_file=$(mktemp)
-    headers_file=$(mktemp)
-    http_code_file=$(mktemp)
-    err_file=$(mktemp)
-    body_pipe=$(mktemp -u)
-    mkfifo "$body_pipe"
-    local _stream_block=""
-    local _stream_error=""
-    local _got_events=0
 
-    curl -sS -N \
-        -D "$headers_file" \
-        -o >(tee "$raw_file" > "$body_pipe") \
-        -w '%{http_code}' \
-        "$SHELLM_API_URL" \
-        -H "content-type: application/json" \
-        -H "x-api-key: $ANTHROPIC_API_KEY" \
-        -H "anthropic-version: 2023-06-01" \
-        -d "$payload" >"$http_code_file" 2>"$err_file" &
-    local curl_pid=$!
-
-    while IFS= read -r raw_line; do
-        local line="${raw_line%$'\r'}"
-
-        # Only process SSE data lines
-        [[ "$line" != data:\ * ]] && continue
-        local json="${line#data: }"
-        [[ "$json" == "[DONE]" ]] && continue
-        _got_events=1
-
-        # Route events using shell pattern matching (avoids jq for non-delta events)
-        case "$json" in
-            *'"content_block_start"'*)
-                if [[ "$json" == *'"thinking"'* ]]; then
-                    _stream_block="thinking"
-                    [[ "$QUIET" -eq 0 ]] && printf '\033[90m  ◐ Thinking...\n\033[0m' >&2
-                elif [[ "$json" == *'"text"'* ]]; then
-                    _stream_block="text"
-                fi
-                ;;
-            *'"content_block_delta"'*)
-                if [[ "$_stream_block" == "thinking" ]]; then
-                    local _thinking_chunk
-                    _thinking_chunk=$(printf '%s' "$json" | jq -j '.delta.thinking // empty')
-                    [[ "$QUIET" -eq 0 ]] && printf '%s' "$_thinking_chunk" >&2
-                    if [[ -n "$thinking_output_file" ]]; then
-                        printf '%s' "$_thinking_chunk" >> "$thinking_output_file"
-                    fi
-                elif [[ "$_stream_block" == "text" ]]; then
-                    local _chunk
-                    _chunk=$(printf '%s' "$json" | jq -j '.delta.text // empty')
-                    if [[ -n "$_chunk" ]]; then
-                        printf '%s' "$_chunk" >> "$text_file"
-                        [[ "$QUIET" -eq 0 ]] && printf '%s' "$_chunk" >&2
-                    fi
-                fi
-                ;;
-            *'"content_block_stop"'*)
-                if [[ -n "$_stream_block" ]]; then
-                    [[ "$QUIET" -eq 0 ]] && printf '\n' >&2
-                fi
-                _stream_block=""
-                ;;
-            *'"type":"error"'*)
-                _stream_error=$(printf '%s' "$json" | jq -r '.error.message // "unknown error"')
-                ;;
-        esac
-    done <"$body_pipe"
-
-    wait "$curl_pid"
-    local curl_rc=$?
-    local http_code curl_err error_message
-    http_code=$(cat "$http_code_file" 2>/dev/null || true)
-    curl_err=$(cat "$err_file" 2>/dev/null || true)
-
-    rm -f "$body_pipe" "$headers_file" "$http_code_file" "$err_file"
-
-    if [[ "$curl_rc" -ne 0 ]]; then
-        rm -f "$text_file" "$raw_file"
-        if [[ -n "$curl_err" ]]; then
-            die "Claude API call failed: $curl_err"
-        fi
-        die "Claude API call failed (curl exit $curl_rc). Is the network available?"
-    fi
-
-    if [[ -n "$http_code" && "$http_code" -ge 400 ]]; then
-        error_message=$(jq -r '.error.message // .message // empty' "$raw_file" 2>/dev/null || true)
-        rm -f "$text_file" "$raw_file"
-        if [[ -n "$error_message" ]]; then
-            die "Claude API error (HTTP $http_code): $error_message"
-        fi
-        die "Claude API error (HTTP $http_code)"
-    fi
-
-    # Error handling
-    if [[ "$_got_events" -eq 0 ]]; then
-        local fallback_text
-        fallback_text=$(jq -r '.content[]? | select(.type == "text") | .text' "$raw_file" 2>/dev/null || true)
-        if [[ -n "$fallback_text" ]]; then
-            printf '%s' "$fallback_text" > "$text_file"
+    if [[ -n "$thinking_output_file" ]]; then
+        if [[ "$QUIET" -eq 0 ]]; then
+            llm "${args[@]}" 2> >(tee "$thinking_output_file" >&2) | tee "$text_file" >&2
         else
-            rm -f "$text_file" "$raw_file"
-            die "Claude API call returned no SSE events and no text response"
+            llm "${args[@]}" 2>"$thinking_output_file" > "$text_file"
+        fi
+    else
+        if [[ "$QUIET" -eq 0 ]]; then
+            llm "${args[@]}" 2>/dev/null | tee "$text_file" >&2
+        else
+            llm "${args[@]}" 2>/dev/null > "$text_file"
         fi
     fi
-    if [[ -n "$_stream_error" ]]; then
-        rm -f "$text_file" "$raw_file"
-        die "Claude API error: $_stream_error"
-    fi
 
-    # Return collected text response (same interface as before)
     cat "$text_file"
-    rm -f "$text_file" "$raw_file"
+    rm -f "$text_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -703,19 +656,21 @@ extract_code() {
 build_system_prompt() {
     local context_info="$1"
     local docker_active="${2:-0}"
+    local rundir="${3:-}"
 
     if [[ -n "${SHELLM_SYSTEM_PROMPT:-}" ]]; then
         printf '%s\n' "$SHELLM_SYSTEM_PROMPT"
     else
     cat <<'SYSPROMPT'
-You are an AI assistant operating inside a bash shell environment. You solve tasks by generating and executing bash code.
+You are shellm, an AI assistant operating inside a bash shell environment. You solve tasks by generating and executing bash code.
 
 ## How you work
 - Do any reasoning you want before generating your block of shell code
 - When you're ready end your response with a single ```bash fenced code block
 - Your code is executed in a bash subprocess
 - You see the stdout/stderr output from execution
-- You iterate until you have the answer, then signal completion
+- Break down problems and recursively call a sub-instances of shellm to make progress
+- You will be called iteratively until you have the answer, then signal completion
 - You have all typical shell tools at your disposal
 - You have full access to a local filesystem to use as you see fit
 
@@ -725,6 +680,7 @@ IMPORTANT: End your response with exactly ONE ```bash code block. Only the first
 - You have all the standard tools available on Linux/Unix based systems
 - Standard shell: cd, ls, grep, cat, rm, cp, mv, mkdir, echo, curl, find, etc.
 - Text processing: grep, awk, sed, wc, sort, uniq, head, tail, cut, tr, jq, etc.
+- Recursive self-calling: you can recursively make shellm sub-calls
 
 ## Signaling completion
 When you have the answer, set one of these in your bash code:
@@ -745,7 +701,6 @@ SYSPROMPT
 - Start by inspecting the existing environment before making changes.
 - Do not print environment variables wholesale. Avoid `env`, `printenv`, or `set` unless the user explicitly asks for them.
 - When you use `shellm` to create a nested run always include a summary of the bigger picture in the context you pass it so that it knows how it fits in
-- Use `shellm --fork "prompt"` only when you need a nested run that inherits the current session history and workspace state.
 - Your code runs with stdin connected to /dev/null. Interactive prompts
     (password, confirmation, etc.) will get immediate EOF and fail. Always
     use non-interactive flags: --yes, -y, --force, --batch, etc.
@@ -799,79 +754,158 @@ SYSPROMPT
 }
 
 # ---------------------------------------------------------------------------
-# Session helpers
+# Async context summary generation
 # ---------------------------------------------------------------------------
 
-find_workspace() {
-    local prefix="$1"
-    local runs_dir="$HOME/.shellm/runs"
-    # Exact match
-    if [[ -d "$runs_dir/$prefix" ]]; then
-        echo "$runs_dir/$prefix"
-        return
-    fi
-    # Strict prefix match — must match exactly one
-    local matches
-    matches=$(ls -1 "$runs_dir" 2>/dev/null | grep "^${prefix}" || true)
-    local count
-    count=$(echo "$matches" | grep -c . 2>/dev/null || echo 0)
-    if [[ "$count" -eq 1 ]]; then
-        echo "$runs_dir/$matches"
-    elif [[ "$count" -gt 1 ]]; then
-        echo "Ambiguous prefix '$prefix' matches $count sessions:" >&2
-        echo "$matches" | head -5 >&2
-        return 1
-    else
-        return 1
-    fi
-}
+generate_context_md() {
+    local rundir="$1"
+    local prompt="$2"
+    local stdin_file="$3"  # path to file with stdin content, or ""
+    shift 3
+    local file_paths=("$@")
 
-run_forked_prompt() {
-    local prompt="$1"
+    local context_md_file="$rundir/.shellm/context.md"
+    local summary_model="${SHELLM_SUMMARY_MODEL:-claude-haiku-4-5-20251001}"
 
-    [[ -n "${SHELLM_WORKDIR:-}" ]] || die "--fork only works inside an existing shellm session"
-
-    local current_depth="${SHELLM_DEPTH:-0}"
-    local max_depth="${SHELLM_MAX_DEPTH:-3}"
-
-    if [[ "$current_depth" -ge "$max_depth" ]]; then
-        die "Max fork depth reached ($current_depth >= $max_depth)"
+    # Read stdin content if available
+    local stdin_content=""
+    if [[ -n "$stdin_file" && -f "$stdin_file" ]]; then
+        stdin_content=$(cat "$stdin_file")
     fi
 
-    local parent_workdir="$SHELLM_WORKDIR"
-    local parent_messages="$parent_workdir/.messages.json"
-    [[ -f "$parent_messages" ]] || die "--fork requires existing conversation history in $parent_workdir"
-
-    # Create a proper run directory for the fork (nested under parent)
-    local runs_dir="$parent_workdir/.shellm/sub-runs"
-    mkdir -p "$runs_dir"
-    local ws_name
-    ws_name=$(make_workspace_name "$prompt")
-    local fork_workdir="$runs_dir/$ws_name"
-    mkdir -p "$fork_workdir"
-
-    # Copy parent workdir contents into the new run (skip .shellm to avoid
-    # recursive copy — fork workdir is nested under parent's .shellm/sub-runs/)
-    for item in "$parent_workdir"/* "$parent_workdir"/.[!.]*; do
-        [[ -e "$item" ]] || continue
-        [[ "$(basename "$item")" == ".shellm" ]] && continue
-        cp -R "$item" "$fork_workdir"/
+    # Read file previews (first 500 chars each)
+    local -a file_previews=()
+    for f in "${file_paths[@]+"${file_paths[@]}"}"; do
+        if [[ -f "$f" ]]; then
+            file_previews+=("$(head -c 500 "$f" 2>/dev/null || true)")
+        else
+            file_previews+=("")
+        fi
     done
-    rm -f "$fork_workdir/.final"
 
-    # Write info.yaml for the fork
-    mkdir -p "$fork_workdir/.shellm"
-    printf 'forked: true\n' > "$fork_workdir/.shellm/info.yaml"
+    # Build combined context for LLM (cap at 20K chars)
+    local max_ctx=20000
+    local combined="CLI argument: ${prompt}"
 
-    local fork_messages
-    fork_messages=$(jq --arg p "$prompt" '. + [{"role":"user","content":$p}]' "$parent_messages")
+    if [[ -n "$stdin_content" ]]; then
+        local avail=$((max_ctx - ${#combined}))
+        if [[ $avail -gt 0 ]]; then
+            combined+=$'\n\nstdin:\n'"${stdin_content:0:$avail}"
+        fi
+    fi
 
-    _SHELLM_FORKED_WORKDIR="$fork_workdir"
-    _SHELLM_FORKED_MESSAGES="$fork_messages"
-    SHELLM_DEPTH=$(( current_depth + 1 ))
-    export _SHELLM_FORKED_WORKDIR _SHELLM_FORKED_MESSAGES SHELLM_DEPTH
+    for f in "${file_paths[@]+"${file_paths[@]}"}"; do
+        if [[ -f "$f" ]]; then
+            local avail=$((max_ctx - ${#combined}))
+            [[ $avail -le 0 ]] && break
+            local fc
+            fc=$(head -c "$avail" "$f" 2>/dev/null || true)
+            combined+=$'\n\nFile '"${f}"$':\n'"${fc}"
+        fi
+    done
 
-    run_loop "$prompt"
+    local total_size=${#combined}
+
+    # Build file path list for LLM prompt
+    local files_json_hint=""
+    local k=1
+    for f in "${file_paths[@]+"${file_paths[@]}"}"; do
+        files_json_hint+="    \"${f}\": \"<one-line description of this file>\""
+        if [[ $k -lt ${#file_paths[@]} ]]; then
+            files_json_hint+=","
+        fi
+        files_json_hint+=$'\n'
+        k=$((k + 1))
+    done
+
+    # Determine full_summary instruction
+    local full_summary_hint
+    if [[ $total_size -gt 1000 ]]; then
+        full_summary_hint='"<multi-paragraph summary string>"'
+    else
+        full_summary_hint='null'
+    fi
+
+    # Build LLM prompt — ask for JSON so we can parse reliably
+    local llm_prompt="Analyze the context and goal of this shellm run. Respond with ONLY valid JSON (no markdown fences, no preamble) matching this schema:
+{
+  \"tldr\": \"one-line summary of the context and goal of this shellm run\",
+  \"full_summary\": ${full_summary_hint},
+  \"file_descriptions\": {
+${files_json_hint}  }
+}
+$(if [[ ${#file_paths[@]} -eq 0 ]]; then echo 'The file_descriptions object should be empty ({}) since no files were provided.'; fi)
+
+Inputs to the run:
+${combined}"
+
+    # Non-streaming API call to fast model
+    local msg_json
+    msg_json=$(jq -n --arg p "$llm_prompt" '[{"role":"user","content":$p}]')
+
+    local text
+    text=$(llm -m "$summary_model" -t 2048 \
+        -s "You produce concise summaries as JSON. Output only valid JSON. No markdown fences. No preamble." \
+        -M "$msg_json" 2>/dev/null) || true
+
+    # Parse JSON response
+    local tldr="" full_summary=""
+    local parsed_ok=0
+    if [[ -n "$text" ]]; then
+        # Strip markdown fences if the model wrapped them anyway
+        local cleaned
+        cleaned=$(printf '%s\n' "$text" | sed '1s/^```json$//;1s/^```$//;$s/^```$//' | sed '/^$/d')
+        if printf '%s' "$cleaned" | jq . >/dev/null 2>&1; then
+            text="$cleaned"
+            parsed_ok=1
+            tldr=$(printf '%s' "$text" | jq -r '.tldr // empty')
+            full_summary=$(printf '%s' "$text" | jq -r 'if .full_summary == null then "" else .full_summary end')
+        fi
+    fi
+
+    # Write context.md
+    {
+        echo "# TLDR of shellm Run Context"
+        echo "${tldr:-(summary generation failed)}"
+        echo ""
+
+        if [[ -n "$full_summary" ]]; then
+            echo "# Full Summary of shellm Run Context"
+            echo "$full_summary"
+            echo ""
+        fi
+
+        echo "# Context Provided"
+        echo "- context provided as argument to command line: ${prompt}"
+        if [[ -n "$stdin_content" ]]; then
+            echo "- stdin: ${stdin_content:0:500}"
+        fi
+        echo ""
+
+        # File subheaders with LLM descriptions and previews
+        local idx=0
+        for f in "${file_paths[@]+"${file_paths[@]}"}"; do
+            local file_desc=""
+            if [[ "$parsed_ok" -eq 1 ]]; then
+                file_desc=$(printf '%s' "$text" | jq -r --arg path "$f" '.file_descriptions[$path] // empty')
+            fi
+
+            echo "## file$((idx+1)): ${f}"
+            if [[ -n "$file_desc" ]]; then
+                echo "$file_desc"
+            fi
+            echo ""
+            echo '```'
+            if [[ -n "${file_previews[$idx]:-}" ]]; then
+                echo "${file_previews[$idx]}"
+            else
+                echo "(file not readable)"
+            fi
+            echo '```'
+            echo ""
+            idx=$((idx + 1))
+        done
+    } > "$context_md_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -884,167 +918,165 @@ run_loop() {
     local context_files=("$@")
     local num_files=${#context_files[@]}
 
+    local rundir
     local workdir
     local messages_json
     local system_prompt
     local docker_active=0
     local stdin_context=""
     local -a file_contexts=()
-    local _SHELLM_ACTIVE_WORKSPACE=""
+    local _SHELLM_ACTIVE_ENV=""
 
-    if [[ -n "${_SHELLM_RESUME_WORKDIR:-}" ]]; then
-        workdir="${_SHELLM_RESUME_WORKDIR}"
-        messages_json="${_SHELLM_RESUME_MESSAGES}"
-        export SHELLM_WORKDIR="$workdir"
-        unset _SHELLM_RESUME_WORKDIR _SHELLM_RESUME_MESSAGES
-
-        # Try to reattach to Docker workspace from prior run
-        local ws_name="${_SHELLM_WORKSPACE_NAME:-}"
-        if [[ -n "$ws_name" && "$ws_name" != "local" ]] && [[ ! -f /.dockerenv ]]; then
-            if workspace_resolve "$ws_name"; then
-                progress "Resumed workspace: $ws_name"
-            elif should_use_docker; then
-                local shellm_path
-                shellm_path=$(realpath "$0")
-                docker_setup "$workdir" "$shellm_path"
-                workspace_register "$ws_name"
-                docker_active=1
-            fi
-        fi
-        _SHELLM_ACTIVE_WORKSPACE="${ws_name:-}"
-
-        system_prompt=$(build_system_prompt "" "${_SHELLM_DOCKER_MODE:-0}")
-        banner
-        progress "Resuming session: $(basename "$workdir")"
-        rm -f "$workdir/.final"
-        printf '%s' "$messages_json" > "$workdir/.messages.json"
-    elif [[ -n "${_SHELLM_FORKED_MESSAGES:-}" ]]; then
-        workdir="${_SHELLM_FORKED_WORKDIR}"
-        messages_json="${_SHELLM_FORKED_MESSAGES}"
-        export SHELLM_WORKDIR="$workdir"
-        unset _SHELLM_FORKED_WORKDIR _SHELLM_FORKED_MESSAGES
-        system_prompt=$(build_system_prompt "" "${_SHELLM_DOCKER_MODE:-0}")
-        banner
-        progress "Forked sub-loop (depth: ${SHELLM_DEPTH:-0}, workdir: $workdir)"
-        printf '%s' "$messages_json" > "$workdir/.messages.json"
+    # Create run record
+    local run_name
+    run_name=$(make_workspace_name "$prompt")
+    if [[ -n "${_SHELLM_PARENT_RUNDIR:-}" ]]; then
+        # Sub-run: nest inside parent run record (direct child)
+        rundir="${_SHELLM_PARENT_RUNDIR}/$run_name"
     else
-        # --- Normal entry ---
-        banner
-
-        # Create workdir
-        if [[ -n "$_SHELLM_WORKDIR_USER" ]]; then
-            workdir="$_SHELLM_WORKDIR_USER"
-            mkdir -p "$workdir"
-        else
-            if [[ -n "${_SHELLM_PARENT_RUN:-}" ]]; then
-                # Sub-run: nest inside parent workdir
-                local runs_dir="${_SHELLM_PARENT_WORKDIR}/.shellm/sub-runs"
-            else
-                # Top-level run
-                local runs_dir="$HOME/.shellm/runs"
-            fi
-            mkdir -p "$runs_dir"
-            local wd_name
-            wd_name=$(make_workspace_name "$prompt")
-            workdir="$runs_dir/$wd_name"
-            mkdir -p "$workdir"
-        fi
-        export SHELLM_WORKDIR="$workdir"
-        printf '%s\n' "$_SHELLM_ORIGINAL_CMD" > "$workdir/.command"
-        # Record run metadata
-        mkdir -p "$workdir/.shellm"
-        printf 'forked: false\n' > "$workdir/.shellm/info.yaml"
-        progress "Workdir: $workdir"
-
-        # Load context into variables for env var passing
-        local context_info=""
-
-        # Read stdin if piped
-        if [[ ! -t 0 ]]; then
-            stdin_context=$(cat)
-            if [[ -n "$stdin_context" ]]; then
-                local ctx_chars=${#stdin_context}
-                progress "Stdin context loaded: $ctx_chars chars"
-                context_info="- \$CONTEXT: stdin data ($ctx_chars chars)"
-            fi
-        fi
-
-        # Read each -f file (resolve to absolute paths for Docker mount compatibility)
-        local i=1
-        if [[ "$num_files" -gt 0 ]]; then
-            local resolved_files=()
-            for f in "${context_files[@]}"; do
-                local abs_path
-                abs_path=$(realpath "$f")
-                resolved_files+=("$abs_path")
-                local content
-                content=$(cat "$abs_path")
-                file_contexts+=("$content")
-                local fc_chars=${#content}
-                progress "File context $i loaded: $abs_path ($fc_chars chars)"
-                context_info="${context_info:+$context_info
-}- \$FILE_CONTEXT$i: $abs_path ($fc_chars chars)"
-                i=$((i + 1))
-            done
-            context_files=("${resolved_files[@]}")
-        fi
-
-        # (no message needed when only inline context — the prompt is the context)
-
-        # Workspace & Docker setup
-        local shellm_path
-        shellm_path=$(realpath "$0")
-        local ws_name="${_SHELLM_WORKSPACE_NAME:-}"
-
-        if [[ "$ws_name" == "local" ]]; then
-            # "local" is the reserved workspace = run on host, no Docker
-            workspace_register_local "$ws_name"
-        elif [[ -f /.dockerenv ]]; then
-            # Already inside Docker — treat as local
-            ws_name="local"
-            workspace_register_local "$ws_name"
-        elif ! docker info >/dev/null 2>&1; then
-            # Docker not available — fall back to local
-            debug "Docker not available, using local workspace"
-            ws_name="local"
-            workspace_register_local "$ws_name"
-        else
-            # Docker workspace
-            if [[ -z "$ws_name" ]]; then
-                ws_name=$(make_workspace_name_auto "$prompt")
-            fi
-            # Try to reattach to existing workspace container
-            if workspace_resolve "$ws_name"; then
-                progress "Using workspace: $ws_name"
-            else
-                # Create new container
-                docker_setup "$workdir" "$shellm_path" "${context_files[@]+"${context_files[@]}"}"
-                workspace_register "$ws_name"
-                docker_active=1
-                progress "Created workspace: $ws_name"
-            fi
-        fi
-
-        # Store workspace name for later (cleanup, env vars)
-        _SHELLM_ACTIVE_WORKSPACE="$ws_name"
-
-        # Build system prompt
-        system_prompt=$(build_system_prompt "$context_info" "$_SHELLM_DOCKER_MODE")
-
-        # Initialize conversation history
-        messages_json=$(jq -n --arg p "$prompt" '[{"role":"user","content":$p}]')
-        printf '%s' "$messages_json" > "$workdir/.messages.json"
+        rundir="$HOME/.shellm/runs/$run_name"
     fi
+    mkdir -p "$rundir/.shellm"
+
+    # Track root rundir for the run tree
+    if [[ -n "${_SHELLM_PARENT_RUNDIR:-}" ]]; then
+        _SHELLM_ROOT_RUNDIR="${_SHELLM_ROOT_RUNDIR:-$_SHELLM_PARENT_RUNDIR}"
+    else
+        _SHELLM_ROOT_RUNDIR="$rundir"
+    fi
+
+    # Create or use workdir
+    if [[ -n "$_SHELLM_WORKDIR_USER" ]]; then
+        workdir="$_SHELLM_WORKDIR_USER"
+    else
+        workdir="$HOME/.shellm/workdirs/$run_name"
+    fi
+    mkdir -p "$workdir"
+
+    export SHELLM_WORKDIR="$workdir"
+
+    # Record metadata
+    printf '%s\n' "$_SHELLM_ORIGINAL_CMD" > "$rundir/.shellm/command"
+    printf '%s\n' "$workdir" > "$rundir/.shellm/workdir"
+    progress "Run: $rundir"
+    progress "Workdir: $workdir"
+
+    # Load context into variables for env var passing
+    local context_info=""
+
+    # Read stdin if piped
+    if [[ ! -t 0 ]]; then
+        stdin_context=$(cat)
+        if [[ -n "$stdin_context" ]]; then
+            local ctx_chars=${#stdin_context}
+            progress "Stdin context loaded: $ctx_chars chars"
+            context_info="- \$CONTEXT: stdin data ($ctx_chars chars)"
+        fi
+    fi
+
+    # Read each -f file (resolve to absolute paths for Docker mount compatibility)
+    local i=1
+    if [[ "$num_files" -gt 0 ]]; then
+        local resolved_files=()
+        for f in "${context_files[@]}"; do
+            local abs_path
+            abs_path=$(realpath "$f")
+            resolved_files+=("$abs_path")
+            local content
+            content=$(cat "$abs_path")
+            file_contexts+=("$content")
+            local fc_chars=${#content}
+            progress "File context $i loaded: $abs_path ($fc_chars chars)"
+            context_info="${context_info:+$context_info
+}- \$FILE_CONTEXT$i: $abs_path ($fc_chars chars)"
+            i=$((i + 1))
+        done
+        context_files=("${resolved_files[@]}")
+    fi
+
+    # Env & Docker setup
+    local shellm_path
+    shellm_path=$(realpath "$0")
+    local ws_name="${_SHELLM_ENV_NAME:-}"
+
+    if [[ "$ws_name" == "local" ]]; then
+        env_register_local "$ws_name"
+    elif [[ -f /.dockerenv ]]; then
+        ws_name="local"
+        env_register_local "$ws_name"
+    elif ! docker info >/dev/null 2>&1; then
+        progress "\033[1;33mWARNING: Docker not found — running on host. Use of Docker is recommended!\033[0m"
+        ws_name="local"
+        env_register_local "$ws_name"
+    else
+        if [[ -n "$ws_name" ]]; then
+            # Explicit --env: resolve or create
+            :
+        elif [[ "${_new_env:-0}" -eq 1 ]]; then
+            # --new-env: always create fresh
+            ws_name=$(make_env_name "$prompt")
+        else
+            # Default: try to reuse any running env
+            local running
+            running=$(env_find_running) || true
+            if [[ -n "$running" ]]; then
+                ws_name="$running"
+            else
+                ws_name=$(make_env_name "$prompt")
+            fi
+        fi
+        if env_resolve "$ws_name"; then
+            progress "Using env: $ws_name"
+        else
+            docker_setup "$workdir" "$shellm_path" "${context_files[@]+"${context_files[@]}"}"
+            env_register "$ws_name"
+            docker_active=1
+            progress "Created env: $ws_name"
+        fi
+    fi
+
+    _SHELLM_ACTIVE_ENV="$ws_name"
+    printf '%s\n' "$ws_name" > "$rundir/.shellm/env"
+
+    # Build system prompt
+    system_prompt=$(build_system_prompt "$context_info" "$_SHELLM_DOCKER_MODE")
+
+    # Kick off async context summary generation (background)
+    local _ctx_summary_pid=""
+    local stdin_ctx_file=""
+    if [[ -n "$stdin_context" ]]; then
+        stdin_ctx_file="$rundir/.shellm/.stdin_context"
+        printf '%s' "$stdin_context" > "$stdin_ctx_file"
+    fi
+    generate_context_md "$rundir" "$prompt" "$stdin_ctx_file" \
+        "${context_files[@]+"${context_files[@]}"}" &
+    _ctx_summary_pid=$!
+    debug "Context summary generation started (PID: $_ctx_summary_pid)"
+
+    # Initialize conversation history
+    messages_json=$(jq -n --arg p "$prompt" '[{"role":"user","content":$p}]')
+    printf '%s' "$messages_json" > "$rundir/.shellm/llm_messages_history.json"
 
     # --- Cleanup trap ---
     _cleanup_docker="$docker_active"
-    _cleanup_workdir="$workdir"
+    _cleanup_rundir="$rundir"
     _cleanup_temp="$SHELLM_TEMP_DOCKER"
-    _cleanup_ws_name="${_SHELLM_ACTIVE_WORKSPACE:-}"
+    _cleanup_ws_name="${_SHELLM_ACTIVE_ENV:-}"
+    _cleanup_ctx_pid="${_ctx_summary_pid:-}"
     cleanup() {
+        # Give context summary background process time to finish
+        if [[ -n "$_cleanup_ctx_pid" ]] && kill -0 "$_cleanup_ctx_pid" 2>/dev/null; then
+            local _ctx_wait=0
+            while kill -0 "$_cleanup_ctx_pid" 2>/dev/null && [[ $_ctx_wait -lt 30 ]]; do
+                sleep 1
+                _ctx_wait=$((_ctx_wait + 1))
+            done
+            # Force kill if still running after grace period
+            kill "$_cleanup_ctx_pid" 2>/dev/null || true
+        fi
         # Kill lingering exec/watchdog processes
         local pid_file
-        for pid_file in "$_cleanup_workdir/.exec_pid" "$_cleanup_workdir/.watchdog_pid"; do
+        for pid_file in "$_cleanup_rundir/.shellm/.exec_pid" "$_cleanup_rundir/.shellm/.watchdog_pid"; do
             if [[ -f "$pid_file" ]]; then
                 local pid
                 pid=$(cat "$pid_file" 2>/dev/null || true)
@@ -1055,13 +1087,13 @@ run_loop() {
                 rm -f "$pid_file"
             fi
         done
-        rm -f "$_cleanup_workdir/.timeout" "$_cleanup_workdir/.output"
+        rm -f "$_cleanup_rundir/.shellm/.timeout" "$_cleanup_rundir/.shellm/.output"
         # Docker teardown: only if --temp-docker was passed
         if [[ "${_cleanup_temp:-0}" -eq 1 ]] && [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 ]]; then
             docker_teardown
-            # Also destroy workspace metadata
+            # Also destroy env metadata
             if [[ -n "$_cleanup_ws_name" ]]; then
-                workspace_destroy "$_cleanup_ws_name"
+                env_destroy "$_cleanup_ws_name"
             fi
         fi
     }
@@ -1073,6 +1105,10 @@ run_loop() {
 
     progress "Starting shellm loop (model: $SHELLM_MODEL, max iterations: $SHELLM_MAX_ITERATIONS)"
 
+    SHELLM_CAST_FILE="$rundir/.shellm/session.jsonl"
+    emit_cast_header "$SHELLM_MODEL" "$workdir"
+    emit_event "command" "$prompt"
+
     local iteration=0
     while [[ "$iteration" -lt "$SHELLM_MAX_ITERATIONS" ]]; do
         iteration=$((iteration + 1))
@@ -1081,10 +1117,10 @@ run_loop() {
         progress "Iteration $iteration/$SHELLM_MAX_ITERATIONS — calling Claude API..."
 
         # Call Claude (capture thinking/reasoning to file)
-        local thinking_file="$workdir/.last_thinking"
+        local thinking_file="$rundir/.shellm/.last_thinking"
         : > "$thinking_file"
         local response
-        response=$(call_claude "$system_prompt" "$messages_json" "$thinking_file")
+        response=$(call_llm "$system_prompt" "$messages_json" "$thinking_file")
 
         # Read captured thinking/reasoning
         local thinking=""
@@ -1092,6 +1128,11 @@ run_loop() {
             thinking=$(cat "$thinking_file")
         fi
         rm -f "$thinking_file"
+
+        [[ -n "$thinking" ]] && emit_event "thinking" "$thinking"
+        local reasoning
+        reasoning=$(extract_reasoning "$response")
+        [[ -n "$reasoning" ]] && emit_event "reasoning" "$reasoning"
 
         if [[ -z "$response" ]]; then
             die "Empty response from Claude API"
@@ -1110,6 +1151,8 @@ run_loop() {
             return 0
         fi
 
+        emit_event "input" "$code"
+
         # Show the code being executed
         local code_lines
         code_lines=$(echo "$code" | wc -l | tr -d ' ')
@@ -1125,28 +1168,30 @@ $code
 set +x"$'\n'"
 __shellm_rc=\$?
 set +e
-[ -n \"\${FINAL+x}\" ] && printf '%s' \"\$FINAL\" > \"$workdir/.final\"
-[ -n \"\${FINAL_FILE+x}\" ] && cat \"\$FINAL_FILE\" > \"$workdir/.final\"
+[ -n \"\${FINAL+x}\" ] && printf '%s' \"\$FINAL\" > \"$rundir/.shellm/final\"
+[ -n \"\${FINAL_FILE+x}\" ] && cat \"\$FINAL_FILE\" > \"$rundir/.shellm/final\"
 exit \$__shellm_rc
 "
 
         # Build env var array for subprocess
         local -a env_vars=(
             SHELLM_WORKDIR="$workdir"
-            SHELLM_WORKSPACE="$(if [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 ]]; then echo "local"; else echo "${_SHELLM_ACTIVE_WORKSPACE:-}"; fi)"
+            SHELLM_ENV="$(if [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 ]]; then echo "local"; else echo "${_SHELLM_ACTIVE_ENV:-}"; fi)"
             _SHELLM_PARENT_CONTAINER="${_SHELLM_CONTAINER:-}"
             ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
             SHELLM_MODEL="$SHELLM_MODEL"
             SHELLM_MAX_TOKENS="$SHELLM_MAX_TOKENS"
             SHELLM_MAX_ITERATIONS="$SHELLM_MAX_ITERATIONS"
-            SHELLM_THINKING_BUDGET="$SHELLM_THINKING_BUDGET"
+            SHELLM_EFFORT="$SHELLM_EFFORT"
             SHELLM_TRUNCATE="$SHELLM_TRUNCATE"
             SHELLM_API_URL="$SHELLM_API_URL"
+            LLM_API_URL="$SHELLM_API_URL"
             SHELLM_DOCKER_IMAGE="$SHELLM_DOCKER_IMAGE"
-            SHELLM_DEPTH="$SHELLM_DEPTH"
             SHELLM_MAX_DEPTH="$SHELLM_MAX_DEPTH"
-            _SHELLM_PARENT_RUN="$(basename "$workdir")"
-            _SHELLM_PARENT_WORKDIR="$workdir"
+            _SHELLM_PARENT_RUN="$run_name"
+            _SHELLM_PARENT_RUNDIR="$rundir"
+            SHELLM_RUNDIR="$rundir"
+            _SHELLM_ROOT_RUNDIR="$_SHELLM_ROOT_RUNDIR"
             PATH="$(dirname "$shellm_path"):$PATH"
         )
         if [[ -n "$stdin_context" ]]; then
@@ -1158,10 +1203,10 @@ exit \$__shellm_rc
         done
 
         # Execute code — background exec + watchdog + polling reader
-        local output_file="$workdir/.output"
-        local exec_pid_file="$workdir/.exec_pid"
-        local watchdog_pid_file="$workdir/.watchdog_pid"
-        local timeout_marker="$workdir/.timeout"
+        local output_file="$rundir/.shellm/.output"
+        local exec_pid_file="$rundir/.shellm/.exec_pid"
+        local watchdog_pid_file="$rundir/.shellm/.watchdog_pid"
+        local timeout_marker="$rundir/.shellm/.timeout"
         : > "$output_file"
         rm -f "$timeout_marker" "$exec_pid_file" "$watchdog_pid_file"
         local exit_code=0
@@ -1264,6 +1309,7 @@ exit \$__shellm_rc
 
         local output
         output=$(cat "$output_file")
+        [[ -n "$output" ]] && emit_event "output" "$output"
         rm -f "$output_file" "$exec_pid_file" "$watchdog_pid_file" "$timeout_marker"
 
         debug "Exit code: $exit_code, timed_out: $timed_out"
@@ -1278,10 +1324,13 @@ exit \$__shellm_rc
         fi
 
         # Check for final answer
-        if [[ -f "$workdir/.final" ]]; then
+        if [[ -f "$rundir/.shellm/final" ]]; then
             [[ "$QUIET" -eq 0 ]] && echo >&2
             progress "Final answer received"
-            redact_sensitive "$(cat "$workdir/.final")"
+            local final_answer
+            final_answer=$(cat "$rundir/.shellm/final")
+            emit_event "final" "$final_answer"
+            redact_sensitive "$final_answer"
             return 0
         fi
 
@@ -1332,8 +1381,8 @@ ${response}"
             --argjson result "$result_escaped" \
             '. + [{"role":"assistant","content":$assistant},{"role":"user","content":$result}]')
 
-        # Persist messages for session resume
-        printf '%s' "$messages_json" > "$workdir/.messages.json"
+        # Persist messages
+        printf '%s' "$messages_json" > "$rundir/.shellm/llm_messages_history.json"
     done
 
     [[ "$QUIET" -eq 0 ]] && echo >&2
@@ -1348,9 +1397,9 @@ ${response}"
 main() {
     _SHELLM_ORIGINAL_CMD="shellm $*"
     local context_files=()
-    local fork_mode=0
     local print_prompt=0
-    local _SHELLM_WORKSPACE_NAME="${SHELLM_WORKSPACE:-}"
+    local _SHELLM_ENV_NAME="${SHELLM_ENV:-}"
+    local _new_env=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1365,7 +1414,7 @@ main() {
                 QUIET=1
                 shift
                 ;;
-            -f)
+            -f|--file)
                 local f="${2:?Usage: shellm -f FILE \"prompt\"}"
                 [[ -f "$f" ]] || die "Context file not found: $f"
                 context_files+=("$f")
@@ -1383,8 +1432,8 @@ main() {
                 SHELLM_MAX_TOKENS="${2:?--max-tokens requires a value}"
                 shift 2
                 ;;
-            --thinking-budget)
-                SHELLM_THINKING_BUDGET="${2:?--thinking-budget requires a value}"
+            --effort)
+                SHELLM_EFFORT="${2:?--effort requires a value}"
                 shift 2
                 ;;
             --max-depth)
@@ -1395,9 +1444,13 @@ main() {
                 _SHELLM_WORKDIR_USER="${2:?--workdir requires a value}"
                 shift 2
                 ;;
-            --workspace)
-                _SHELLM_WORKSPACE_NAME="${2:?--workspace requires a value}"
+            --env)
+                _SHELLM_ENV_NAME="${2:?--env requires a value}"
                 shift 2
+                ;;
+            --new-env)
+                _new_env=1
+                shift
                 ;;
             --temp-docker)
                 SHELLM_TEMP_DOCKER=1
@@ -1409,24 +1462,12 @@ main() {
                 SHELLM_SYSTEM_PROMPT=$(cat "$sp_file")
                 shift 2
                 ;;
-            --fork)
-                fork_mode=1
-                shift
-                ;;
             --print-system-prompt)
                 print_prompt=1
                 shift
                 ;;
             --docker-image)
                 SHELLM_DOCKER_IMAGE="${2:?--docker-image requires a value}"
-                shift 2
-                ;;
-            --continue)
-                _resume_mode="latest"
-                shift
-                ;;
-            --start-from)
-                _resume_mode="${2:?--start-from requires a session name}"
                 shift 2
                 ;;
             -*)
@@ -1440,48 +1481,13 @@ main() {
 
     local prompt="$*"
 
+    if [[ "$_new_env" -eq 1 && -n "$_SHELLM_ENV_NAME" ]]; then
+        die "--new-env and --env cannot be used together"
+    fi
+
     if [[ "$print_prompt" -eq 1 ]]; then
         build_system_prompt "" 0
         exit 0
-    fi
-
-    if [[ "$fork_mode" -eq 1 ]]; then
-        [[ -z "$prompt" ]] && die "A prompt is required when forking (e.g. shellm --fork \"investigate this\")"
-        run_forked_prompt "$prompt"
-        return
-    fi
-
-    if [[ -n "${_resume_mode:-}" ]]; then
-        local ws
-        if [[ -n "$_SHELLM_WORKDIR_USER" ]]; then
-            # --workdir provided: use it directly as the workdir to resume
-            ws="$_SHELLM_WORKDIR_USER"
-        elif [[ "$_resume_mode" == "latest" ]]; then
-            local runs_dir="$HOME/.shellm/runs"
-            ws="$runs_dir/$(ls -1t "$runs_dir" 2>/dev/null | head -1)"
-            [[ ! -d "$ws" ]] && die "No past sessions found"
-        else
-            ws=$(find_workspace "$_resume_mode") || die "No matching session found: $_resume_mode"
-            [[ -z "$ws" ]] && die "No matching session found: $_resume_mode"
-        fi
-        [[ ! -f "$ws/.messages.json" ]] && die "No conversation history in: $(basename "$ws")"
-        [[ -z "$prompt" ]] && die "A prompt is required when resuming (e.g. shellm --continue \"continue\")"
-        local messages
-        messages=$(cat "$ws/.messages.json")
-        # Merge with last user message to maintain alternating roles
-        local last_role
-        last_role=$(echo "$messages" | jq -r '.[-1].role')
-        if [[ "$last_role" == "user" ]]; then
-            messages=$(echo "$messages" | jq --arg p "$prompt" \
-                '.[-1].content = .[-1].content + "\n\n---\nNew instruction from user:\n" + $p')
-        else
-            messages=$(echo "$messages" | jq --arg p "$prompt" \
-                '. + [{"role":"user","content":$p}]')
-        fi
-        _SHELLM_RESUME_WORKDIR="$ws"
-        _SHELLM_RESUME_MESSAGES="$messages"
-        run_loop "$prompt"
-        return
     fi
 
     [[ -z "$prompt" ]] && { usage; }

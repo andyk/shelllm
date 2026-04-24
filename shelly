@@ -645,11 +645,14 @@ cmd_compact() {
         fi
     done < "$hist"
 
-    # Summarize using shellm
+    # Summarize using llm
     printf 'Compacting history...\n' >&2
     local summary
-    summary=$(printf '%s' "$conversation" | shellm --quiet \
-        "Summarize this conversation concisely. Capture key facts, decisions, and context. Output a brief summary paragraph.") || {
+    summary=$(llm -m "$SHELLY_MODEL" \
+        -s "You produce concise conversation summaries. Capture key facts, decisions, and context." \
+        "Summarize this conversation concisely. Output a brief summary paragraph.
+
+${conversation}") || {
         die "Failed to compact history"
     }
 

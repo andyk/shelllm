@@ -121,8 +121,7 @@ action_search() {
     count=$(ls -1 "$MEM_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
     [[ "$count" -eq 0 ]] && { echo "No memories stored." >&2; return 0; }
 
-    # Concatenate all memories with filenames as headers and pipe to shellm,
-    # so it works regardless of Docker sandboxing.
+    # Concatenate all memories with filenames as headers
     local memories=""
     local f
     for f in "$MEM_DIR"/*.md; do
@@ -132,10 +131,10 @@ $(cat "$f")
 "
     done
 
-    printf '%s' "$memories" | shellm --quiet "Here are memory files. Search them for: ${query}
-Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body.
-Return ONLY the filenames and summaries of semantically matching memories, one per line.
-If nothing matches, say 'No matches found.'"
+    llm -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'" \
+        "Search these memories for: ${query}
+
+${memories}"
 }
 
 action_list() {

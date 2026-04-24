@@ -3,7 +3,7 @@ set -euo pipefail
 
 PREFIX="${PREFIX:-/usr/local/bin}"
 SYMLINKS="${SYMLINKS:-0}"
-TOOLS=(shellm shelly skills mem)
+TOOLS=(shellm shellm-explore shelly skills mem)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -13,7 +13,7 @@ while [[ $# -gt 0 ]]; do
             cat <<'EOF'
 Usage: ./install.sh [options]
 
-Installs shellm, shelly, skills, and mem to a directory on your PATH.
+Installs shellm, shellm-explore, shelly, skills, and mem to a directory on your PATH.
 
 Options:
   --prefix DIR   Install directory (default: /usr/local/bin)
