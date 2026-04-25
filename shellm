@@ -33,6 +33,7 @@ _SHELLM_CONTAINER=""
 _SHELLM_WORKDIR_USER=""
 _SHELLM_DOCKER_BROKER_DIR=""
 _SHELLM_DOCKER_BROKER_TRANSPORT=""
+_SHELLM_TOOL_MOUNTS_VERSION=1
 
 # Load .env if present
 if [[ -f ".env" ]]; then
@@ -387,6 +388,25 @@ tool_sibling_path() {
     printf '%s/%s\n' "$dir" "$tool"
 }
 
+resolve_shellm_tool_path() {
+    local shellm_path="$1"
+    local tool="$2"
+    local path
+
+    path=$(tool_sibling_path "$shellm_path" "$tool")
+    if [[ -x "$path" ]]; then
+        realpath "$path"
+        return 0
+    fi
+
+    if command -v "$tool" >/dev/null 2>&1; then
+        realpath "$(command -v "$tool")"
+        return 0
+    fi
+
+    return 1
+}
+
 docker_broker_start() {
     local env_name="$1"
     local workspace="$2"
@@ -395,8 +415,8 @@ docker_broker_start() {
     [[ "$SHELLM_DOCKER_ACCESS" == "broker" ]] || return 0
 
     local broker_path
-    broker_path=$(tool_sibling_path "$shellm_path" "shellm-docker-broker")
-    [[ -x "$broker_path" ]] || die "Broker mode requires shellm-docker-broker next to shellm: $broker_path"
+    broker_path=$(resolve_shellm_tool_path "$shellm_path" "shellm-docker-broker" || true)
+    [[ -x "$broker_path" ]] || die "Broker mode requires shellm-docker-broker next to shellm or on PATH"
 
     local broker_dir="$HOME/.shellm/docker-broker/$env_name"
     local env_dir="$SHELLM_ENVS_DIR/$env_name"
@@ -421,9 +441,9 @@ docker_broker_stop() {
     local broker_path=""
 
     if [[ -n "$shellm_path" ]]; then
-        broker_path=$(tool_sibling_path "$shellm_path" "shellm-docker-broker")
+        broker_path=$(resolve_shellm_tool_path "$shellm_path" "shellm-docker-broker" || true)
     elif command -v shellm-docker-broker >/dev/null 2>&1; then
-        broker_path=$(command -v shellm-docker-broker)
+        broker_path=$(realpath "$(command -v shellm-docker-broker)")
     fi
 
     if [[ -x "$broker_path" ]]; then
@@ -469,6 +489,14 @@ env_metadata_matches() {
             ;;
     esac
 
+    local stored_type
+    stored_type=$(docker_metadata_value "$env_name" type)
+    if [[ "$stored_type" == "docker" ]]; then
+        local stored_tool_mounts_version
+        stored_tool_mounts_version=$(docker_metadata_value "$env_name" tool_mounts_version)
+        [[ "$stored_tool_mounts_version" == "$_SHELLM_TOOL_MOUNTS_VERSION" ]] || return 1
+    fi
+
     return 0
 }
 
@@ -477,6 +505,17 @@ env_metadata_mismatch_message() {
     local stored_access
     stored_access=$(docker_metadata_value "$env_name" docker_access)
     stored_access="${stored_access:-none}"
+    local stored_type
+    stored_type=$(docker_metadata_value "$env_name" type)
+    if [[ "$stored_type" == "docker" ]]; then
+        local stored_tool_mounts_version
+        stored_tool_mounts_version=$(docker_metadata_value "$env_name" tool_mounts_version)
+        if [[ "$stored_tool_mounts_version" != "$_SHELLM_TOOL_MOUNTS_VERSION" ]]; then
+            printf 'Env %s was created before current shellm tool mounts. Use a different --env or remove ~/.shellm/envs/%s so shellm can recreate it with llm, shellm-explore, and sibling tools mounted.' \
+                "$env_name" "$env_name"
+            return
+        fi
+    fi
     printf 'Env %s was created with docker_access=%s, but this run requested docker_access=%s. Use a different --env, destroy the env, or request the same access mode.' \
         "$env_name" "$stored_access" "$SHELLM_DOCKER_ACCESS"
 }
@@ -533,6 +572,14 @@ docker_setup() {
     local -a seen_dirs=("$runs_mount")
     local -a install_packages=(jq curl python3 tmux sudo)
 
+    local tool tool_path
+    local -a shellm_tools=(llm shellm-explore shelly skills mem shellm-docker shellm-docker-broker)
+    for tool in "${shellm_tools[@]}"; do
+        tool_path=$(resolve_shellm_tool_path "$shellm_path" "$tool" || true)
+        [[ -n "$tool_path" ]] || continue
+        docker_run_flags+=(-v "$tool_path:/usr/local/bin/$tool:ro")
+    done
+
     # Make custom workdirs visible when they live outside ~/.shellm.
     if [[ "$workspace" != "$runs_mount"* ]]; then
         extra_mounts+=(-v "$workspace:$workspace")
@@ -558,9 +605,8 @@ docker_setup() {
     case "$SHELLM_DOCKER_ACCESS" in
         broker)
             local client_path
-            client_path=$(tool_sibling_path "$shellm_path" "shellm-docker")
-            [[ -x "$client_path" ]] || die "Broker mode requires shellm-docker next to shellm: $client_path"
-            docker_run_flags+=(-v "$client_path:/usr/local/bin/shellm-docker:ro")
+            client_path=$(resolve_shellm_tool_path "$shellm_path" "shellm-docker" || true)
+            [[ -x "$client_path" ]] || die "Broker mode requires shellm-docker next to shellm or on PATH"
             if [[ "$_SHELLM_DOCKER_BROKER_TRANSPORT" == "socket" ]]; then
                 install_packages+=(socat)
             fi
@@ -744,6 +790,7 @@ env_register() {
     printf '%s\n' "$SHELLM_DOCKER_ACCESS" > "$ws_dir/docker_access"
     printf '%s\n' "${_SHELLM_DOCKER_BROKER_TRANSPORT:-}" > "$ws_dir/docker_broker_transport"
     printf '%s\n' "${SHELLM_DOCKER_SOCKET:-}" > "$ws_dir/docker_socket"
+    printf '%s\n' "$_SHELLM_TOOL_MOUNTS_VERSION" > "$ws_dir/tool_mounts_version"
     if [[ "$SHELLM_DOCKER_ACCESS" == "dind" ]]; then
         printf '1\n' > "$ws_dir/privileged"
     else
@@ -768,7 +815,7 @@ env_register_local() {
     printf '\n' > "$ws_dir/docker_broker_transport"
     printf '\n' > "$ws_dir/docker_socket"
     printf '0\n' > "$ws_dir/privileged"
-    rm -f "$ws_dir/container_id"
+    rm -f "$ws_dir/container_id" "$ws_dir/tool_mounts_version"
 }
 
 # Tear down an env's Docker container and remove its metadata.
