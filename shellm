@@ -576,7 +576,11 @@ docker_setup() {
             install_packages+=(docker.io)
             ;;
         dind)
-            docker_run_flags+=(--privileged -e "DOCKER_HOST=unix:///var/run/docker.sock")
+            docker_run_flags+=(
+                --privileged
+                --cgroupns=private
+                -e "DOCKER_HOST=unix:///var/run/docker.sock"
+            )
             install_packages+=(docker.io)
             ;;
     esac
@@ -621,8 +625,12 @@ docker_setup() {
             docker info >/dev/null 2>&1 || docker_setup_die "Container could not access Docker through $SHELLM_DOCKER_SOCKET"
     elif [[ "$SHELLM_DOCKER_ACCESS" == "dind" ]]; then
         progress_dim "Starting inner Docker daemon..."
+        # storage-driver=vfs avoids overlay-on-overlay failures when the host
+        # FS is already overlayfs (e.g. Docker Desktop on macOS). vfs is slow
+        # but the only driver that works reliably across nesting environments
+        # — fuse-overlayfs mounts cleanly here but runc can't exec from them.
         docker exec --user 0:0 "$_SHELLM_CONTAINER" bash -c '
-            nohup dockerd --host=unix:///var/run/docker.sock >/var/log/shellm-dockerd.log 2>&1 &
+            nohup dockerd --host=unix:///var/run/docker.sock --storage-driver=vfs >/var/log/shellm-dockerd.log 2>&1 &
         ' >/dev/null 2>&1 || docker_setup_die "Could not start inner Docker daemon"
         local i
         for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
