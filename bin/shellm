@@ -2639,11 +2639,16 @@ exit \$__shellm_rc
 # whose NAME looks like a credential are masked. (Passing secrets as a bare
 # `--var NAME` keeps them off the command line altogether.)
 _redacted_cmdline() {
-    local out="shellm" prev="" a n
+    local out="shellm" prev="" a n nu
     for a in "$@"; do
         if [[ "$prev" == "--var" && "$a" == *=* ]]; then
             n="${a%%=*}"
-            if [[ "${n^^}" =~ (KEY|TOKEN|SECRET|PASSW|CREDENTIAL) ]]; then
+            # Uppercase via tr, not ${n^^}: the latter is a bash-4 expansion
+            # and macOS's /bin/bash is 3.2, where it is a fatal "bad
+            # substitution" that kills the whole run (every shellm run exited
+            # rc=1 with no output on macOS).
+            nu=$(printf '%s' "$n" | tr '[:lower:]' '[:upper:]')
+            if [[ "$nu" =~ (KEY|TOKEN|SECRET|PASSW|CREDENTIAL) ]]; then
                 a="$n=<redacted>"
             fi
         fi
