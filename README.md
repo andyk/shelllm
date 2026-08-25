@@ -39,8 +39,8 @@ life, and opens a dashboard where you can watch its mind run:
 curl -fsSL https://headlong.ai/install.sh | bash
 ```
 
-You'll need bash 3.2+, git, curl, jq, and an LLM API key (Anthropic,
-OpenAI, Gemini, or OpenRouter); the dashboard also needs
+You'll need bash 3.2+, git, curl, jq, and either an LLM API key (Anthropic,
+OpenAI, Gemini, or OpenRouter) or an authenticated Codex CLI installation; the dashboard also needs
 [uv](https://docs.astral.sh/uv/) and bun or node, and the installer offers
 to fetch those. 
 

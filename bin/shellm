@@ -1294,6 +1294,7 @@ call_llm() {
 
     local -a args=(-m "$SHELLM_MODEL"
         --effort "$SHELLM_EFFORT" --thinking --system-prompt "$system_prompt" -M "$messages_json")
+    [[ -n "${SHELLM_PROVIDER:-}" ]] && args+=(--provider "$SHELLM_PROVIDER")
     [[ -n "$SHELLM_MAX_TOKENS" ]] && args+=(-t "$SHELLM_MAX_TOKENS")
 
     local text_file stderr_file

@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Small Headlong adapter for the official Codex app-server protocol."""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+def send(proc, method, request_id, params=None):
+    message = {"method": method}
+    if request_id is not None:
+        message["id"] = request_id
+    if params is not None:
+        message["params"] = params
+    proc.stdin.write((json.dumps(message) + "\n").encode())
+    proc.stdin.flush()
+
+
+def fail(message):
+    print(f"codex provider: {message}", file=sys.stderr)
+    return 1
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--messages-file", required=True)
+    parser.add_argument("--system-prompt-file")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--usage-file")
+    args = parser.parse_args()
+
+    try:
+        messages = json.load(open(args.messages_file, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return fail(f"cannot read messages: {exc}")
+
+    system = ""
+    if args.system_prompt_file:
+        try:
+            system = open(args.system_prompt_file, encoding="utf-8").read()
+        except OSError as exc:
+            return fail(f"cannot read system prompt: {exc}")
+
+    prompt_parts = []
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        prompt_parts.append(f"[{role}]\n{content}")
+    prompt = "\n\n".join(prompt_parts)
+
+    command = os.environ.get("CODEX_APP_SERVER_BIN", "codex")
+    try:
+        proc = subprocess.Popen(
+            [command, "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        return fail(f"cannot start {command}: {exc}")
+
+    try:
+        send(proc, "initialize", 1, {"clientInfo": {
+            "name": "headlong",
+            "title": "Headlong",
+            "version": "0.1.0",
+        }})
+        send(proc, "initialized", None)
+        send(proc, "thread/start", 2, {
+            "model": args.model,
+            "cwd": os.getcwd(),
+            "ephemeral": True,
+            "developerInstructions": system or None,
+        })
+
+        thread_id = None
+        for line in proc.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == 1 and "error" in message:
+                return fail(message["error"].get("message", "initialize failed"))
+            if message.get("id") == 2:
+                if "error" in message:
+                    return fail(message["error"].get("message", "thread/start failed"))
+                thread_id = message.get("result", {}).get("thread", {}).get("id")
+                if not thread_id:
+                    return fail("thread/start returned no thread id")
+                send(proc, "turn/start", 3, {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": prompt}],
+                    "model": args.model,
+                    "effort": os.environ.get("LLM_EFFORT") or None,
+                })
+                continue
+            if message.get("method") == "item/agentMessage/delta":
+                delta = message.get("params", {}).get("delta", "")
+                if delta:
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+                continue
+            if message.get("method") in {
+                "item/reasoningSummaryTextDelta",
+                "item/reasoningTextDelta",
+            }:
+                delta = message.get("params", {}).get("delta", "")
+                if delta:
+                    print(delta, file=sys.stderr, end="", flush=True)
+                continue
+            if message.get("method") == "turn/completed":
+                turn = message.get("params", {}).get("turn", {})
+                if turn.get("status") != "completed":
+                    return fail(turn.get("error", {}).get("message", "turn failed"))
+                if args.usage_file:
+                    with open(args.usage_file, "w", encoding="utf-8") as usage:
+                        json.dump({
+                            "billing_source": "chatgpt_subscription",
+                            "usage_available": False,
+                        }, usage)
+                return 0
+            if message.get("id") == 3 and "error" in message:
+                return fail(message["error"].get("message", "turn/start failed"))
+            if message.get("method") in {
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+                "item/permissions/requestApproval",
+                "item/tool/requestUserInput",
+            }:
+                return fail("interactive approval is not supported by this adapter")
+    finally:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait(timeout=2)
+
+    return fail("app-server exited before completing the turn")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
