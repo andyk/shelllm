@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # llm — Minimal multi-provider LLM CLI tool
 # Supports the Anthropic, OpenAI, Gemini, and OpenRouter APIs.
 
@@ -146,7 +148,7 @@ Options:
   -t, --max-tokens N       Max output tokens. Default: model-specific cap
   -M, --messages JSON      Messages array JSON, e.g. [{"role":"user","content":"hi"}]
   --no-stream              Disable streaming (streaming is on by default)
-  --provider NAME          Provider: anthropic, openai, gemini, or openrouter
+  --provider NAME          Provider: anthropic, openai, gemini, openrouter, or codex
   --thinking [LEVEL]       Enable thinking (Anthropic: adaptive; Gemini: minimal/low/medium/high)
   --effort LEVEL           Thinking effort/provider output effort
   --raw                    Print raw non-streaming API response JSON
@@ -190,6 +192,7 @@ Thinking & effort:
 Environment:
   ANTHROPIC_API_KEY        Required for Anthropic models
   OPENAI_API_KEY           Required for OpenAI models
+  CODEX_APP_SERVER_BIN     Codex executable for the codex provider (default: codex)
   GEMINI_API_KEY           Required for Gemini models
   OPENROUTER_API_KEY       Required for OpenRouter models
   LLM_API_URL              Override provider API URL
@@ -843,6 +846,22 @@ _llm_cleanup() {
     return 0
 }
 trap '_llm_cleanup' EXIT
+if [[ "$LLM_PROVIDER" == "codex" ]]; then
+    printf '%s' "$LLM_MESSAGES" > "$payload_file"
+    system_file=""
+    if [[ -n "$LLM_SYSTEM" ]]; then
+        system_file=$(mktemp "${TMPDIR:-/tmp}/llm-system.XXXXXX")
+        printf '%s' "$LLM_SYSTEM" > "$system_file"
+    fi
+    codex_args=(--messages-file "$payload_file" --model "$LLM_MODEL" --usage-file "$LLM_USAGE_FILE")
+    [[ -n "$system_file" ]] && codex_args+=(--system-prompt-file "$system_file")
+    _llm_note ok
+    "$SCRIPT_DIR/../tools/codex-app-server-llm" "${codex_args[@]}"
+    _codex_rc=$?
+    [[ -n "$system_file" ]] && rm -f "$system_file"
+    [[ "$_codex_rc" -eq 0 ]] && _llm_ledger_append
+    exit "$_codex_rc"
+fi
 "build_payload_${LLM_PROVIDER}" > "$payload_file"
 
 # Get URL and headers

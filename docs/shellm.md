@@ -269,7 +269,7 @@ llm -m openai/gpt-oss-120b "what wakes you up in the morning?"
 llm -m claude-opus-4-7 -M '[{"role":"user","content":"hi"},{"role":"assistant","content":"hello!"},{"role":"user","content":"what did I just say?"}]'
 ```
 
-**Provider auto-detection:**
+**Provider selection:**
 
 | Model pattern | Provider |
 |---|---|
@@ -277,6 +277,16 @@ llm -m claude-opus-4-7 -M '[{"role":"user","content":"hi"},{"role":"assistant","
 | `gpt-*`, `o1-*`, `o3-*`, `o4-*` | OpenAI (`OPENAI_API_KEY`) |
 | `gemini-*` | Gemini (`GEMINI_API_KEY`) |
 | `vendor/model` (any slash) | OpenRouter (`OPENROUTER_API_KEY`) |
+
+For ChatGPT-managed Codex authentication, select the official Codex app-server
+explicitly. Headlong does not read or copy OAuth tokens:
+
+```bash
+SHELLM_PROVIDER=codex SHELLM_MODEL=gpt-5.6-luna shellm "say OK"
+```
+
+The Codex CLI must already be signed in with `codex login`. The adapter keeps
+the API-key providers available and does not send their keys to Codex.
 
 **Output contract:** stdout = text response, stderr = thinking tokens (Anthropic only), exit 0 = success. This makes it composable with pipes and subshells.
 
@@ -348,6 +358,14 @@ You can also put settings in a `.env` file in the working directory:
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
 SHELLM_MODEL=claude-opus-4-7-20250715
+SHELLM_MAX_ITERATIONS=10
+```
+
+For a Codex-backed configuration, use this instead:
+
+```bash
+SHELLM_PROVIDER=codex
+SHELLM_MODEL=gpt-5.6-luna
 SHELLM_MAX_ITERATIONS=10
 ```
 
