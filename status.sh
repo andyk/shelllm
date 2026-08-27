@@ -69,7 +69,9 @@ else
     fi
     if [[ -d "$HEADLONG_HOME" ]]; then
         keys=""
-        for k in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY; do
+        for k in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY \
+                 OPENCODE_API_KEY AWS_BEARER_TOKEN_BEDROCK AWS_ACCESS_KEY_ID \
+                 AWS_PROFILE; do
             grep -q "^$k=" "$HEADLONG_HOME/.env" 2>/dev/null && keys="$keys $k"
         done
         model=$(sed -n 's/^SHELLM_MODEL=//p' "$HEADLONG_HOME/.env" 2>/dev/null | tail -1)

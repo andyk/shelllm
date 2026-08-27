@@ -56,6 +56,8 @@ if [[ -z "${SHELLM_MODEL:-}" ]]; then
         # One env var covers both OpenCode plans; default to the Go
         # subscription (flat-rate). Zen models: SHELLM_MODEL=opencode/<model>.
         SHELLM_MODEL="opencode-go/deepseek-v4-flash"
+    elif [[ -n "${AWS_BEARER_TOKEN_BEDROCK:-}${AWS_PROFILE:-}" || ( -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ) ]]; then
+        SHELLM_MODEL="us.anthropic.claude-sonnet-4-6"
     else
         SHELLM_MODEL="claude-opus-4-7"
     fi
@@ -106,6 +108,43 @@ _SHELLM_EXTRA_BINS=()
 # ---------------------------------------------------------------------------
 
 die() { echo "shellm: error: $*" >&2; exit 1; }
+
+_shellm_model_uses_bedrock() {
+    case "$SHELLM_MODEL" in
+        bedrock/*|openai.gpt-*|*.openai.gpt-*|anthropic.claude*|*.anthropic.claude*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Resolve a profile once for sandbox propagation. bin/llm sees the marker and
+# refreshes the profile again on each top-level model call; generated code gets
+# only the temporary credential values, not host profile files or executables.
+_shellm_materialize_aws_profile_credentials() {
+    _shellm_model_uses_bedrock || return 0
+    [[ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]] && return 0
+    [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]] && return 0
+    [[ -n "${AWS_PROFILE:-}" ]] || return 0
+    command -v aws >/dev/null 2>&1 \
+        || die "AWS_PROFILE is set, but the AWS CLI is not installed"
+
+    local credential_json
+    credential_json=$(aws configure export-credentials --profile "$AWS_PROFILE" --format process) \
+        || die "Could not resolve AWS_PROFILE '$AWS_PROFILE' with 'aws configure export-credentials'"
+    local -a credential_parts=()
+    local credential_part
+    while IFS= read -r credential_part; do
+        credential_parts+=("$credential_part")
+    done < <(printf '%s' "$credential_json" | jq -r \
+        '.AccessKeyId // "", .SecretAccessKey // "", .SessionToken // ""')
+    unset credential_json
+
+    export AWS_ACCESS_KEY_ID="${credential_parts[0]:-}"
+    export AWS_SECRET_ACCESS_KEY="${credential_parts[1]:-}"
+    export AWS_SESSION_TOKEN="${credential_parts[2]:-}"
+    export HEADLONG_AWS_PROFILE_CREDENTIALS=1
+    [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] \
+        || die "AWS_PROFILE '$AWS_PROFILE' returned incomplete credentials"
+}
 
 banner() {
     [[ "$QUIET" -eq 1 ]] && return
@@ -189,6 +228,8 @@ Options:
 Environment:
   <PROVIDER>_API_KEY      Key for SHELLM_MODEL's provider (ANTHROPIC_API_KEY
                           for claude-*, OPENROUTER_API_KEY for vendor/model, ...)
+  AWS_BEARER_TOKEN_BEDROCK Amazon Bedrock API key for Bedrock model IDs
+  AWS_PROFILE             AWS CLI profile/credential_process for Bedrock
   SHELLM_MODEL            Model to use
   SHELLM_FAST_MODEL       Cheap model class for utility calls (summaries,
                           mem search); defaults to SHELLM_MODEL's provider
@@ -255,6 +296,10 @@ redact_sensitive() {
     if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
         output="${output//${ANTHROPIC_API_KEY}/<redacted-anthropic-key>}"
     fi
+    local secret
+    for secret in "${AWS_BEARER_TOKEN_BEDROCK:-}" "${AWS_SECRET_ACCESS_KEY:-}" "${AWS_SESSION_TOKEN:-}"; do
+        [[ -z "$secret" ]] || output="${output//$secret/<redacted-aws-credential>}"
+    done
 
     printf '%s' "$output" | LC_ALL=C sed -E 's/sk-ant-[A-Za-z0-9._-]+/<redacted-anthropic-key>/g'
 }
@@ -2329,7 +2374,6 @@ exit \$__shellm_rc
             SHELLM_WORKDIR="$workdir"
             SHELLM_ENV="$(if [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 && "$SHELLM_ALLOW_NESTED_DOCKER" != "1" ]]; then echo "local"; else echo "${_SHELLM_ACTIVE_ENV:-}"; fi)"
             _SHELLM_PARENT_CONTAINER="${_SHELLM_CONTAINER:-}"
-            ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
             SHELLM_MODEL="$SHELLM_MODEL"
             SHELLM_MAX_TOKENS="$SHELLM_MAX_TOKENS"
             SHELLM_MAX_ITERATIONS="$SHELLM_MAX_ITERATIONS"
@@ -2360,6 +2404,18 @@ exit \$__shellm_rc
             SHELLM_ACTIVITY_FILE="$rundir/.activity"
             PATH="$(dirname "$shellm_path"):$PATH"
         )
+        # Provider credentials reach generated code through the environment,
+        # never argv. Profile-backed Bedrock credentials were materialized on
+        # the host, so sandboxes do not need ~/.aws or credential_process.
+        local _provider_var
+        for _provider_var in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY \
+                             OPENROUTER_API_KEY OPENCODE_API_KEY \
+                             AWS_BEARER_TOKEN_BEDROCK AWS_ACCESS_KEY_ID \
+                             AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION \
+                             AWS_DEFAULT_REGION; do
+            [[ -n "${!_provider_var:-}" ]] \
+                && env_vars+=("$_provider_var=${!_provider_var}")
+        done
         # Forward --var values
         for _ev in "${_SHELLM_EXTRA_VARS[@]+"${_SHELLM_EXTRA_VARS[@]}"}"; do
             env_vars+=("$_ev")
@@ -2851,6 +2907,8 @@ main() {
     fi
 
     [[ -z "$prompt" && -z "$_use_traj" ]] && { usage; }
+
+    _shellm_materialize_aws_profile_credentials
 
     if [[ "${#context_files[@]}" -gt 0 ]]; then
         run_loop "$prompt" "${context_files[@]}"

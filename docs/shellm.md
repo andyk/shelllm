@@ -265,6 +265,12 @@ llm -m gemini-2.5-pro "translate to French: hello world"
 # OpenRouter (any vendor/model name)
 llm -m openai/gpt-oss-120b "what wakes you up in the morning?"
 
+# Amazon Bedrock: Claude via Bedrock Runtime
+AWS_BEARER_TOKEN_BEDROCK=... llm -m us.anthropic.claude-sonnet-4-6 "hello"
+
+# Amazon Bedrock: OpenAI via the Mantle Responses API
+AWS_BEARER_TOKEN_BEDROCK=... llm -m openai.gpt-5.6-sol "hello"
+
 # Multi-turn conversation from JSON
 llm -m claude-opus-4-7 -M '[{"role":"user","content":"hi"},{"role":"assistant","content":"hello!"},{"role":"user","content":"what did I just say?"}]'
 ```
@@ -276,7 +282,21 @@ llm -m claude-opus-4-7 -M '[{"role":"user","content":"hi"},{"role":"assistant","
 | `claude-*` | Anthropic (`ANTHROPIC_API_KEY`) |
 | `gpt-*`, `o1-*`, `o3-*`, `o4-*` | OpenAI (`OPENAI_API_KEY`) |
 | `gemini-*` | Gemini (`GEMINI_API_KEY`) |
+| `bedrock/<model>`, `anthropic.claude*`, `*.anthropic.claude*` | Amazon Bedrock Runtime (`AWS_BEARER_TOKEN_BEDROCK`) |
+| `openai.gpt-*` | Amazon Bedrock Mantle Responses API (`AWS_BEARER_TOKEN_BEDROCK`) |
+| `us.openai.gpt-*`, `global.openai.gpt-*`, etc. | Amazon Bedrock Runtime Responses API (`AWS_BEARER_TOKEN_BEDROCK`) |
 | `vendor/model` (any slash) | OpenRouter (`OPENROUTER_API_KEY`) |
+
+Bedrock uses `AWS_REGION`, then `AWS_DEFAULT_REGION`, and defaults to
+`us-east-1`. Bedrock API keys are region-bound, so set the matching region.
+Standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` credentials (and an
+optional `AWS_SESSION_TOKEN`) are also accepted through curl's SigV4 support.
+Setting `AWS_PROFILE` instead makes `llm` resolve fresh credentials through
+AWS CLI on every call; `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` are
+honored. If no Region environment variable is set, the profile Region is used.
+Mantle OpenAI models stream normally. Claude's Bedrock streaming transport is
+binary AWS event-stream rather than SSE, so `llm` uses non-streaming
+`InvokeModel` and caps `max_tokens` at that API's 21,333-token limit.
 
 **Output contract:** stdout = text response, stderr = thinking tokens (Anthropic only), exit 0 = success. This makes it composable with pipes and subshells.
 

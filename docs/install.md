@@ -95,7 +95,7 @@ With no tty, every question falls back to an environment variable or a
 default, so a script or a coding agent can install with no interaction:
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...   # or ANTHROPIC_/OPENAI_/GEMINI_API_KEY
+export OPENROUTER_API_KEY=sk-or-...   # or another provider's *_API_KEY
 export HEADLONG_IDENTITY_NAME=ada       # optional; the interview's answers
 export HEADLONG_IDENTITY_VIBE="curious, warm, and plainspoken"
 export HEADLONG_IDENTITY_FOCUS="learning how their own mind works"
@@ -103,8 +103,36 @@ export HEADLONG_IDENTITY_USER="I'm Sam, a programmer trying Headlong out"
 curl -fsSL https://headlong.ai/install.sh | bash
 ```
 
-A key must be in the environment; everything else is optional.
+A provider credential must be in the environment; everything else is optional.
 `HEADLONG_NO_DASH=1` and `HEADLONG_NO_THINKERS=1` skip those parts.
+
+For Amazon Bedrock, use a Bedrock API key and the Region where it was created:
+
+```bash
+export AWS_BEARER_TOKEN_BEDROCK=...
+export AWS_REGION=us-east-1
+# Optional: Mantle OpenAI instead of the default Bedrock Claude model
+export SHELLM_MODEL=openai.gpt-5.6-sol
+curl -fsSL https://headlong.ai/install.sh | bash
+```
+
+`AWS_ACCESS_KEY_ID` plus `AWS_SECRET_ACCESS_KEY` (and, for temporary
+credentials, `AWS_SESSION_TOKEN`) can replace the Bedrock API key. The curl
+used for SigV4 authentication must be version 7.75 or newer.
+
+An AWS CLI profile is the durable choice when credentials come from SSO or a
+`credential_process`; Headlong asks AWS CLI for fresh credentials on each
+model call and persists the profile's configured Region:
+
+```bash
+export AWS_PROFILE=codex-bedrock
+curl -fsSL https://headlong.ai/install.sh | bash
+```
+
+Profile-backed installs stay on the host because a standalone agent container
+cannot safely invoke a host credential process. Generated shell commands are
+still Docker-sandboxed. Use `AWS_BEARER_TOKEN_BEDROCK` for the fully
+containerized install option.
 
 With no tty there is nobody to answer the sandbox question, so on a
 machine without a working Docker daemon the install stops unless

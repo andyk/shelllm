@@ -52,6 +52,8 @@ run_init() {
     local home="$1"; shift
     mkdir -p "$home"
     env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GEMINI_API_KEY -u OPENROUTER_API_KEY \
+        -u OPENCODE_API_KEY -u AWS_BEARER_TOKEN_BEDROCK -u AWS_ACCESS_KEY_ID \
+        -u AWS_SECRET_ACCESS_KEY -u AWS_PROFILE \
         -u HEADLONG_UNSANDBOXED -u HEADLONG_FAKE_DOCKER -u SHELLM_DOCKER_IMAGE -u SHELLM_MODEL \
         HOME="$home" HEADLONG_HOME="$home/.headlong" HEADLONG_APP_DIR="$APP" \
         HEADLONG_NO_TTY=1 PATH="$STUB:$PATH" "$@" \
@@ -95,6 +97,8 @@ check "fake ok: sandbox promised despite a down daemon"  grep -qx "SHELLM_REQUIR
 # --- --dry-run: walks the gate, writes nothing, exits 0 ----------------------
 mkdir -p "$WORK/h6"
 env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GEMINI_API_KEY -u OPENROUTER_API_KEY \
+    -u OPENCODE_API_KEY -u AWS_BEARER_TOKEN_BEDROCK -u AWS_ACCESS_KEY_ID \
+    -u AWS_SECRET_ACCESS_KEY -u AWS_PROFILE \
     -u HEADLONG_UNSANDBOXED -u SHELLM_DOCKER_IMAGE -u SHELLM_MODEL \
     HOME="$WORK/h6" HEADLONG_HOME="$WORK/h6/.headlong" HEADLONG_APP_DIR="$APP" \
     HEADLONG_NO_TTY=1 HEADLONG_FAKE_DOCKER=ok PATH="$STUB:$PATH" \

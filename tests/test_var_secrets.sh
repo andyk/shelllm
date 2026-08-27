@@ -42,6 +42,15 @@ printf '%s' "$n" > "$LLM_COUNT"
 if [[ -f "$LLM_SCRIPT/$n" ]]; then cat "$LLM_SCRIPT/$n"; else cat "$LLM_SCRIPT/last"; fi
 STUB
 chmod +x "$WORK/toolbin/llm"
+cat > "$WORK/toolbin/aws" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" == "configure export-credentials --profile sandbox-profile --format process" ]]; then
+    printf '{"Version":1,"AccessKeyId":"PROFILEACCESS","SecretAccessKey":"profile-secret-value","SessionToken":"profile-session-value"}\n'
+    exit 0
+fi
+exit 1
+STUB
+chmod +x "$WORK/toolbin/aws"
 
 export PATH="$WORK/toolbin:$PATH"
 export LLM_COUNT="$WORK/count"
@@ -130,6 +139,25 @@ if [[ "$hits" -eq 0 ]]; then
     ok "forwarded secret is nowhere under the state home"
 else
     bad "forwarded secret is nowhere under the state home" "$(grep -rlF "$SECRET" "$HEADLONG_HOME" | head -3)"
+fi
+
+# --- 4. AWS profile credentials are resolved on the host for generated code --
+unset ANTHROPIC_API_KEY AWS_BEARER_TOKEN_BEDROCK AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export AWS_PROFILE=sandbox-profile AWS_REGION=us-east-1
+export SHELLM_MODEL=openai.gpt-5.6-sol
+fence "printf '%s %s %s' \"\$AWS_ACCESS_KEY_ID\" \"\$AWS_SECRET_ACCESS_KEY\" \"\$AWS_SESSION_TOKEN\" > '$WORK/aws-profile.txt'
+ps -axo args= > '$WORK/aws-profile-ps.txt' 2>/dev/null || ps -eo args= > '$WORK/aws-profile-ps.txt'" > "$WORK/script/1"
+fence 'FINAL=done' > "$WORK/script/last"
+run_shellm "profile task"
+if grep -qx 'PROFILEACCESS profile-secret-value profile-session-value' "$WORK/aws-profile.txt" 2>/dev/null; then
+    ok "AWS profile credentials reach generated code"
+else
+    bad "AWS profile credentials reach generated code" "$(cat "$WORK/aws-profile.txt" 2>/dev/null)"
+fi
+if ! grep -qF 'profile-secret-value' "$WORK/aws-profile-ps.txt" 2>/dev/null; then
+    ok "resolved AWS profile secret stays off process argv"
+else
+    bad "resolved AWS profile secret stays off process argv" "secret found in ps snapshot"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

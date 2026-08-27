@@ -32,12 +32,18 @@ trajectory.
 ## Install without a tty
 
 With no tty the installer asks nothing; every answer comes from an
-environment variable or a default. A key must be in the environment:
+environment variable or a default. A provider credential must be in the environment:
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...   # or ANTHROPIC_/OPENAI_/GEMINI_API_KEY
+export OPENROUTER_API_KEY=sk-or-...   # or another provider's *_API_KEY
 curl -fsSL https://headlong.ai/install.sh | bash
 ```
+
+Amazon Bedrock uses `AWS_BEARER_TOKEN_BEDROCK` plus `AWS_REGION` (or standard
+AWS environment credentials). `AWS_PROFILE` is also accepted and refreshes
+`credential_process` credentials through AWS CLI on each call. `openai.gpt-*`
+model IDs route to the Mantle Responses API; Bedrock-prefixed Anthropic and
+OpenAI IDs route to Bedrock Runtime.
 
 Optional variables: `HEADLONG_IDENTITY_NAME`, `HEADLONG_IDENTITY_VIBE`,
 `HEADLONG_IDENTITY_FOCUS`, `HEADLONG_IDENTITY_USER` (the interview answers),

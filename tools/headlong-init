@@ -290,7 +290,8 @@ EOF
 # ---------------------------------------------------------------------------
 
 _have_key() {
-    [[ -n "${ANTHROPIC_API_KEY:-}${OPENAI_API_KEY:-}${GEMINI_API_KEY:-}${OPENROUTER_API_KEY:-}${OPENCODE_API_KEY:-}" ]]
+    [[ -n "${ANTHROPIC_API_KEY:-}${OPENAI_API_KEY:-}${GEMINI_API_KEY:-}${OPENROUTER_API_KEY:-}${OPENCODE_API_KEY:-}${AWS_BEARER_TOKEN_BEDROCK:-}${AWS_PROFILE:-}" \
+       || ( -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ) ]]
 }
 
 _key_var_for() {  # guess the provider env var from the key's prefix
@@ -298,6 +299,7 @@ _key_var_for() {  # guess the provider env var from the key's prefix
         sk-ant-*) echo ANTHROPIC_API_KEY ;;
         sk-or-*)  echo OPENROUTER_API_KEY ;;
         AIza*)    echo GEMINI_API_KEY ;;
+        ABSK*|bedrock-api-key-*) echo AWS_BEARER_TOKEN_BEDROCK ;;
         sk-*)     echo OPENAI_API_KEY ;;
         *)        echo "" ;;
     esac
@@ -310,17 +312,20 @@ _default_model_for() {
         GEMINI_API_KEY)     echo "gemini-3.5-flash" ;;
         OPENROUTER_API_KEY) echo "anthropic/claude-sonnet-4.5" ;;
         OPENCODE_API_KEY)   echo "opencode-go/deepseek-v4-flash" ;;
+        AWS_BEARER_TOKEN_BEDROCK|AWS_ACCESS_KEY_ID|AWS_PROFILE) echo "us.anthropic.claude-sonnet-4-6" ;;
     esac
 }
 
 _key_var_unambiguous() {  # the ONLY provider var a key's prefix can belong to
     # Deliberately stricter than _key_var_for: a bare sk- key is OpenAI *or*
     # OpenCode (see _prompt_key, which has to ask), so it is not evidence of
-    # anything and must never move a key. Only these three prefixes settle it.
+    # anything and must never move a key. Only these provider-specific
+    # prefixes settle it.
     case "$1" in
         sk-ant-*) echo ANTHROPIC_API_KEY ;;
         sk-or-*)  echo OPENROUTER_API_KEY ;;
         AIza*)    echo GEMINI_API_KEY ;;
+        ABSK*|bedrock-api-key-*) echo AWS_BEARER_TOKEN_BEDROCK ;;
         *)        echo "" ;;
     esac
 }
@@ -372,6 +377,12 @@ _first_key_var() {  # the provider var to use (llm's priority order)
         want=$(_key_var_unambiguous "${!var}")
         [[ -z "$want" || "$want" == "$var" ]] && { echo "$var"; return 0; }
     done
+    [[ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]] && { echo AWS_BEARER_TOKEN_BEDROCK; return 0; }
+    if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+        echo AWS_ACCESS_KEY_ID
+        return 0
+    fi
+    [[ -n "${AWS_PROFILE:-}" ]] && { echo AWS_PROFILE; return 0; }
     # Every key present contradicts its variable and _reconcile_key_vars could
     # not place one (it never runs inside $(...)); fall back to the old
     # first-set-wins so behavior is unchanged rather than absent.
@@ -390,6 +401,40 @@ _llm_ok() {
     # Generous cap: reasoning models spend thinking tokens against -t, and
     # a too-small budget makes the reply come back empty.
     llm -t 256 "Reply with the single word: ok" >/dev/null 2>>"$INIT_LOG"
+}
+
+_model_uses_bedrock() {
+    case "${SHELLM_MODEL:-}" in
+        bedrock/*|openai.gpt-*|*.openai.gpt-*|anthropic.claude*|*.anthropic.claude*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_persist_bedrock_environment() {
+    _model_uses_bedrock || return 0
+
+    # Persist whichever authentication path the runtime will actually prefer.
+    # The state env is mode 600, matching all other provider key storage.
+    if [[ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]]; then
+        _env_set "$HEADLONG_HOME/.env" AWS_BEARER_TOKEN_BEDROCK "$AWS_BEARER_TOKEN_BEDROCK"
+    elif [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+        _env_set "$HEADLONG_HOME/.env" AWS_ACCESS_KEY_ID "$AWS_ACCESS_KEY_ID"
+        _env_set "$HEADLONG_HOME/.env" AWS_SECRET_ACCESS_KEY "$AWS_SECRET_ACCESS_KEY"
+        [[ -z "${AWS_SESSION_TOKEN:-}" ]] \
+            || _env_set "$HEADLONG_HOME/.env" AWS_SESSION_TOKEN "$AWS_SESSION_TOKEN"
+    elif [[ -n "${AWS_PROFILE:-}" ]]; then
+        _env_set "$HEADLONG_HOME/.env" AWS_PROFILE "$AWS_PROFILE"
+        [[ -z "${AWS_CONFIG_FILE:-}" ]] \
+            || _env_set "$HEADLONG_HOME/.env" AWS_CONFIG_FILE "$AWS_CONFIG_FILE"
+        [[ -z "${AWS_SHARED_CREDENTIALS_FILE:-}" ]] \
+            || _env_set "$HEADLONG_HOME/.env" AWS_SHARED_CREDENTIALS_FILE "$AWS_SHARED_CREDENTIALS_FILE"
+    fi
+
+    local region="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+    if [[ -z "$region" && -n "${AWS_PROFILE:-}" ]] && command -v aws >/dev/null 2>&1; then
+        region=$(aws configure get region --profile "$AWS_PROFILE" 2>/dev/null || true)
+    fi
+    _env_set "$HEADLONG_HOME/.env" AWS_REGION "${region:-us-east-1}"
 }
 
 _prompt_key() {
@@ -424,12 +469,13 @@ _prompt_key() {
         esac
     elif [[ -z "$var" ]]; then
         local which
-        which=$(ask "Which provider is that key for? (1) Anthropic (2) OpenAI (3) Gemini (4) OpenRouter (5) OpenCode" "1")
+        which=$(ask "Which provider is that key for? (1) Anthropic (2) OpenAI (3) Gemini (4) OpenRouter (5) OpenCode (6) Amazon Bedrock" "1")
         case "$which" in
             2) var=OPENAI_API_KEY ;;
             3) var=GEMINI_API_KEY ;;
             4) var=OPENROUTER_API_KEY ;;
             5) var=OPENCODE_API_KEY ;;
+            6) var=AWS_BEARER_TOKEN_BEDROCK ;;
             *) var=ANTHROPIC_API_KEY ;;
         esac
     fi
@@ -442,12 +488,12 @@ _prompt_key() {
 _ensure_api_key() {
     _reconcile_key_vars
     if ! _have_key && [[ "$HAS_TTY" -eq 0 ]]; then
-        die "no API key found. Set ANTHROPIC_API_KEY (or OPENAI/GEMINI/OPENROUTER/OPENCODE_API_KEY), or put it in $HEADLONG_HOME/.env"
+        die "no API key found. Set ANTHROPIC_API_KEY (or OPENAI/GEMINI/OPENROUTER/OPENCODE_API_KEY/AWS_BEARER_TOKEN_BEDROCK/AWS_PROFILE), or put it in $HEADLONG_HOME/.env"
     fi
     if ! _have_key; then
         cat >/dev/tty <<'EOF'
 
-Headlong needs an LLM API key (Anthropic, OpenAI, Gemini, OpenRouter, or OpenCode).
+Headlong needs an LLM API key (Anthropic, OpenAI, Gemini, OpenRouter, OpenCode, or Amazon Bedrock).
 Paste just the key itself; headlong-init figures out the provider from it.
 
   * Use a DEDICATED, SPEND-CAPPED key. The agent you're about to create
@@ -468,6 +514,7 @@ EOF
     if [[ -z "${SHELLM_MODEL:-}" ]]; then
         _env_set "$HEADLONG_HOME/.env" "SHELLM_MODEL" "$(_default_model_for "$(_first_key_var)")"
     fi
+    _persist_bedrock_environment
 
     # A default identity means an earlier init already validated a key.
     # Unattended re-runs (a restarted container: tty allocated, nobody
