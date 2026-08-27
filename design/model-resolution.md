@@ -2,7 +2,7 @@
 
 Status: COMPLETE — documents shipped behavior; the resolution chains match bin/llm, bin/shellm, bin/mem, and thinkers/_lib/common.sh.
 
-**Status:** Current behavior (documented 2026-07-15)
+**Status:** Current behavior (documented 2026-08-27)
 
 How every LLM call in shellm decides which model to use, and where the
 environment variables that feed that decision come from. Two layers:
@@ -14,8 +14,11 @@ environment variables that feed that decision come from. Two layers:
 
 There is no hard provider dependency anywhere: `bin/llm` picks the
 provider from the model name (`claude-*` → Anthropic, `vendor/model` →
-OpenRouter, `gpt-*`/`o*` → OpenAI, `gemini-*` → Gemini) and each provider
-needs only its own `<PROVIDER>_API_KEY`. A model name that implies no
+OpenRouter, `gpt-*`/`o*` → OpenAI, `gemini-*` → Gemini, `openai.gpt-*` →
+Bedrock Mantle, and Bedrock-prefixed Anthropic/OpenAI IDs → Bedrock Runtime)
+and each provider needs only its own credential. Bedrock accepts
+`AWS_BEARER_TOKEN_BEDROCK`, standard AWS environment credentials, or an
+`AWS_PROFILE` resolved afresh through AWS CLI. A model name that implies no
 provider — a local OpenAI-compatible alias, say — is reached by setting
 `LLM_PROVIDER` or passing `--provider`; an env value that contradicts a
 name the harness *can* classify is still honored, but says so on stderr. Hardcoded `claude-*` names below
@@ -31,6 +34,9 @@ are last-resort defaults, reached only when nothing is configured.
 | `SHELLM_SUMMARY_MODEL` | Run-summary override; beats `SHELLM_FAST_MODEL` |
 | `LLM_MODEL` | `bin/llm`'s own knob; equivalent to `-m` |
 | `LLM_PROVIDER` | `bin/llm`'s provider override; equivalent to `--provider`. Needed when the model name implies no provider. A value that disagrees with what the name implies is honored, but warns on stderr |
+| `AWS_BEARER_TOKEN_BEDROCK` | Amazon Bedrock API key; preferred Bedrock authentication |
+| `AWS_PROFILE` | AWS CLI profile used to refresh Bedrock SigV4 credentials on each call |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | Bedrock endpoint Region; then the AWS profile Region; defaults to `us-east-1` |
 
 ## Resolution chains
 
@@ -105,4 +111,12 @@ SHELLM_MODEL=openai/gpt-oss-120b
 # Mixed quality: smart actor, cheap utilities
 SHELLM_MODEL=z-ai/glm-5.2
 SHELLM_FAST_MODEL=openai/gpt-oss-120b
+
+# Amazon Bedrock Mantle (OpenAI Responses API)
+AWS_BEARER_TOKEN_BEDROCK=...
+AWS_REGION=us-east-1
+SHELLM_MODEL=openai.gpt-5.6-sol
+
+# Alternative: use a refreshable AWS CLI profile instead of the bearer vars
+AWS_PROFILE=codex-bedrock
 ```

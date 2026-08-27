@@ -140,6 +140,10 @@ cap at 4 KB — plenty for an env file.
 Which key(s) to include is a `SHELLM_MODEL` decision — e.g.
 `SHELLM_MODEL=openai/gpt-oss-120b` routes via OpenRouter and needs
 `OPENROUTER_API_KEY`; a `claude-*` model needs `ANTHROPIC_API_KEY`.
+An `openai.gpt-*` model routes through Amazon Bedrock Mantle and needs
+`AWS_BEARER_TOKEN_BEDROCK` plus the matching `AWS_REGION`.
+Host installs may instead use `AWS_PROFILE`; Headlong refreshes the profile's
+credentials through AWS CLI and inherits its configured Region.
 Switching providers is just a different parameter value. Optional:
 `SHELLM_FAST_MODEL` sets a cheap model class for utility calls (run
 summaries, `mem search`) — worth setting when `SHELLM_MODEL` is an
@@ -281,4 +285,3 @@ aws ec2 start-instances --region <your-region> \
 # destroy everything (instance, tunnel, DNS, Access app)
 terraform destroy
 ```
-

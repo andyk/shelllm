@@ -45,6 +45,10 @@ TOOLS=("${BIN_TOOLS[@]}" "${AUX_TOOLS[@]}")
 
 _pkg_hint() {
     local pkg="$1"
+    if [[ "$pkg" == "aws" ]]; then
+        printf 'install AWS CLI v2: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html'
+        return
+    fi
     if [[ "$(uname -s)" == "Darwin" ]]; then
         printf 'brew install %s' "$pkg"
     elif command -v apt-get >/dev/null 2>&1; then
@@ -65,11 +69,18 @@ _require_deps() {
 
     # Already root with apt available — a fresh container, typically — so
     # just install them. Still no sudo anywhere: as a normal user we only
-    # print the hints below.
+    # print the hints below. AWS CLI v2 is not an apt package named `aws`, so
+    # leave that one for the explicit installation hint.
     if [[ "$(id -u)" -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
-        echo "==> Installing missing dependencies: ${missing[*]}"
-        apt-get update -qq >/dev/null && \
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates "${missing[@]}" >/dev/null || true
+        local installable=()
+        for dep in "${missing[@]}"; do
+            [[ "$dep" == "aws" ]] || installable+=("$dep")
+        done
+        if [[ "${#installable[@]}" -gt 0 ]]; then
+            echo "==> Installing missing dependencies: ${installable[*]}"
+            apt-get update -qq >/dev/null && \
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates "${installable[@]}" >/dev/null || true
+        fi
     fi
 
     for dep in "${missing[@]}"; do
@@ -100,11 +111,13 @@ _docker_daemon_ok() {
 # container, NUL-delimited for the caller to read into an array: the interview
 # answers are free text, so a value may contain a newline.
 #
-# Keys go by NAME. `-e VAR=value` puts the value in the docker client's argv,
+# Credentials and region config go by NAME. `-e VAR=value` puts the value in
+# the docker client's argv,
 # where `ps` shows it to every other user on the machine for as long as the
-# client runs; thinkers/_lib/common.sh forwards keys the same way for the same
-# reason, and tests/test_var_secrets.sh pins the rule for shellm. Docker reads a name-only
-# `-e VAR` from its own environment, so the name must be exported, which is why
+# client runs; thinkers/_lib/common.sh forwards credentials the same way for
+# the same reason, and tests/test_var_secrets.sh pins the rule for shellm.
+# Docker reads a name-only `-e VAR` from its own environment, so the name must
+# be exported, which is why
 # the answers below do NOT use it: install.sh assigns HEADLONG_REPO and
 # HEADLONG_BRANCH itself without exporting them, so a bare name would forward
 # nothing and the container would clone the default repo instead of the
@@ -112,7 +125,10 @@ _docker_daemon_ok() {
 _docker_forward_args() {
     local var
     for var in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY \
-               OPENCODE_API_KEY; do
+               OPENCODE_API_KEY AWS_BEARER_TOKEN_BEDROCK AWS_ACCESS_KEY_ID \
+               AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE \
+               AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE AWS_REGION \
+               AWS_DEFAULT_REGION; do
         if [[ -n "${!var:-}" ]]; then
             export "${var?}"
             printf '%s\0%s\0' "-e" "$var"
@@ -167,6 +183,17 @@ EOF
             *)    echo 'Please answer 1, 2, or 3.' >/dev/tty ;;
         esac
     done
+
+    if [[ -n "${AWS_PROFILE:-}" && -z "${AWS_BEARER_TOKEN_BEDROCK:-}" ]]; then
+        cat <<EOF
+
+AWS_PROFILE=$AWS_PROFILE uses a host credential process or AWS config that a
+standalone agent container cannot refresh safely. Continuing with the host
+install instead; the agent's generated shell commands will still use Docker.
+Use AWS_BEARER_TOKEN_BEDROCK if you want the entire agent inside one container.
+EOF
+        return 0
+    fi
 
     # An agent container already exists: that IS the install. Go back in
     # instead of failing on the taken name.
@@ -224,7 +251,11 @@ EOF
 }
 
 _bootstrap_and_reexec() {
-    _require_deps git curl jq
+    if [[ -n "${AWS_PROFILE:-}" ]]; then
+        _require_deps git curl jq aws
+    else
+        _require_deps git curl jq
+    fi
 
     cat <<'EOF'
 
@@ -480,7 +511,11 @@ main() {
         esac
     done
 
-    _require_deps jq curl
+    if [[ -n "${AWS_PROFILE:-}" ]]; then
+        _require_deps jq curl aws
+    else
+        _require_deps jq curl
+    fi
 
     mkdir -p "$PREFIX"
     _install_tools

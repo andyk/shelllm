@@ -29,9 +29,18 @@ sed '$ d' "$REPO/install.sh" > "$WORK/install.lib"
 
 SECRET=sk-or-ARGVCANARY
 OPENCODE_SECRET=sk-OPENCODECANARY
+BEDROCK_SECRET=BEDROCK-ARGVCANARY
+AWS_SECRET=AWS-SECRET-ARGVCANARY
 args=$(
     export OPENROUTER_API_KEY="$SECRET"
     export OPENCODE_API_KEY="$OPENCODE_SECRET"
+    export AWS_BEARER_TOKEN_BEDROCK="$BEDROCK_SECRET"
+    export AWS_ACCESS_KEY_ID=AKIAARGVCANARY
+    export AWS_SECRET_ACCESS_KEY="$AWS_SECRET"
+    export AWS_SESSION_TOKEN=AWS-SESSION-ARGVCANARY
+    export AWS_PROFILE=bedrock-profile
+    export AWS_CONFIG_FILE=/tmp/aws-config
+    export AWS_REGION=us-east-1
     export HEADLONG_IDENTITY_NAME=ada
     # Set, deliberately NOT exported, which is how install.sh leaves them.
     # shellcheck disable=SC2034  # read by _docker_forward_args through ${!var}
@@ -49,6 +58,15 @@ flat=" $args "   # padded so a match at either end still has a boundary
 case "$flat" in
     *"$SECRET"*) bad "no API key value on the docker command line" "found $SECRET in: $flat" ;;
     *)           ok  "no API key value on the docker command line" ;;
+esac
+case "$flat" in
+    *"-e AWS_PROFILE "*"-e AWS_CONFIG_FILE "*) ok "AWS profile configuration is forwarded by name" ;;
+    *) bad "AWS profile configuration is forwarded by name" "got: $flat" ;;
+esac
+case "$flat" in
+    *"$BEDROCK_SECRET"*|*"$AWS_SECRET"*) bad "Bedrock credentials stay off the docker command line" "got: $flat" ;;
+    *"-e AWS_BEARER_TOKEN_BEDROCK "*"-e AWS_SECRET_ACCESS_KEY "*) ok "Bedrock credentials are forwarded by name" ;;
+    *) bad "Bedrock credentials are forwarded by name" "got: $flat" ;;
 esac
 case "$flat" in
     *"-e OPENROUTER_API_KEY "*) ok "the key is forwarded by name" ;;
@@ -95,6 +113,8 @@ exported=$(
 # fills in are forwarded, and no key name appears at all.
 none=$(
     unset OPENROUTER_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENCODE_API_KEY
+    unset AWS_BEARER_TOKEN_BEDROCK AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+    unset AWS_PROFILE AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE AWS_REGION AWS_DEFAULT_REGION
     unset HEADLONG_IDENTITY_NAME HEADLONG_IDENTITY_VIBE HEADLONG_IDENTITY_FOCUS
     unset HEADLONG_IDENTITY_USER HEADLONG_OPERATOR_NAME
     # shellcheck disable=SC1090  # generated copy of the installer under test
@@ -102,7 +122,7 @@ none=$(
     _docker_forward_args | tr '\0' ' '
 )
 case "$none" in
-    *API_KEY*) bad "no key is forwarded when none is set" "got: $none" ;;
+    *API_KEY*|*AWS_ACCESS_KEY_ID*|*AWS_SECRET_ACCESS_KEY*|*AWS_PROFILE*) bad "no key is forwarded when none is set" "got: $none" ;;
     *)         ok  "no key is forwarded when none is set" ;;
 esac
 

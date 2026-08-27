@@ -339,13 +339,18 @@ _build_shellm_flags() {
     printf '%s\n' "--var" "TRAJ_DIR=$abs_traj_dir"
     printf '%s\n' "--var" "TRAJ_ID=$TRAJ_ID"
 
-    # Propagate model + API keys to nested shellm calls. Inside Docker, .env
+    # Propagate model + provider credentials to nested shellm calls. Inside
+    # Docker, .env
     # isn't mounted, so without these the nested call hits the final else in
     # bin/shellm's model fallback and fails with "ANTHROPIC_API_KEY is not set".
-    # Keys go by NAME (bare `--var NAME`): shellm reads the value from its
-    # environment, so it never shows up in `ps` or the recorded command line.
+    # Credentials and region go by NAME (bare `--var NAME`): shellm reads the
+    # value from its environment, so it never shows up in `ps` or the recorded
+    # command line.
     [[ -n "${SHELLM_MODEL:-}" ]] && printf '%s\n' "--var" "SHELLM_MODEL=$SHELLM_MODEL"
-    for _ak in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY; do
+    for _ak in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY \
+               AWS_BEARER_TOKEN_BEDROCK AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY \
+               AWS_SESSION_TOKEN AWS_PROFILE AWS_CONFIG_FILE \
+               AWS_SHARED_CREDENTIALS_FILE AWS_REGION AWS_DEFAULT_REGION; do
         if [[ -n "${!_ak:-}" ]]; then
             export "${_ak?}"
             printf '%s\n' "--var" "$_ak"

@@ -12,7 +12,7 @@ description: Reference for the shellm system — recursive LLM shell, identity m
 shellm is a set of composable bash scripts that turn an LLM into an autonomous agent living in a shell. The stack, bottom to top:
 
 ```
-llm              raw LLM calls (Anthropic, OpenAI, Gemini)
+llm              raw LLM calls (Anthropic, OpenAI, Gemini, Bedrock, and more)
 shellm           recursive execute-in-shell loop on top of llm
 traj / context   step log (DAG) + message assembly for multi-turn
 mem / skills     persistent memory + learnable capabilities
@@ -30,7 +30,7 @@ An agent activates an identity (`source .identities/<name>/activate`), which set
 | Script | Purpose |
 |--------|---------|
 | `shellm` | Recursive LLM-in-bash loop. Sends a prompt to the LLM, executes returned bash code blocks, feeds output back, repeats until `FINAL` is set. The heart of the system. |
-| `llm` | Multi-provider LLM CLI. `llm [options] prompt` or stdin. Supports Anthropic, OpenAI, Gemini. Key flags: `-m MODEL`, `-s SYSTEM`, `-M MESSAGES_JSON`, `--stream`, `--thinking`. |
+| `llm` | Multi-provider LLM CLI. `llm [options] prompt` or stdin. Supports Anthropic, OpenAI, Gemini, OpenRouter, OpenCode, and Amazon Bedrock. Key flags: `-m MODEL`, `-s SYSTEM`, `-M MESSAGES_JSON`, `--stream`, `--thinking`. |
 
 ### Identity & activation
 

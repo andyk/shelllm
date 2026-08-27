@@ -33,7 +33,15 @@ printf '#!/usr/bin/env bash\ncase "${1:-}" in info) exit 0 ;; *) exit 0 ;; esac\
 # llm: always fails, so init stops right after writing SHELLM_MODEL. Without a
 # tty that is a single fast failure, which is all these assertions need.
 printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB/llm"
-chmod +x "$STUB/docker" "$STUB/llm"
+cat > "$STUB/aws" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == "configure get region --profile test-profile" ]]; then
+    printf 'us-west-2\n'
+    exit 0
+fi
+exit 1
+EOF
+chmod +x "$STUB/docker" "$STUB/llm" "$STUB/aws"
 
 APP="$WORK/app"; mkdir -p "$APP/bin" "$APP/tools"
 : > "$APP/bin/shellm"
@@ -43,7 +51,10 @@ run_init() {
     local home="$1"; shift
     mkdir -p "$home"
     env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GEMINI_API_KEY -u OPENROUTER_API_KEY \
-        -u OPENCODE_API_KEY -u SHELLM_MODEL -u HEADLONG_UNSANDBOXED \
+        -u OPENCODE_API_KEY -u AWS_BEARER_TOKEN_BEDROCK -u AWS_ACCESS_KEY_ID \
+        -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AWS_REGION -u AWS_DEFAULT_REGION \
+        -u AWS_PROFILE -u AWS_CONFIG_FILE -u AWS_SHARED_CREDENTIALS_FILE \
+        -u SHELLM_MODEL -u HEADLONG_UNSANDBOXED \
         HOME="$home" HEADLONG_HOME="$home/.headlong" HEADLONG_APP_DIR="$APP" \
         HEADLONG_NO_TTY=1 HEADLONG_UNSANDBOXED=1 PATH="$STUB:$PATH" "$@" \
         bash "$REPO/tools/headlong-init" </dev/null > "$WORK/out" 2>&1
@@ -89,6 +100,40 @@ run_init "$WORK/h5" OPENAI_API_KEY=sk-ant-api03-EXAMPLE-NOT-A-REAL-KEY
 check "misplaced sk-ant- key: model follows the key" \
     grep -qx 'SHELLM_MODEL=claude-sonnet-4-5-20250929' "$WORK/h5/.headlong/.env"
 
+# --- Bedrock bearer tokens and SigV4 credentials pick the Bedrock default ----
+run_init "$WORK/h8" AWS_BEARER_TOKEN_BEDROCK=BEDROCK-EXAMPLE-NOT-A-REAL-KEY
+check "Bedrock API key: picks the Bedrock Claude default" \
+    grep -qx 'SHELLM_MODEL=us.anthropic.claude-sonnet-4-6' "$WORK/h8/.headlong/.env"
+check "Bedrock API key: key and default region persist" bash -c \
+    'grep -qx "AWS_BEARER_TOKEN_BEDROCK=BEDROCK-EXAMPLE-NOT-A-REAL-KEY" "$1" && grep -qx "AWS_REGION=us-east-1" "$1"' \
+    _ "$WORK/h8/.headlong/.env"
+
+run_init "$WORK/h9" AWS_ACCESS_KEY_ID=AKIAEXAMPLE AWS_SECRET_ACCESS_KEY=EXAMPLE-NOT-A-REAL-SECRET
+check "AWS credential pair: picks the Bedrock Claude default" \
+    grep -qx 'SHELLM_MODEL=us.anthropic.claude-sonnet-4-6' "$WORK/h9/.headlong/.env"
+check "AWS credential pair: credentials persist for later launches" bash -c \
+    'grep -qx "AWS_ACCESS_KEY_ID=AKIAEXAMPLE" "$1" && grep -qx "AWS_SECRET_ACCESS_KEY=EXAMPLE-NOT-A-REAL-SECRET" "$1"' \
+    _ "$WORK/h9/.headlong/.env"
+
+run_init "$WORK/h12" AWS_PROFILE=test-profile AWS_CONFIG_FILE="$WORK/aws-config"
+check "AWS profile: picks the Bedrock Claude default" \
+    grep -qx 'SHELLM_MODEL=us.anthropic.claude-sonnet-4-6' "$WORK/h12/.headlong/.env"
+check "AWS profile: profile and config path persist" bash -c \
+    'grep -qx "AWS_PROFILE=test-profile" "$1" && grep -qx "AWS_CONFIG_FILE=$2" "$1"' \
+    _ "$WORK/h12/.headlong/.env" "$WORK/aws-config"
+check "AWS profile: configured region persists" \
+    grep -qx 'AWS_REGION=us-west-2' "$WORK/h12/.headlong/.env"
+
+run_init "$WORK/h10" OPENAI_API_KEY=ABSK-EXAMPLE-NOT-A-REAL-KEY
+check "misplaced ABSK key: recognized and persisted as a Bedrock API key" \
+    grep -qx 'AWS_BEARER_TOKEN_BEDROCK=ABSK-EXAMPLE-NOT-A-REAL-KEY' "$WORK/h10/.headlong/.env"
+check "misplaced ABSK key: model follows Bedrock" \
+    grep -qx 'SHELLM_MODEL=us.anthropic.claude-sonnet-4-6' "$WORK/h10/.headlong/.env"
+
+run_init "$WORK/h11" OPENAI_API_KEY=bedrock-api-key-EXAMPLE-NOT-A-REAL-KEY
+check "misplaced short-term Bedrock token: recognized as Bedrock" \
+    grep -qx 'AWS_BEARER_TOKEN_BEDROCK=bedrock-api-key-EXAMPLE-NOT-A-REAL-KEY' "$WORK/h11/.headlong/.env"
+
 # --- a stale SHELLM_MODEL pinned from the misfiled variable heals ------------
 # An earlier init derived gpt-5.5 from the key sitting in OPENAI_API_KEY;
 # reconciling the key must re-pin the model, or every later run keeps routing
@@ -128,6 +173,8 @@ export PAYLOAD_OUT="$WORK/payload.json"
 cd "$WORK" || exit 1
 env -u SHELLM_MODEL -u HEADLONG_HOME -u LLM_PROVIDER -u LLM_API_URL -u LLM_MODEL \
     -u OPENAI_API_KEY -u GEMINI_API_KEY -u OPENROUTER_API_KEY -u OPENCODE_API_KEY \
+    -u AWS_BEARER_TOKEN_BEDROCK -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
+    -u AWS_PROFILE -u AWS_CONFIG_FILE -u AWS_SHARED_CREDENTIALS_FILE \
     PATH="$CURL_STUB:$PATH" LLM_RETRIES=0 \
     HOME="$WORK/h6" ANTHROPIC_API_KEY=sk-ant-test LLM_MAX_TOKENS=4242 \
     bash "$REPO/bin/llm" -m claude-sonnet-4-5-20250929 hi >/dev/null 2>&1
@@ -140,6 +187,8 @@ check "bin/llm: LLM_MAX_TOKENS from the environment reaches the request" \
 printf 'echo POLLUTION\nLLM_MAX_TOKENS=1234\n' > "$WORK/.env"
 env -u SHELLM_MODEL -u HEADLONG_HOME -u LLM_PROVIDER -u LLM_API_URL -u LLM_MODEL \
     -u OPENAI_API_KEY -u GEMINI_API_KEY -u OPENROUTER_API_KEY -u OPENCODE_API_KEY \
+    -u AWS_BEARER_TOKEN_BEDROCK -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
+    -u AWS_PROFILE -u AWS_CONFIG_FILE -u AWS_SHARED_CREDENTIALS_FILE \
     -u LLM_MAX_TOKENS \
     PATH="$CURL_STUB:$PATH" LLM_RETRIES=0 \
     HOME="$WORK/h6" ANTHROPIC_API_KEY=sk-ant-test \

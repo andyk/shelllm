@@ -112,7 +112,7 @@ out=$(
     unset OPENROUTER_API_KEY HEADLONG_HOME SHELLM_HOME
     mkdir -p "$H/id/memories" "$H/id/skills" "$H/id/kernel" "$H/id/trajectories" "$H/.headlong" "$H/wd"
     printf 'name=probe\n' > "$H/id/info.txt"
-    printf 'OPENROUTER_API_KEY=from-headlong\n' > "$H/.headlong/.env"
+    printf 'OPENROUTER_API_KEY=from-headlong\nAWS_BEARER_TOKEN_BEDROCK=bedrock-from-headlong\nAWS_PROFILE=test-profile\nAWS_CONFIG_FILE=/tmp/test-aws-config\nAWS_REGION=us-west-2\n' > "$H/.headlong/.env"
     export IDENTITY_DIR="$H/id" TRAJ_DIR="$H/id/trajectories" TRAJ_ID=t1 MEM_DIR="$H/id/memories"
     cd "$H/wd" || exit 1
     # shellcheck disable=SC1090  # the library under test
@@ -123,6 +123,14 @@ out=$(
 case "$out" in
     *"--var OPENROUTER_API_KEY "*) ok "the key is forwarded to the nested shellm" ;;
     *) bad "the key is forwarded to the nested shellm" "no bare --var for it" ;;
+esac
+case "$out" in
+    *"--var AWS_BEARER_TOKEN_BEDROCK "*"--var AWS_REGION "*) ok "Bedrock key and region are forwarded to the nested shellm" ;;
+    *) bad "Bedrock key and region are forwarded to the nested shellm" "missing bare --var entries" ;;
+esac
+case "$out" in
+    *"--var AWS_PROFILE "*"--var AWS_CONFIG_FILE "*) ok "AWS profile configuration is forwarded to the nested shellm" ;;
+    *) bad "AWS profile configuration is forwarded to the nested shellm" "missing bare --var entries" ;;
 esac
 
 echo

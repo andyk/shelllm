@@ -41,7 +41,8 @@ curl -fsSL https://headlong.ai/install.sh | bash
 ```
 
 You'll need bash 3.2+, git, curl, jq, and an LLM API key (Anthropic,
-OpenAI, Gemini, or OpenRouter); the dashboard also needs
+OpenAI, Gemini, OpenRouter, OpenCode, or Amazon Bedrock); the dashboard also
+needs
 [uv](https://docs.astral.sh/uv/) and bun or node, and the installer offers
 to fetch those. 
 
@@ -154,7 +155,7 @@ experiment with.
 | Tool | What it does |
 |------|-------------|
 | **shellm** | The RLM core. It sends context to an LLM, runs the bash the LLM writes back, and repeats |
-| **llm** | Multi-provider LLM CLI. Anthropic, OpenAI, Gemini, and OpenRouter behind one interface |
+| **llm** | Multi-provider LLM CLI. Anthropic, OpenAI, Gemini, OpenRouter, OpenCode, and Amazon Bedrock behind one interface |
 | **traj** | Trajectory operations on append-only jsonl DAGs with fork and merge |
 | **context** | Renders a trajectory into an LLM messages array with tiered compaction |
 | **thinkers** | The mind. Reactive thought processes run by a dispatcher |
