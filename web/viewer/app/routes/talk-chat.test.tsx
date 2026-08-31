@@ -11,6 +11,7 @@ import type {
   IdentityActivity,
   ThinkersStatus,
 } from "~/lib/types";
+import { fetchChat } from "~/lib/api";
 import { setPwaName } from "~/lib/pwa";
 import TalkChat from "~/routes/talk-chat";
 
@@ -119,5 +120,47 @@ describe("phone chat composer", () => {
       "line one\nline two",
       "pwa-nick"
     );
+  });
+});
+
+const EMPTY_CHAT: ChatLog = {
+  identity: { id: "ada", name: "ada" },
+  live: false,
+  messages: [],
+  outcomes: {},
+};
+const FINAL_REPLY_TEXT = "here is the finished reply";
+
+describe("completed reply settles the waiting state", () => {
+  afterEach(() => {
+    vi.mocked(fetchChat).mockResolvedValue(EMPTY_CHAT);
+  });
+
+  it("renders a non-partial incoming reply and clears the pending-send state", async () => {
+    // A final (partial: false) message from the other side must take the
+    // `!lastMessage.partial` branch that resets lastSentAt, unlike a partial
+    // bubble which keeps the fast-poll/typing affordances alive.
+    vi.mocked(fetchChat).mockResolvedValue({
+      ...EMPTY_CHAT,
+      messages: [
+        {
+          ts: "2026-01-01T00:00:00Z",
+          step_id: "s1",
+          from: "ada",
+          to: "pwa-nick",
+          content: FINAL_REPLY_TEXT,
+          reply_to: null,
+          filename: null,
+          source_url: null,
+          partial: false,
+        },
+      ],
+    });
+
+    renderTalkChat();
+
+    expect(await screen.findByText(FINAL_REPLY_TEXT)).toBeTruthy();
+    // No typing dots once the completed reply has arrived.
+    expect(document.querySelectorAll(".typing-dot").length).toBe(0);
   });
 });

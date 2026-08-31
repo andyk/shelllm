@@ -719,7 +719,11 @@ def create_app(
             raise HTTPException(status_code=422, detail="Invalid conversation name")
         status = liveness.identity_status(identity.path, traj_dir / "trajectory.jsonl")
         view = chat.chat_view(
-            trajectory.CACHE.chat_steps(traj_dir), identity.name, tail, with_
+            trajectory.CACHE.chat_steps(traj_dir),
+            identity.name,
+            tail,
+            with_,
+            chat.active_partial_replies(identity.path, identity.name, with_),
         )
         return {
             "identity": {"id": identity.id, "name": identity.name},

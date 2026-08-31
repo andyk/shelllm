@@ -131,6 +131,7 @@ export interface ChatMessage {
   reply_to: string | null;
   filename: string | null;
   source_url: string | null;
+  partial?: boolean;
 }
 
 export interface ChatLog {

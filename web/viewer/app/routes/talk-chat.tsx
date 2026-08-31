@@ -169,6 +169,7 @@ export default function TalkChat() {
   const draftRef = useAutosizeTextarea(draft);
   const lastSentAtRef = useRef<number | null>(null);
   lastSentAtRef.current = lastSentAt;
+  const hasActivePartialRef = useRef(false);
   const awaitingRef = useRef(false);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -187,6 +188,7 @@ export default function TalkChat() {
     queryFn: () => fetchChat(identityId, 200, myName),
     refetchInterval: () => {
       const sent = lastSentAtRef.current;
+      if (hasActivePartialRef.current) return FAST_POLL_MS;
       const awaiting =
         awaitingRef.current && sent && Date.now() - sent < FAST_POLL_WINDOW_MS;
       return awaiting ? FAST_POLL_MS : IDLE_POLL_MS;
@@ -216,10 +218,16 @@ export default function TalkChat() {
   const messages = useMemo(() => chat?.messages ?? [], [chat]);
   const outcomes = chat?.outcomes ?? {};
 
-  // A reply arriving ends the "waiting" state (fast poll + typing dots).
+  const hasActivePartial = messages.some((message) => message.partial);
+  hasActivePartialRef.current = hasActivePartial;
+
+  // A final reply arriving ends the waiting state; an active partial keeps
+  // fast polling so the bubble can keep growing.
   const lastMessage = messages[messages.length - 1];
   useEffect(() => {
-    if (lastMessage && lastMessage.from !== myName) setLastSentAt(null);
+    if (lastMessage && lastMessage.from !== myName && !lastMessage.partial) {
+      setLastSentAt(null);
+    }
   }, [lastMessage, myName]);
 
   // Optimistic bubbles disappear once the server echoes the real message.
@@ -255,7 +263,8 @@ export default function TalkChat() {
   const waitingForReply =
     lastSentAt !== null &&
     lastOutcome === undefined &&
-    (visiblePending.some((p) => !p.failed) ||
+    (hasActivePartial ||
+      visiblePending.some((p) => !p.failed) ||
       (lastMessage ? lastMessage.from === myName : false));
 
   // Dots only when the agent is verifiably on it: dispatcher up AND a
@@ -264,7 +273,11 @@ export default function TalkChat() {
     (t) => t.steps_in_flight > 0 || t.pending.includes("message")
   );
   const showTyping =
-    waitingForReply && dispatcherRunning && thinkerBusy && !typingExpired;
+    waitingForReply &&
+    !hasActivePartial &&
+    dispatcherRunning &&
+    thinkerBusy &&
+    !typingExpired;
   const showDeclinedNote =
     lastSentAt !== null &&
     lastOutcome === "no-reply" &&
@@ -274,7 +287,11 @@ export default function TalkChat() {
     lastOutcome === "failed" &&
     (lastMessage ? lastMessage.from === myName : false);
   const showNoReplyNote =
-    waitingForReply && typingExpired && !showDeclinedNote && !showFailedNote;
+    waitingForReply &&
+    typingExpired &&
+    !hasActivePartial &&
+    !showDeclinedNote &&
+    !showFailedNote;
   awaitingRef.current = waitingForReply;
 
   // Follow new messages only when already reading the latest ones.
