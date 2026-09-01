@@ -156,7 +156,7 @@ Options:
   --provider NAME          Provider: anthropic, openai, gemini, openrouter,
                            opencode, opencode-go, openai-compatible, or
                            adapter (needs LLM_ADAPTER)
-  --thinking [LEVEL]       Enable thinking (Anthropic: adaptive; Gemini: minimal/low/medium/high)
+  --thinking [LEVEL]       Enable thinking (Anthropic: on/off; Gemini: minimal/low/medium/high)
   --effort LEVEL           Thinking effort/provider output effort
   --raw                    Print raw non-streaming API response JSON
   -h, --help               Show this help
@@ -180,12 +180,13 @@ Thinking & effort:
   These flags control how much reasoning the model does before answering.
   Each provider implements this differently:
 
-  Anthropic (--thinking, --effort):
-    --thinking enables extended thinking (chain-of-thought visible on stderr).
-    --effort controls output effort independent of thinking:
-      low, medium, high (default), xhigh, max
-    Both flags can be combined. Without --thinking, the model still reasons
-    internally but doesn't expose it.
+  Anthropic (--thinking):
+    --thinking enables extended thinking (chain-of-thought visible on
+    stderr), budgeted at half of --max-tokens. Without --thinking, the model
+    still reasons internally but doesn't expose it. --effort is not a real
+    Anthropic API field (the API rejects it on every current model) and is
+    always ignored here; LLM_ASSUME_THINKING=1 forces it through anyway if a
+    future model ever supports it.
 
   Gemini (--thinking LEVEL):
     Gemini models think by default. --thinking sets the depth:
@@ -474,6 +475,16 @@ supports_anthropic_thinking() {
     esac
 }
 
+# output_config.effort is not a documented field in Anthropic's public
+# Messages API (verified against the real API on claude-sonnet-4-5, its
+# flagship model: "This model does not support the effort parameter" — the
+# same kind of ported assumption as the old thinking type:"adaptive" below).
+# No known model supports it, so this always returns 1 unless overridden.
+supports_anthropic_effort() {
+    [[ "${LLM_ASSUME_THINKING:-0}" == 1 ]] && return 0
+    return 1
+}
+
 supports_openai_reasoning() {
     [[ "${LLM_ASSUME_THINKING:-0}" == 1 ]] && return 0
     case "$LLM_MODEL" in
@@ -509,14 +520,25 @@ build_payload_anthropic() {
 
     if [[ "$LLM_THINKING" -eq 1 ]]; then
         if supports_anthropic_thinking; then
-            jq_filter="${jq_filter%\}} , thinking:{type:\"adaptive\",display:\"summarized\"}}"
+            # Anthropic requires an explicit budget_tokens with type:"enabled"
+            # (there is no "adaptive" type in the real API); half of
+            # max_tokens, floored at the API minimum of 1024, leaves the
+            # other half for the visible response.
+            local _thinking_budget=$(( LLM_MAX_TOKENS / 2 ))
+            (( _thinking_budget < 1024 )) && _thinking_budget=1024
+            jq_args+=(--argjson thinking_budget "$_thinking_budget")
+            jq_filter="${jq_filter%\}} , thinking:{type:\"enabled\",budget_tokens:\$thinking_budget}}"
         else
             echo "llm: --thinking ignored: $LLM_MODEL not in the known-thinking model list (LLM_ASSUME_THINKING=1 to send anyway)" >&2
         fi
     fi
 
     if [[ -n "$LLM_EFFORT" ]]; then
-        jq_filter="${jq_filter%\}} , output_config:{effort:\"$LLM_EFFORT\"}}"
+        if supports_anthropic_effort; then
+            jq_filter="${jq_filter%\}} , output_config:{effort:\"$LLM_EFFORT\"}}"
+        else
+            echo "llm: --effort ignored: $LLM_MODEL does not support output_config.effort (LLM_ASSUME_THINKING=1 to send anyway)" >&2
+        fi
     fi
 
     printf '%s' "$LLM_MESSAGES" | jq "${jq_args[@]}" "$jq_filter"
