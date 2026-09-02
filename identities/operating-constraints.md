@@ -1,15 +1,13 @@
-# Operating constraints (shipped notes)
+# Operating constraints
 
 Runtime identity goals live in `.identities/<name>/goals.md` and are
-gitignored. This file is the reviewable copy of constraints we want on
-the record in git.
+gitignored. This file is a reviewable record of constraints we want to
+preserve across rebuilds. It does not update runtime identity files.
 
-## GitHub ops
+## GitHub operations
 
-On first failure or surprise (auth, permissions, wrong account, 403):
-stop. One question in the originating thread. No second GitHub attempt.
-Don't retry, switch account, fork around, or "I'll just make it work."
-
-Source: Andy in #headlong-bot, 2026-08 (thread
-`slack-U0614H65RN3-C0BMVH6LM4K-1787508187.726149`). Historical fail:
-kept retrying after the ask.
+On the first GitHub failure or unexpected result, including an
+authentication, permission, wrong account, or 403 error, stop. Ask one
+question in the originating thread. Do not make another GitHub request
+until the user replies. Do not retry, change accounts, use a fork to
+bypass the failure, or use another workaround.
