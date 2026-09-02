@@ -8,3 +8,5 @@ interview.
 Runtime identities (an agent's persona, trajectories, memories, and
 activate script) are data, not code. They live in `.identities/`, which
 is gitignored.
+
+Also: [operating-constraints.md](operating-constraints.md), constraints that should survive a box rebuild.
