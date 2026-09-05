@@ -97,6 +97,7 @@ SHELLM_API_FORMAT="${SHELLM_API_FORMAT:-chat}"
 SHELLM_API_TRANSPORT="${SHELLM_API_TRANSPORT:-https}"
 SHELLM_RESPONSES_BODY_FILE="${SHELLM_RESPONSES_BODY_FILE:-}"
 SHELLM_RESPONSES_BACKGROUND="${SHELLM_RESPONSES_BACKGROUND:-}"
+SHELLM_RESPONSES_COMPACT_THRESHOLD="${SHELLM_RESPONSES_COMPACT_THRESHOLD:-}"
 # The provider this run inherited, kept because the websocket transport
 # overwrites LLM_PROVIDER for llm calls and the Docker sandbox must still be
 # told the original: the host broker's socket does not exist in a container.
@@ -198,6 +199,10 @@ case "$SHELLM_RESPONSES_BACKGROUND" in
     ""|0|1) ;;
     *) die "Invalid SHELLM_RESPONSES_BACKGROUND: $SHELLM_RESPONSES_BACKGROUND (expected 0 or 1)" ;;
 esac
+if [[ -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ]]; then
+    [[ "$SHELLM_RESPONSES_COMPACT_THRESHOLD" =~ ^[1-9][0-9]*$ ]] \
+        || die "Invalid SHELLM_RESPONSES_COMPACT_THRESHOLD: $SHELLM_RESPONSES_COMPACT_THRESHOLD (expected a positive integer)"
+fi
 
 # A local model bound to the Docker host is usually configured as localhost
 # for thinkers and other llm calls that run on that host. Code executed in a
@@ -375,6 +380,13 @@ Environment:
                           1 runs each Responses create in the background
                           (llm polls or resumes the stream, and cancels the
                           job if killed); 0 forces foreground
+  SHELLM_RESPONSES_COMPACT_THRESHOLD
+                          Input-token count at which the Responses window is
+                          compacted. Stateful runs pass it to llm and the
+                          server compacts inside the turn; replay runs
+                          (OpenRouter, ZDR, after a continuation fallback)
+                          call the compact endpoint and swap the chain for
+                          the window it returns
   SHELLM_EMPTY_RESPONSE_RETRIES
                           Empty-response retries before the run dies
                           (default 8; set empty for unlimited)
@@ -1599,6 +1611,65 @@ execute_code() {
 # LLM API call (delegates to the `llm` tool)
 # ---------------------------------------------------------------------------
 
+# Compaction upkeep for the process-local replay chain, run once per terminal
+# response. Two independent things happen here. A server that compacted inside
+# the turn returns a compaction item in the output, and the API says that item
+# is where the next window starts, so everything before it is dropped. Then, in
+# replay mode only, nobody is compacting on our behalf: once the reported input
+# tokens reach SHELLM_RESPONSES_COMPACT_THRESHOLD we call the compact endpoint
+# and swap the chain for the window it hands back, which must be sent as is.
+# A failed compact call is not fatal. The chain is still correct, only longer,
+# and the next crossing tries again.
+compact_replay_chain() {
+    local replay_file="$1" response_file="$2" replay_mode="$3"
+    local replay_dir chain_tmp
+    [[ -n "$replay_file" && -s "$replay_file" && -s "$response_file" ]] || return 0
+    replay_dir=$(dirname "$replay_file")
+
+    if jq -e 'any(.output[]?; .type == "compaction")' "$response_file" >/dev/null 2>&1; then
+        chain_tmp=$(mktemp "$replay_dir/.responses-replay.XXXXXX") || return 0
+        chmod 600 "$chain_tmp"
+        if jq '(map(.type? == "compaction") | index(true)) as $at
+               | if $at == null then . else .[$at:] end' \
+                "$replay_file" > "$chain_tmp" 2>/dev/null; then
+            mv -f "$chain_tmp" "$replay_file"
+        else
+            rm -f "$chain_tmp"
+        fi
+    fi
+
+    [[ "$replay_mode" -eq 1 && -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ]] || return 0
+    local input_tokens
+    input_tokens=$(jq -r '.usage.input_tokens // empty' "$response_file" 2>/dev/null || true)
+    [[ "$input_tokens" =~ ^[0-9]+$ ]] || return 0
+    [[ "$input_tokens" -ge "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ]] || return 0
+
+    progress "compacting the Responses replay chain at $input_tokens input tokens"
+    local compact_out compact_err
+    compact_out=$(mktemp) || return 0
+    compact_err=$(mktemp) || { rm -f "$compact_out"; return 0; }
+    if ! responses compact --model "$SHELLM_MODEL" --input-file "$replay_file" \
+            > "$compact_out" 2> "$compact_err"; then
+        echo "shellm: warning: compaction failed, keeping the replay chain: $(tail -c 300 "$compact_err")" >&2
+        rm -f "$compact_out" "$compact_err"
+        return 0
+    fi
+    if ! jq -e '.output | type == "array" and length > 0' "$compact_out" >/dev/null 2>&1; then
+        echo "shellm: warning: compaction failed, the compact reply carried no window" >&2
+        rm -f "$compact_out" "$compact_err"
+        return 0
+    fi
+    chain_tmp=$(mktemp "$replay_dir/.responses-replay.XXXXXX") || {
+        rm -f "$compact_out" "$compact_err"; return 0; }
+    chmod 600 "$chain_tmp"
+    if jq '.output' "$compact_out" > "$chain_tmp" 2>/dev/null; then
+        mv -f "$chain_tmp" "$replay_file"
+    else
+        rm -f "$chain_tmp"
+    fi
+    rm -f "$compact_out" "$compact_err"
+}
+
 call_llm() {
     local system_prompt="$1"
     local full_messages_json="$2"
@@ -1615,6 +1686,10 @@ call_llm() {
     local new_messages_json="$full_messages_json"
     local previous_response_id=""
     local fallback_used=0
+    # Set once the run is replaying the chain itself rather than continuing by
+    # response id. Compaction splits on it: the server can only compact what it
+    # holds, so a replaying run has to call the compact endpoint on its own.
+    local replay_mode=0
 
     export LLM_API_FORMAT="$api_format"
     if [[ "$api_format" == "responses" ]]; then
@@ -1678,6 +1753,7 @@ call_llm() {
         new_messages_json=$(printf '%s' "$new_messages_json" | jq -c 'map(del(.step_ids))')
         request_messages_json="$full_messages_json"
         if [[ "$stateless" == "1" || ( -n "$disabled_file" && -e "$disabled_file" ) ]]; then
+            replay_mode=1
             if [[ "$replay_has_history" -eq 1 ]]; then
                 request_messages_json=$(printf '%s' "$new_messages_json" \
                     | jq --slurpfile history "$replay_file" '($history[0] // []) + .')
@@ -1689,7 +1765,7 @@ call_llm() {
         fi
     else
         unset LLM_RESPONSE_FILE LLM_RESPONSES_BODY_FILE LLM_PREVIOUS_RESPONSE_ID \
-            LLM_RESPONSES_BACKGROUND 2>/dev/null || true
+            LLM_RESPONSES_BACKGROUND LLM_RESPONSES_COMPACT_THRESHOLD 2>/dev/null || true
     fi
 
     while true; do
@@ -1715,6 +1791,14 @@ call_llm() {
                 export LLM_PREVIOUS_RESPONSE_ID="$previous_response_id"
             else
                 unset LLM_PREVIOUS_RESPONSE_ID 2>/dev/null || true
+            fi
+            # Server-side compaction only makes sense while the server holds
+            # the window. A replaying run keeps its own chain, so it asks for
+            # nothing here and compacts after the turn instead.
+            if [[ "$replay_mode" -eq 0 && -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ]]; then
+                export LLM_RESPONSES_COMPACT_THRESHOLD="$SHELLM_RESPONSES_COMPACT_THRESHOLD"
+            else
+                unset LLM_RESPONSES_COMPACT_THRESHOLD 2>/dev/null || true
             fi
             [[ -z "$response_file" ]] || rm -f "$response_file"
         fi
@@ -1768,6 +1852,7 @@ call_llm() {
                         "$replay_file" "$turn_tmp" "$response_file" > "$replay_tmp"
                     mv -f "$replay_tmp" "$replay_file"
                     rm -f "$turn_tmp"
+                    compact_replay_chain "$replay_file" "$response_file" "$replay_mode"
                 fi
                 if [[ -n "$context_file" && "$messages_are_delta" != "1" ]]; then
                     local context_dir context_tmp
@@ -1844,6 +1929,7 @@ call_llm() {
                 request_messages_json="$full_messages_json"
             fi
             fallback_used=1
+            replay_mode=1
             rm -f "$text_file" "$stderr_file" "$messages_file"
             [[ -z "$thinking_output_file" ]] || : > "$thinking_output_file"
             progress "responses continuation rejected; retrying once with exact replay context"

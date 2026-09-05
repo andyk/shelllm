@@ -512,5 +512,66 @@ else
 fi
 chmod 700 "$WORK/locked"
 
+# Compaction. LLM_RESPONSES_COMPACT_THRESHOLD owns context_management when it
+# is set; otherwise whatever the body file says stands.
+reset
+export CURL_MODE=buffered-completed
+LLM_RESPONSES_COMPACT_THRESHOLD=200000 \
+    run_openai --no-stream "compact me" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 ]] && jq -e '
+    (.context_management | length) == 1 and
+    .context_management[0].type == "compaction" and
+    .context_management[0].compact_threshold == 200000
+' "$CURL_PAYLOAD" >/dev/null; then
+    ok "LLM_RESPONSES_COMPACT_THRESHOLD adds a compaction context_management entry"
+else
+    bad "LLM_RESPONSES_COMPACT_THRESHOLD adds a compaction context_management entry" "rc=$rc payload=$(jq -c .context_management "$CURL_PAYLOAD" 2>/dev/null)"
+fi
+
+reset
+cat > "$WORK/compact-body.json" <<'JSON'
+{"context_management":[{"type":"compaction","compact_threshold":50000}]}
+JSON
+LLM_RESPONSES_BODY_FILE="$WORK/compact-body.json" \
+    run_openai --no-stream "body owns it" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 ]] \
+   && jq -e '.context_management[0].compact_threshold == 50000' "$CURL_PAYLOAD" >/dev/null; then
+    ok "a body-file context_management survives an unset compaction threshold"
+else
+    bad "a body-file context_management survives an unset compaction threshold" "rc=$rc payload=$(jq -c .context_management "$CURL_PAYLOAD" 2>/dev/null)"
+fi
+
+reset
+LLM_RESPONSES_BODY_FILE="$WORK/compact-body.json" LLM_RESPONSES_COMPACT_THRESHOLD=9000 \
+    run_openai --no-stream "env wins" >"$WORK/stdout" 2>"$WORK/stderr"
+if jq -e '(.context_management | length) == 1 and .context_management[0].compact_threshold == 9000' \
+        "$CURL_PAYLOAD" >/dev/null; then
+    ok "an explicit compaction threshold overrides the body file"
+else
+    bad "an explicit compaction threshold overrides the body file" "payload=$(jq -c .context_management "$CURL_PAYLOAD" 2>/dev/null)"
+fi
+
+reset
+LLM_RESPONSES_COMPACT_THRESHOLD=0 \
+    run_openai --no-stream "bad threshold" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && ! -e "$CURL_CALLS" ]] \
+   && grep -q 'Invalid LLM_RESPONSES_COMPACT_THRESHOLD' "$WORK/stderr"; then
+    ok "a non-positive compaction threshold fails before any request"
+else
+    bad "a non-positive compaction threshold fails before any request" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+reset
+LLM_RESPONSES_COMPACT_THRESHOLD=200000 LLM_API_FORMAT=chat \
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "chat" >"$WORK/stdout" 2>"$WORK/stderr"
+if grep -q 'LLM_RESPONSES_COMPACT_THRESHOLD ignored' "$WORK/stderr"; then
+    ok "a compaction threshold under chat format says it is ignored"
+else
+    bad "a compaction threshold under chat format says it is ignored" "stderr=$(cat "$WORK/stderr")"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

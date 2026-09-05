@@ -393,6 +393,17 @@ once with that chain and stays stateless for the rest of the run. OpenRouter's
 documented stateless Responses endpoint uses exact replay from the first turn.
 Remote response IDs and replay items are removed when the shellm process exits.
 
+`SHELLM_RESPONSES_COMPACT_THRESHOLD=N` bounds how large that window gets. On a
+stateful run the number rides through to `llm` as the Responses
+`context_management` field and the server compacts inside the turn. On a
+replaying run (OpenRouter, a ZDR endpoint, or after a continuation fallback)
+nobody is compacting on shellm's behalf, so once a terminal response reports at
+least N input tokens shellm calls `responses compact` itself and swaps the
+replay chain for the window that comes back. Either way, a compaction item in a
+terminal output cuts the chain back to that item, which is where the API says
+the next window begins. A failed compact call is a warning, not an error: the
+chain stands and the next crossing tries again.
+
 ### WebSocket mode
 
 Responses also has a WebSocket transport, where one connection carries every
