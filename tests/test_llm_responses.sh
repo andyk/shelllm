@@ -415,14 +415,59 @@ else
     bad "background:true in the body file rides the create (tests/test_llm_responses_background.sh has the lifecycle)" "rc=$rc payload=$(jq -c . "$CURL_PAYLOAD" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
 fi
 
+# A Conversation is the other way to carry state: on its own it rides the
+# create, and the two ways are refused together.
+reset
+export CURL_MODE=buffered-completed
 printf '{"conversation":"conv_123"}' > "$WORK/body.json"
 LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
-    "$LLM" --provider openai -m gpt-5.4-mini "no" >"$WORK/stdout" 2>"$WORK/stderr"
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "yes" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
 rc=$?
-if [[ "$rc" -ne 0 ]] && grep -q 'conversation state cannot be combined' "$WORK/stderr"; then
-    ok "conversation state is rejected before continuation can conflict"
+if [[ "$rc" -eq 0 ]] \
+    && jq -e '.conversation == "conv_123" and (has("previous_response_id") | not)' \
+        "$CURL_PAYLOAD" >/dev/null; then
+    ok "a body-file conversation rides the create on its own"
 else
-    bad "conversation state is rejected before continuation can conflict" "rc=$rc stderr=$(cat "$WORK/stderr")"
+    bad "a body-file conversation rides the create on its own" "rc=$rc payload=$(jq -c . "$CURL_PAYLOAD" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+reset
+LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
+LLM_RESPONSES_CONVERSATION="conv_env" \
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "yes" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 ]] && jq -e '.conversation == "conv_env"' "$CURL_PAYLOAD" >/dev/null; then
+    ok "LLM_RESPONSES_CONVERSATION owns the body file's conversation"
+else
+    bad "LLM_RESPONSES_CONVERSATION owns the body file's conversation" "rc=$rc payload=$(jq -c . "$CURL_PAYLOAD" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+reset
+LLM_API_FORMAT=responses LLM_RESPONSES_CONVERSATION="conv_env" \
+LLM_PREVIOUS_RESPONSE_ID="resp_previous" \
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "no" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && ! -s "$CURL_CALLS" ]] \
+    && grep -q 'conversation and previous_response_id cannot both be set' "$WORK/stderr"; then
+    ok "conversation and previous_response_id are refused as a pair before curl"
+else
+    bad "conversation and previous_response_id are refused as a pair before curl" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+reset
+LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
+LLM_PREVIOUS_RESPONSE_ID="resp_previous" \
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "no" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && ! -s "$CURL_CALLS" ]] \
+    && grep -q 'conversation and previous_response_id cannot both be set' "$WORK/stderr"; then
+    ok "a body-file conversation conflicts with LLM_PREVIOUS_RESPONSE_ID too"
+else
+    bad "a body-file conversation conflicts with LLM_PREVIOUS_RESPONSE_ID too" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
 fi
 
 # OpenRouter has its own Responses endpoint but remains a separate stateless
