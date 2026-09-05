@@ -139,6 +139,14 @@ compacted window and later requests begin with the compaction item; llm adds
 
 ## WebSocket mode
 
+Status: implemented. Two notes where the build differs from the sketch below.
+The guide describes the mode against `/v1/responses` without spelling the
+scheme out, so the endpoint is `RESPONSES_WS_URL` with
+`wss://api.openai.com/v1/responses` as its default rather than a constant. And
+`store` is not a field the adapter owns: it passes through from
+`LLM_RESPONSES_BODY_FILE` untouched, exactly as it does on the HTTPS path, so
+the same body file produces the same request on either transport.
+
 An adapter, not core: `tools/responses-ws`, a Python script (`uv run`, PEP 723
 metadata, `websockets`), following the adapter contract in
 design/providers.md plus the Responses environment (`LLM_RESPONSE_FILE`,

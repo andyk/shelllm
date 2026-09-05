@@ -318,8 +318,9 @@ function-output items in `--messages-file` pass through unchanged.
 Visible output text remains stdout; reasoning summaries go to stderr. The
 mode-0600 `LLM_RESPONSE_FILE` sidecar is the machine channel for the complete
 terminal Response or error envelope, including function-only results. Retrieval,
-cancellation, deletion, Conversations, background mode, and WebSocket sessions
-are lifecycle APIs and are not completion operations in this CLI.
+cancellation, deletion, Conversations, and background mode are lifecycle APIs
+and are not completion operations in this CLI. WebSocket mode is a transport for
+the same completion, and rides the adapter seam described below.
 
 Set `LLM_API_KEY` if the endpoint wants a bearer token. The policy for
 which providers live in core is in
@@ -351,6 +352,59 @@ process-local replay chain. If an endpoint rejects continuation, shellm retries
 once with that chain and stays stateless for the rest of the run. OpenRouter's
 documented stateless Responses endpoint uses exact replay from the first turn.
 Remote response IDs and replay items are removed when the shellm process exits.
+
+### WebSocket mode
+
+Responses also has a WebSocket transport, where one connection carries every
+turn of a run instead of a fresh handshake per turn. It pays off for long,
+tool-heavy rollouts. Turn it on with `SHELLM_API_TRANSPORT=websocket`, which
+requires `SHELLM_API_FORMAT=responses`:
+
+```bash
+SHELLM_API_FORMAT=responses \
+SHELLM_API_TRANSPORT=websocket \
+SHELLM_MODEL=gpt-5.5 \
+shellm "audit this repo"
+```
+
+shellm starts `tools/responses-ws` as a broker at run start, with its unix
+socket inside the run's private directory, and stops it at cleanup. The broker
+holds the connection, reconnects when the server closes it (connections last up
+to 60 minutes), and multiplexes callers onto `stream_id` lanes within the
+documented limits of 16 in flight and 32 named lanes. `llm` reaches it through
+the adapter seam (`LLM_PROVIDER=adapter`), so nothing in the completion path
+gains a Python dependency.
+
+`tools/responses-ws` is a `uv` PEP 723 script whose only dependency is
+`websockets`; a machine without `uv` loses this transport and nothing else. It
+can also be used on its own:
+
+```bash
+# One-shot: no broker, one connection for one completion.
+LLM_API_FORMAT=responses LLM_PROVIDER=adapter \
+LLM_ADAPTER=$PWD/tools/responses-ws \
+LLM_RESPONSE_FILE=/tmp/response.json \
+llm -m gpt-5.5 "hello"
+
+# A broker several callers share, stopped by hand.
+tools/responses-ws serve --socket /tmp/ws.sock --idle 10 &
+RESPONSES_WS_SOCKET=/tmp/ws.sock LLM_PROVIDER=adapter ... llm -m gpt-5.5 "hello"
+tools/responses-ws stop --socket /tmp/ws.sock
+```
+
+| Variable | Meaning |
+|---|---|
+| `RESPONSES_WS_URL` | Endpoint, default `wss://api.openai.com/v1/responses` |
+| `RESPONSES_WS_SOCKET` | Broker socket; without a live one the adapter opens a one-shot connection |
+| `RESPONSES_WS_IDLE` | Broker idle minutes before it exits (default 10, `--idle` overrides) |
+
+The transport does not change any contract: text still streams to stdout,
+reasoning summaries to stderr, and the terminal object to `LLM_RESPONSE_FILE`.
+Continuation still rides `previous_response_id`, and a rejection still lands in
+the sidecar so shellm falls back to its replay chain. Nothing WebSocket-specific
+is forwarded into the Docker sandbox, because a container cannot reach a socket
+on the host: nested `llm` and `shellm` calls inside the sandbox take the
+ordinary HTTPS Responses path.
 
 A provider that can't speak this protocol (an SDK, a vendor CLI,
 signed requests) runs outside core as an adapter: set

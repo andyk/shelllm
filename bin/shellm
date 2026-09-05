@@ -94,7 +94,12 @@ fi
 unset _shellm_process_shellm_api_url_set _shellm_process_shellm_api_url \
     _shellm_process_llm_api_url_set _shellm_process_llm_api_url 2>/dev/null || true
 SHELLM_API_FORMAT="${SHELLM_API_FORMAT:-chat}"
+SHELLM_API_TRANSPORT="${SHELLM_API_TRANSPORT:-https}"
 SHELLM_RESPONSES_BODY_FILE="${SHELLM_RESPONSES_BODY_FILE:-}"
+# The provider this run inherited, kept because the websocket transport
+# overwrites LLM_PROVIDER for llm calls and the Docker sandbox must still be
+# told the original: the host broker's socket does not exist in a container.
+_SHELLM_HOST_PROVIDER="${LLM_PROVIDER:-}"
 # Clear any inherited LLM_API_URL so llm uses per-provider defaults
 unset LLM_API_URL 2>/dev/null || true
 if [[ -n "$SHELLM_API_URL" ]]; then
@@ -170,6 +175,18 @@ die() { echo "shellm: error: $*" >&2; exit 1; }
 case "$SHELLM_API_FORMAT" in
     chat|responses) ;;
     *) die "Invalid SHELLM_API_FORMAT: $SHELLM_API_FORMAT (expected chat or responses)" ;;
+esac
+case "$SHELLM_API_TRANSPORT" in
+    https) ;;
+    websocket)
+        # WebSocket mode is a Responses transport and nothing else: the
+        # protocol on the wire is response.create and Responses events, so
+        # asking for it under Chat Completions is a configuration mistake
+        # rather than something to silently downgrade.
+        [[ "$SHELLM_API_FORMAT" == "responses" ]] \
+            || die "SHELLM_API_TRANSPORT=websocket needs SHELLM_API_FORMAT=responses"
+        ;;
+    *) die "Invalid SHELLM_API_TRANSPORT: $SHELLM_API_TRANSPORT (expected https or websocket)" ;;
 esac
 if [[ -n "$SHELLM_RESPONSES_BODY_FILE" ]]; then
     [[ -f "$SHELLM_RESPONSES_BODY_FILE" ]] \
@@ -343,6 +360,9 @@ Environment:
                           Responses persists and reuses previous_response_id
                           within a run, with one full-context fallback when a
                           provider rejects continuation
+  SHELLM_API_TRANSPORT    How Responses calls travel: https (default) or
+                          websocket, which holds one connection open for the
+                          whole run through tools/responses-ws
   SHELLM_RESPONSES_BODY_FILE
                           Optional Responses create-body JSON object passed to
                           llm (tools, include, store, text format, etc.)
@@ -2649,6 +2669,35 @@ run_loop() {
         fi
     fi
 
+    # WebSocket transport: one connection for the whole run instead of one
+    # handshake per turn. The broker holds it and hands out stream_id lanes;
+    # llm reaches it through the adapter seam, so nothing in the completion
+    # path grows a Python dependency. The socket lives in rundir, which is
+    # already a private 0700 directory that disappears at cleanup.
+    if [[ "$SHELLM_API_TRANSPORT" == "websocket" ]]; then
+        local _ws_tool
+        _ws_tool=$(resolve_shellm_tool_path "$(realpath "$0")" "responses-ws" || true)
+        [[ -n "$_ws_tool" ]] \
+            || die "SHELLM_API_TRANSPORT=websocket needs tools/responses-ws, which was not found next to bin/shellm"
+        _SHELLM_WS_SOCKET="$rundir/.responses-ws.sock"
+        _SHELLM_WS_TOOL="$_ws_tool"
+        "$_ws_tool" serve --socket "$_SHELLM_WS_SOCKET" \
+            > "$rundir/.responses-ws.log" 2>&1 &
+        _SHELLM_WS_PID=$!
+        local _ws_wait=0
+        while [[ ! -e "$_SHELLM_WS_SOCKET" && "$_ws_wait" -lt 60 ]]; do
+            sleep 0.5
+            _ws_wait=$((_ws_wait + 1))
+        done
+        if [[ ! -e "$_SHELLM_WS_SOCKET" ]]; then
+            kill "$_SHELLM_WS_PID" 2>/dev/null || true
+            die "responses-ws broker did not open $_SHELLM_WS_SOCKET: $(tail -1 "$rundir/.responses-ws.log" 2>/dev/null)"
+        fi
+        export LLM_PROVIDER=adapter
+        export LLM_ADAPTER="$_ws_tool"
+        export RESPONSES_WS_SOCKET="$_SHELLM_WS_SOCKET"
+    fi
+
     # Launcher opt-in: report this run's header step_id to the given file so
     # the caller can pair its own steps with this exact run — the trajectory
     # alone can't tell whose header is whose when concurrent runs interleave.
@@ -2686,6 +2735,21 @@ run_loop() {
     _cleanup_ctx_pid="${_ctx_summary_pid:-}"
     cleanup() {
         stop_activity_beacon
+        # Stop the WebSocket broker before rundir goes, so it can unlink its
+        # own socket and close the upstream connection rather than being
+        # killed with a response still in flight.
+        if [[ -n "${_SHELLM_WS_SOCKET:-}" ]]; then
+            [[ -n "${_SHELLM_WS_TOOL:-}" ]] \
+                && "$_SHELLM_WS_TOOL" stop --socket "$_SHELLM_WS_SOCKET" >/dev/null 2>&1
+            if [[ -n "${_SHELLM_WS_PID:-}" ]]; then
+                local _ws_grace=0
+                while kill -0 "$_SHELLM_WS_PID" 2>/dev/null && [[ "$_ws_grace" -lt 5 ]]; do
+                    sleep 1
+                    _ws_grace=$((_ws_grace + 1))
+                done
+                kill "$_SHELLM_WS_PID" 2>/dev/null || true
+            fi
+        fi
         # Give run-summary background process time to finish
         if [[ -n "$_cleanup_ctx_pid" ]] && kill -0 "$_cleanup_ctx_pid" 2>/dev/null; then
             local _ctx_wait=0
@@ -2942,7 +3006,11 @@ exit \$__shellm_rc
             # The generic openai-compatible provider is configured entirely by
             # env (never auto-detected), so llm calls inside generated code
             # need these two like they need the vendor keys above/below.
-            LLM_PROVIDER="${LLM_PROVIDER:-}"
+            # The run's own provider, not the websocket override: the broker's
+            # unix socket is on the host and a nested llm inside the sandbox
+            # cannot reach it, so sandboxed calls take the ordinary HTTPS
+            # Responses path.
+            LLM_PROVIDER="$_SHELLM_HOST_PROVIDER"
             LLM_API_KEY="${LLM_API_KEY:-}"
             SHELLM_MODEL="$SHELLM_MODEL"
             SHELLM_MAX_TOKENS="$SHELLM_MAX_TOKENS"

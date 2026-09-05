@@ -14,6 +14,11 @@ tools live in [bin/](../bin/).
 - `headlong-skills` is the skills package manager (search, install, check,
   init, promote, kernel, remotes). The mind's own `skills` only lists,
   shows, and renders skills, and forwards those subcommands here.
+- `responses-ws` is the WebSocket transport for the OpenAI Responses API: a
+  `bin/llm` adapter, and a broker that holds one connection across a whole
+  shellm run. It is a `uv` script, which is exactly why it lives out here and
+  not in `bin/`. See the WebSocket mode section of
+  [docs/shellm.md](../docs/shellm.md).
 - `shellm-explore` visualizes run trees, `pr-committee` runs multi-model
   PR reviews, and `headlong-killall` stops every Headlong-related process.
 
