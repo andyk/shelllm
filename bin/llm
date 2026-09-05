@@ -497,7 +497,12 @@ case "$LLM_API_FORMAT" in
     responses)
         case "$LLM_PROVIDER" in
             openai|openrouter|openai-compatible) ;;
-            *) die "Responses format is not supported for provider $LLM_PROVIDER (use openai, openrouter, or openai-compatible)" ;;
+            # An adapter speaks whatever its own transport speaks, so llm only
+            # tells it which protocol the stdin payload is (--api-format below)
+            # and hands over the Responses environment. tools/responses-ws is
+            # the adapter this exists for; see design/responses-lifecycle.md.
+            adapter) ;;
+            *) die "Responses format is not supported for provider $LLM_PROVIDER (use openai, openrouter, openai-compatible, or adapter)" ;;
         esac
         if [[ -n "$LLM_RESPONSES_BODY_FILE" ]]; then
             [[ -f "$LLM_RESPONSES_BODY_FILE" ]] \
@@ -1608,6 +1613,10 @@ if [[ "$LLM_PROVIDER" == "adapter" ]]; then
         [[ -n "$LLM_THINKING_LEVEL" ]] && _adapter_args+=("$LLM_THINKING_LEVEL")
     fi
     [[ "$LLM_STREAM" -eq 0 ]] && _adapter_args+=(--no-stream)
+    # Chat adapters predate this flag and must not see it, so it is added only
+    # in Responses mode, where stdin is typed input items rather than a chat
+    # messages array and the adapter owes the caller a terminal sidecar.
+    [[ "$LLM_API_FORMAT" == responses ]] && _adapter_args+=(--api-format responses)
     # Private 0700 sidecar directory for the system prompt and the deadline
     # marker files. Derived names next to a visible /tmp file would be
     # symlink-attackable by other local users; mktemp -d gives an
@@ -1623,6 +1632,14 @@ if [[ "$LLM_PROVIDER" == "adapter" ]]; then
     # kill it). The payload tempfile and its cleanup are reused.
     printf '%s' "$LLM_MESSAGES" > "$payload_file"
     export LLM_USAGE_FILE
+    # In Responses mode the adapter owns the whole protocol, so it needs the
+    # same three inputs the curl path reads. Exporting them here means an
+    # operator can set them without knowing whether the value has to be
+    # exported to reach a child process.
+    if [[ "$LLM_API_FORMAT" == responses ]]; then
+        export LLM_API_FORMAT LLM_RESPONSE_FILE LLM_PREVIOUS_RESPONSE_ID \
+            LLM_RESPONSES_BODY_FILE
+    fi
     _adapter_rc=0
     if [[ "$LLM_MAX_TIME" =~ ^[0-9]+$ && "$LLM_MAX_TIME" -gt 0 ]]; then
         # The adapter runs in its own process group (set -m) so the
