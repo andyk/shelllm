@@ -38,6 +38,7 @@ printf '%s\n' "$n" > "$LLM_STUB_DIR/calls"
 printf '%s\n' "${LLM_API_FORMAT:-}" > "$LLM_STUB_DIR/format-$n"
 printf '%s\n' "${LLM_PREVIOUS_RESPONSE_ID:-}" > "$LLM_STUB_DIR/previous-$n"
 printf '%s\n' "${LLM_RESPONSES_BACKGROUND-unset}" > "$LLM_STUB_DIR/background-$n"
+printf '%s\n' "${LLM_RESPONSES_COMPACT_THRESHOLD-unset}" > "$LLM_STUB_DIR/threshold-$n"
 printf '%s\n' "${LLM_RESPONSE_FILE:-}" > "$LLM_STUB_DIR/response-file-$n"
 [[ -n "$messages_file" ]] && cp "$messages_file" "$LLM_STUB_DIR/messages-$n.json"
 if [[ -n "${LLM_RESPONSE_FILE:-}" ]]; then
@@ -67,7 +68,57 @@ write_response() {
     }' > "$LLM_RESPONSE_FILE" )
 }
 
+# Same terminal object plus a usage block, so the caller can drive shellm's
+# compaction threshold from the reported input tokens.
+write_response_usage() {
+    local id="$1" input_tokens="$2"
+    [[ -n "${LLM_RESPONSE_FILE:-}" ]] || return 0
+    ( umask 077; jq -nc --arg id "$id" --argjson in_tok "$input_tokens" '{
+        id: $id,
+        object: "response",
+        status: "completed",
+        output: [
+            {id:("rs_" + $id), type:"reasoning", summary:[], encrypted_content:("enc_" + $id)},
+            {id:("msg_" + $id), type:"message", role:"assistant", status:"completed", phase:"final_answer", content:[{type:"output_text", text:("text_" + $id)}]}
+        ],
+        usage: {input_tokens: $in_tok, output_tokens: 4}
+    }' > "$LLM_RESPONSE_FILE" )
+}
+
+# A turn the server compacted for us: the terminal output carries a compaction
+# item, and everything before it is no longer part of the next window.
+write_response_server_compacted() {
+    local id="$1"
+    [[ -n "${LLM_RESPONSE_FILE:-}" ]] || return 0
+    ( umask 077; jq -nc --arg id "$id" '{
+        id: $id,
+        object: "response",
+        status: "completed",
+        output: [
+            {id:("rs_" + $id), type:"reasoning", summary:[], encrypted_content:("enc_" + $id)},
+            {id:"cmp_server", type:"compaction", encrypted_content:"enc_server_compaction"},
+            {id:("msg_" + $id), type:"message", role:"assistant", status:"completed", phase:"final_answer", content:[{type:"output_text", text:("text_" + $id)}]}
+        ]
+    }' > "$LLM_RESPONSE_FILE" )
+}
+
 case "$LLM_STUB_MODE:$n" in
+    compact:1|compactfail:1|stateful-compact:1)
+        write_response_usage resp_1 9000
+        printf '%s\n' '```bash' 'printf "first output\n"' '```'
+        ;;
+    compact:2|compactfail:2|stateful-compact:2)
+        write_response_usage resp_2 10
+        printf '%s\n' '```bash' 'FINAL=done-after-compaction' '```'
+        ;;
+    server-compaction:1)
+        write_response_server_compacted resp_1
+        printf '%s\n' '```bash' 'printf "first output\n"' '```'
+        ;;
+    server-compaction:2)
+        write_response resp_2
+        printf '%s\n' '```bash' 'FINAL=done-after-server-compaction' '```'
+        ;;
     continue:1|fallback:1|stateless:1)
         write_response resp_1
         printf '%s\n' '```bash' 'printf "first output\n"' '```'
@@ -145,6 +196,38 @@ esac
 STUB
 chmod +x "$WORK/toolbin/llm"
 
+# The compaction endpoint, stubbed. It records the window it was handed and
+# answers with the canonical next window: one compaction item, nothing else.
+cat > "$WORK/toolbin/responses" <<'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == compact ]] || { echo "unexpected responses command ${1:-}" >&2; exit 2; }
+n=0
+[[ -f "$LLM_STUB_DIR/compact-calls" ]] && read -r n < "$LLM_STUB_DIR/compact-calls"
+n=$((n + 1))
+printf '%s\n' "$n" > "$LLM_STUB_DIR/compact-calls"
+model=""
+input_file=""
+prev=""
+for arg in "$@"; do
+    [[ "$prev" == --model ]] && model="$arg"
+    [[ "$prev" == --input-file ]] && input_file="$arg"
+    prev="$arg"
+done
+printf '%s\n' "$model" > "$LLM_STUB_DIR/compact-model-$n"
+[[ -n "$input_file" ]] && cp "$input_file" "$LLM_STUB_DIR/compact-input-$n.json"
+if [[ "$LLM_STUB_MODE" == compactfail ]]; then
+    echo "responses: error: compaction is unavailable" >&2
+    exit 1
+fi
+jq -nc '{
+    id: "resp_compacted",
+    object: "response",
+    status: "completed",
+    output: [{id: "cmp_1", type: "compaction", encrypted_content: "enc_compacted"}]
+}'
+STUB
+chmod +x "$WORK/toolbin/responses"
+
 export PATH="$WORK/toolbin:$PATH"
 export HOME="$WORK/home"
 export HEADLONG_HOME="$WORK/home/.headlong"
@@ -165,6 +248,7 @@ run_shellm() {
 }
 
 main_calls() { cat "$WORK/stub/calls" 2>/dev/null || echo 0; }
+compact_calls() { cat "$WORK/stub/compact-calls" 2>/dev/null || echo 0; }
 
 # A successful terminal response becomes the next request's continuation ID;
 # only the messages after the last assistant turn are sent as new input.
@@ -396,6 +480,108 @@ if [[ "$rc" -eq 0 && "$(cat "$WORK/stub/format-1")" == chat \
     ok "default chat mode remains stateless"
 else
     bad "default chat mode remains stateless" "rc=$rc format=$(cat "$WORK/stub/format-1")"
+fi
+
+# Compaction in replay mode. Once a terminal response reports input tokens at
+# or above the threshold, shellm compacts the chain itself and the next request
+# opens with the window the compact endpoint returned, nothing before it.
+SHELLM_RESPONSES_COMPACT_THRESHOLD=1000 \
+    run_shellm compact responses openrouter openai/o4-mini
+rc=$?
+if [[ "$rc" -eq 0 && "$(main_calls)" -eq 2 && "$(compact_calls)" -eq 1 \
+      && "$(cat "$WORK/stub/compact-model-1")" == openai/o4-mini ]]; then
+    ok "a crossed compaction threshold compacts the replay chain once"
+else
+    bad "a crossed compaction threshold compacts the replay chain once" "rc=$rc calls=$(main_calls) compacts=$(compact_calls) model=$(cat "$WORK/stub/compact-model-1" 2>/dev/null) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
+fi
+
+if jq -e '
+    .[0].type == "compaction" and .[0].encrypted_content == "enc_compacted" and
+    all(.[]; .encrypted_content != "enc_resp_1") and
+    any(.[]; .role == "user" and (.content | contains("first output")))
+' "$WORK/stub/messages-2.json" >/dev/null 2>&1; then
+    ok "the compacted window replaces the chain and opens the next request"
+else
+    bad "the compacted window replaces the chain and opens the next request" "$(jq -c 'map(if .content? then (.content |= (. | tostring)[0:40]) else . end)' "$WORK/stub/messages-2.json" 2>/dev/null)"
+fi
+
+if jq -e '
+    any(.[]; .encrypted_content == "enc_resp_1") and
+    any(.[]; .role == "user" and (.content | contains("do the task")))
+' "$WORK/stub/compact-input-1.json" >/dev/null 2>&1; then
+    ok "the compact call is handed the whole replay chain"
+else
+    bad "the compact call is handed the whole replay chain" "$(jq -c 'map(.type // .role)' "$WORK/stub/compact-input-1.json" 2>/dev/null)"
+fi
+
+if grep -q 'compacting the Responses replay chain' "$WORK/err"; then
+    ok "compaction logs one progress line"
+else
+    bad "compaction logs one progress line" "stderr=$(tail -5 "$WORK/err" | tr '\n' ' ')"
+fi
+
+# A compact call that fails is not fatal: the chain is kept exactly as it was
+# and the run carries on.
+SHELLM_RESPONSES_COMPACT_THRESHOLD=1000 \
+    run_shellm compactfail responses openrouter openai/o4-mini
+rc=$?
+if [[ "$rc" -eq 0 && "$(main_calls)" -eq 2 && "$(compact_calls)" -eq 1 ]] \
+   && jq -e 'any(.[]; .encrypted_content == "enc_resp_1")' "$WORK/stub/messages-2.json" >/dev/null 2>&1 \
+   && grep -q 'compaction failed' "$WORK/err"; then
+    ok "a failed compact call warns and keeps the replay chain"
+else
+    bad "a failed compact call warns and keeps the replay chain" "rc=$rc calls=$(main_calls) compacts=$(compact_calls) stderr=$(tail -5 "$WORK/err" | tr '\n' ' ')"
+fi
+
+# Stateful mode leaves compaction to the server: llm gets the threshold and
+# shellm never calls the compact endpoint.
+SHELLM_RESPONSES_COMPACT_THRESHOLD=1000 run_shellm stateful-compact responses
+rc=$?
+if [[ "$rc" -eq 0 && "$(compact_calls)" -eq 0 \
+      && "$(cat "$WORK/stub/threshold-1")" == 1000 \
+      && "$(cat "$WORK/stub/threshold-2")" == 1000 ]]; then
+    ok "stateful mode passes the threshold to llm and compacts nothing itself"
+else
+    bad "stateful mode passes the threshold to llm and compacts nothing itself" "rc=$rc compacts=$(compact_calls) t1=$(cat "$WORK/stub/threshold-1" 2>/dev/null) t2=$(cat "$WORK/stub/threshold-2" 2>/dev/null)"
+fi
+
+SHELLM_RESPONSES_COMPACT_THRESHOLD=1000 \
+    run_shellm compact responses openrouter openai/o4-mini
+if [[ "$(cat "$WORK/stub/threshold-1")" == unset ]]; then
+    ok "replay mode compacts locally and does not ask llm for server compaction"
+else
+    bad "replay mode compacts locally and does not ask llm for server compaction" "t1=$(cat "$WORK/stub/threshold-1" 2>/dev/null)"
+fi
+
+run_shellm continue responses
+if [[ "$(cat "$WORK/stub/threshold-1")" == unset ]]; then
+    ok "an unset compaction threshold reaches llm as unset"
+else
+    bad "an unset compaction threshold reaches llm as unset" "t1=$(cat "$WORK/stub/threshold-1" 2>/dev/null)"
+fi
+
+SHELLM_RESPONSES_COMPACT_THRESHOLD=lots "$WORK/toolbin/shellm" --help \
+    > "$WORK/out" 2> "$WORK/err"
+rc=$?
+if [[ "$rc" -ne 0 ]] && grep -q 'Invalid SHELLM_RESPONSES_COMPACT_THRESHOLD' "$WORK/err"; then
+    ok "an invalid compaction threshold fails through shellm's error contract"
+else
+    bad "an invalid compaction threshold fails through shellm's error contract" "rc=$rc stderr=$(cat "$WORK/err")"
+fi
+
+# Server-side compaction inside an ordinary turn: the terminal output carries a
+# compaction item, so the chain is cut back to it with no threshold set and no
+# compact call of our own.
+run_shellm server-compaction responses openrouter openai/o4-mini
+rc=$?
+if [[ "$rc" -eq 0 && "$(main_calls)" -eq 2 && "$(compact_calls)" -eq 0 ]] \
+   && jq -e '
+        .[0].type == "compaction" and .[0].encrypted_content == "enc_server_compaction" and
+        all(.[]; .encrypted_content != "enc_resp_1")
+   ' "$WORK/stub/messages-2.json" >/dev/null 2>&1; then
+    ok "a compaction item in a terminal output truncates the replay chain"
+else
+    bad "a compaction item in a terminal output truncates the replay chain" "rc=$rc calls=$(main_calls) compacts=$(compact_calls) m2=$(jq -c 'map(.type // .role)' "$WORK/stub/messages-2.json" 2>/dev/null)"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

@@ -92,6 +92,11 @@ LLM_RESPONSE_FILE="${LLM_RESPONSE_FILE:-}"
 # turns it on, 0 forces foreground over a body file that asks for it, unset
 # leaves the body file's say.
 LLM_RESPONSES_POLL_INTERVAL="${LLM_RESPONSES_POLL_INTERVAL:-2}"
+# Server-side compaction (design/responses-lifecycle.md): once the rendered
+# input crosses this many tokens the server rewrites the window into an opaque
+# compaction item inside the ordinary turn. Set here it owns the request field;
+# left unset, whatever context_management the body file carries stands.
+LLM_RESPONSES_COMPACT_THRESHOLD="${LLM_RESPONSES_COMPACT_THRESHOLD:-}"
 # Token usage is captured on every call. A caller that wants this call's
 # numbers sets LLM_USAGE_FILE and gets a one-line JSON record
 # ({in_tok, out_tok, think_tok}) written there after the call (bin/shellm
@@ -370,6 +375,11 @@ Environment:
   LLM_RESPONSES_POLL_INTERVAL
                            Seconds between background polls (default 2,
                            doubling to 10). LLM_MAX_TIME bounds the whole wait
+  LLM_RESPONSES_COMPACT_THRESHOLD
+                           Token count at which the server compacts the window
+                           inside the turn, sent as context_management. When
+                           set it replaces any context_management from the body
+                           file; unset, the body file's value stands
   LLM_ADAPTER              Path to an adapter executable; required with
                            --provider adapter (contract: design/providers.md)
   LLM_PROVIDER             Provider to use when the model name implies none
@@ -513,6 +523,9 @@ case "$LLM_API_FORMAT" in
         if [[ -n "${LLM_RESPONSES_BACKGROUND:-}" ]]; then
             echo "llm: note: LLM_RESPONSES_BACKGROUND ignored with LLM_API_FORMAT=chat" >&2
         fi
+        if [[ -n "$LLM_RESPONSES_COMPACT_THRESHOLD" ]]; then
+            echo "llm: note: LLM_RESPONSES_COMPACT_THRESHOLD ignored with LLM_API_FORMAT=chat" >&2
+        fi
         ;;
     responses)
         case "$LLM_PROVIDER" in
@@ -530,6 +543,10 @@ case "$LLM_API_FORMAT" in
         esac
         [[ "$LLM_RESPONSES_POLL_INTERVAL" =~ ^[0-9]+$ ]] \
             || die "Invalid LLM_RESPONSES_POLL_INTERVAL '$LLM_RESPONSES_POLL_INTERVAL' (expected whole seconds)"
+        if [[ -n "$LLM_RESPONSES_COMPACT_THRESHOLD" ]]; then
+            [[ "$LLM_RESPONSES_COMPACT_THRESHOLD" =~ ^[1-9][0-9]*$ ]] \
+                || die "Invalid LLM_RESPONSES_COMPACT_THRESHOLD '$LLM_RESPONSES_COMPACT_THRESHOLD' (expected a positive integer)"
+        fi
         if [[ -n "$LLM_RESPONSES_BODY_FILE" ]]; then
             [[ -f "$LLM_RESPONSES_BODY_FILE" ]] \
                 || die "Responses body file not found: $LLM_RESPONSES_BODY_FILE"
@@ -844,6 +861,7 @@ _build_payload_responses() {
         --arg previous "$LLM_PREVIOUS_RESPONSE_ID"
         --arg effort "$reasoning_effort"
         --arg background "${LLM_RESPONSES_BACKGROUND:-}"
+        --arg compact_threshold "$LLM_RESPONSES_COMPACT_THRESHOLD"
         --argjson max_tokens "$LLM_MAX_TOKENS"
         --argjson stream "$( [[ "$LLM_STREAM" -eq 1 ]] && echo true || echo false )"
     )
@@ -878,6 +896,9 @@ _build_payload_responses() {
         | if $background == "1" then .background = true
           elif $background == "0" then del(.background)
           else . end
+        | if $compact_threshold == "" then .
+          else .context_management =
+            [{type: "compaction", compact_threshold: ($compact_threshold | tonumber)}] end
         | if $effort == "" then .
           else .reasoning = ((.reasoning // {}) + {effort: $effort, summary: "auto"}) end
         | .include = ((.include // [])
