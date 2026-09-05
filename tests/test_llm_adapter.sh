@@ -14,6 +14,10 @@
 #   - -s reaches the adapter via --system-prompt-file
 #   - --no-stream, --effort, and --thinking LEVEL are forwarded
 #   - LLM_USAGE_FILE reaches the adapter and its usage lands in the ledger
+#   - LLM_API_FORMAT=responses is allowed for the adapter provider and adds
+#     --api-format responses to the argv, with the Responses environment
+#     (LLM_RESPONSE_FILE, LLM_PREVIOUS_RESPONSE_ID, LLM_RESPONSES_BODY_FILE)
+#     visible to the adapter; chat mode passes no --api-format at all
 #   - the system-prompt tempfile is mode 0600 (private prompt in /tmp)
 #   - LLM_MAX_TIME is a hard deadline: TERM, 5s grace, then KILL — and a
 #     deadline expiry fails the call even if the adapter exits 0 on TERM
@@ -51,6 +55,14 @@ for a in "$@"; do
     fi
     prev="$a"
 done
+if [[ -n "${ADAPTER_ENV:-}" ]]; then
+    {
+        printf 'LLM_API_FORMAT=%s\n' "${LLM_API_FORMAT:-}"
+        printf 'LLM_RESPONSE_FILE=%s\n' "${LLM_RESPONSE_FILE:-}"
+        printf 'LLM_PREVIOUS_RESPONSE_ID=%s\n' "${LLM_PREVIOUS_RESPONSE_ID:-}"
+        printf 'LLM_RESPONSES_BODY_FILE=%s\n' "${LLM_RESPONSES_BODY_FILE:-}"
+    } > "$ADAPTER_ENV"
+fi
 if [[ -n "${ADAPTER_USAGE:-}" && -n "${LLM_USAGE_FILE:-}" ]]; then
     printf '%s' "$ADAPTER_USAGE" > "$LLM_USAGE_FILE"
 fi
@@ -68,16 +80,19 @@ export ADAPTER_ARGS="$WORK/adapter_args"
 export ADAPTER_STDIN="$WORK/adapter_stdin"
 export ADAPTER_SYS="$WORK/adapter_sys"
 export ADAPTER_SYS_MODE="$WORK/adapter_sys_mode"
+export ADAPTER_ENV="$WORK/adapter_env"
 export LLM_RETRIES=0
 unset ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY \
       OPENCODE_API_KEY LLM_API_KEY LLM_PROVIDER LLM_API_URL LLM_MODEL \
       LLM_MAX_TOKENS SHELLM_MODEL SHELLM_API_URL LLM_ADAPTER \
-      ADAPTER_USAGE ADAPTER_RC LLM_USAGE_FILE LLM_USAGE_LEDGER
+      ADAPTER_USAGE ADAPTER_RC LLM_USAGE_FILE LLM_USAGE_LEDGER \
+      LLM_API_FORMAT LLM_RESPONSE_FILE LLM_PREVIOUS_RESPONSE_ID \
+      LLM_RESPONSES_BODY_FILE
 cd "$WORK" || exit 1
 
 LLM="$REPO/bin/llm"
 
-reset() { : > "$ADAPTER_ARGS"; : > "$ADAPTER_STDIN"; : > "$ADAPTER_SYS"; }
+reset() { : > "$ADAPTER_ARGS"; : > "$ADAPTER_STDIN"; : > "$ADAPTER_SYS"; : > "$ADAPTER_ENV"; }
 
 has_arg_pair() {  # has_arg_pair FLAG VALUE — argv is recorded one per line
     grep -A1 -x -- "$1" "$ADAPTER_ARGS" | tail -1 | grep -qx -- "$2"
@@ -165,6 +180,51 @@ if grep -q '"in_tok":11' "$WORK/ledger.jsonl" 2>/dev/null \
     ok "adapter usage lands in the ledger"
 else
     bad "adapter usage lands in the ledger" "$(head -1 "$WORK/ledger.jsonl" 2>/dev/null)"
+fi
+
+# ---------------------------------------------------------------------------
+# Responses format reaches the adapter (tools/responses-ws needs this)
+# ---------------------------------------------------------------------------
+
+reset
+printf '%s' '{"store":false}' > "$WORK/body.json"
+out=$(LLM_PROVIDER=adapter LLM_ADAPTER="$WORK/adapter" \
+      LLM_API_FORMAT=responses \
+      LLM_RESPONSE_FILE="$WORK/resp.json" \
+      LLM_PREVIOUS_RESPONSE_ID=resp_prev \
+      LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
+      "$LLM" -m gpt-5.5 "say ok" 2>"$WORK/stderr")
+rc=$?
+if [[ "$rc" -eq 0 && "$out" == "adapter says ok" ]]; then
+    ok "the adapter provider is allowed under LLM_API_FORMAT=responses"
+else
+    bad "the adapter provider is allowed under LLM_API_FORMAT=responses" "rc=$rc: $(head -1 "$WORK/stderr")"
+fi
+if has_arg_pair "--api-format" "responses"; then
+    ok "--api-format responses is forwarded"
+else
+    bad "--api-format responses is forwarded" "$(tr '\n' ' ' < "$ADAPTER_ARGS")"
+fi
+if grep -qx "LLM_RESPONSE_FILE=$WORK/resp.json" "$ADAPTER_ENV" \
+   && grep -qx 'LLM_PREVIOUS_RESPONSE_ID=resp_prev' "$ADAPTER_ENV" \
+   && grep -qx "LLM_RESPONSES_BODY_FILE=$WORK/body.json" "$ADAPTER_ENV"; then
+    ok "the Responses environment reaches the adapter"
+else
+    bad "the Responses environment reaches the adapter" "$(tr '\n' ' ' < "$ADAPTER_ENV")"
+fi
+if jq -e '.[0].role == "user"' "$ADAPTER_STDIN" >/dev/null 2>&1; then
+    ok "typed Responses input arrives on stdin"
+else
+    bad "typed Responses input arrives on stdin" "$(head -c 120 "$ADAPTER_STDIN")"
+fi
+
+reset
+LLM_PROVIDER=adapter LLM_ADAPTER="$WORK/adapter" \
+    "$LLM" -m qwen3:8b "say ok" >/dev/null 2>"$WORK/stderr"
+if grep -qx -- "--api-format" "$ADAPTER_ARGS"; then
+    bad "chat mode passes no --api-format" "$(tr '\n' ' ' < "$ADAPTER_ARGS")"
+else
+    ok "chat mode passes no --api-format"
 fi
 
 # ---------------------------------------------------------------------------

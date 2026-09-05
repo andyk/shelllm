@@ -117,6 +117,17 @@ The contract, implemented by the invoker in `bin/llm` (pinned by
   [LEVEL]`, and `--no-stream`. The system prompt arrives via
   `--system-prompt-file PATH`. The messages array (the same JSON shape
   `llm -M` takes) arrives on stdin.
+- `LLM_API_FORMAT=responses` is legal for the adapter provider. `bin/llm`
+  then adds `--api-format responses` to the argv, and stdin carries typed
+  Responses `input` items rather than a chat messages array. The adapter
+  owes the Responses contract in return: text deltas on stdout, reasoning
+  summary deltas on stderr, the terminal Response object or error envelope
+  written to `LLM_RESPONSE_FILE` (atomic, mode 0600), and the same reading
+  of `LLM_PREVIOUS_RESPONSE_ID` and `LLM_RESPONSES_BODY_FILE` that
+  `bin/llm`'s own builder does, including the caller's body as the base and
+  the always-requested `reasoning.encrypted_content`. Those three variables
+  are exported to the adapter. Chat adapters never see `--api-format`.
+  `tools/responses-ws` is the adapter this exists for.
 - The adapter writes response text to stdout, streamed as it is
   produced, and diagnostics to stderr. It exits 0 on success and
   nonzero on failure with a one-line reason on stderr. It must not

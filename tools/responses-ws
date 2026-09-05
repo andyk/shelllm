@@ -1,0 +1,604 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["websockets>=13"]
+# ///
+"""WebSocket transport for the OpenAI Responses API, as a headlong adapter.
+
+This is an adapter, not core (design/providers.md): it needs Python and the
+websockets library, which bin/llm is not allowed to depend on. bin/llm runs it
+with LLM_PROVIDER=adapter and LLM_API_FORMAT=responses, which adds
+"--api-format responses" to the argv and hands over the Responses environment.
+The output contract is llm's Responses contract exactly: visible text on
+stdout as it streams, reasoning summaries on stderr, the terminal Response
+object in LLM_RESPONSE_FILE, token counts in LLM_USAGE_FILE, non-zero exit on
+failure.
+
+Two roles live in one file. The default role is the per-call adapter. The
+"serve" role is a broker that holds one connection open across many calls and
+multiplexes them onto stream_id lanes, which is where the latency win of
+WebSocket mode actually comes from: a run pays the handshake once instead of
+once per turn. shellm starts the broker for a run and points llm at this file
+through RESPONSES_WS_SOCKET.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import json
+import os
+import socket
+import sys
+import time
+import uuid
+
+import websockets
+from websockets.asyncio.client import connect as ws_connect
+
+# The guide (developers.openai.com/api/docs/guides/websocket-mode) documents
+# the mode against /v1/responses without spelling the scheme out, so the URL
+# stays configurable and this is only the default. ws:// is accepted too, which
+# is what the hermetic test's fake server speaks.
+DEFAULT_URL = "wss://api.openai.com/v1/responses"
+
+# Connection limits from the same guide. A connection accepts at most 16
+# in-flight responses and 32 distinct stream_id values, and lives at most 60
+# minutes. The broker recycles a fixed pool of lane names so a long run cannot
+# walk past the second limit, and rotates the connection before the third.
+MAX_IN_FLIGHT = 16
+MAX_LANES = 32
+CONNECTION_MAX_AGE = 55 * 60
+
+TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed")
+
+
+def die(message: str) -> None:
+    sys.stderr.write("responses-ws: error: %s\n" % message)
+    raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Request construction
+# ---------------------------------------------------------------------------
+
+
+def read_body_file(path: str) -> dict:
+    """Extra create fields, with the same precedence bin/llm's builder uses."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            body = json.load(handle)
+    except (OSError, ValueError) as exc:
+        die("cannot read LLM_RESPONSES_BODY_FILE %s: %s" % (path, exc))
+    if not isinstance(body, dict):
+        die("LLM_RESPONSES_BODY_FILE must contain a JSON object: %s" % path)
+    return body
+
+
+def build_create(args, input_items) -> dict:
+    """The response.create payload.
+
+    Mirrors bin/llm's build_payload_responses so the two transports send the
+    same request: the caller's extra body is the base, llm owns the fields
+    coupled to its CLI, and encrypted reasoning content is always requested so
+    a stateless replay keeps exact reasoning items. Fields that belong to the
+    HTTP transport rather than the request (stream, background) are dropped,
+    because in WebSocket mode every response streams and the connection is the
+    thing that stays open.
+    """
+    body = {}
+    body_file = os.environ.get("LLM_RESPONSES_BODY_FILE", "")
+    if body_file:
+        body.update(read_body_file(body_file))
+    body.pop("stream", None)
+    body.pop("background", None)
+
+    body["model"] = args.model
+    body["input"] = input_items
+    body["max_output_tokens"] = args.max_tokens
+
+    if args.system_prompt_file:
+        try:
+            with open(args.system_prompt_file, "r", encoding="utf-8") as handle:
+                body["instructions"] = handle.read()
+        except OSError as exc:
+            die("cannot read --system-prompt-file: %s" % exc)
+
+    previous = os.environ.get("LLM_PREVIOUS_RESPONSE_ID", "")
+    if previous:
+        body["previous_response_id"] = previous
+
+    effort = args.thinking if args.thinking else args.effort
+    if effort:
+        reasoning = dict(body.get("reasoning") or {})
+        reasoning["effort"] = effort
+        reasoning["summary"] = "auto"
+        body["reasoning"] = reasoning
+
+    include = list(body.get("include") or [])
+    if "reasoning.encrypted_content" not in include:
+        include.append("reasoning.encrypted_content")
+    body["include"] = include
+
+    body["type"] = "response.create"
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Output contract
+# ---------------------------------------------------------------------------
+
+
+def write_private(path: str, payload: str) -> None:
+    """Atomic mode-0600 write, the same guarantee bin/llm's sidecar makes."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    tmp = os.path.join(directory, ".responses-ws.%d.%s" % (os.getpid(), uuid.uuid4().hex))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def write_sidecar(obj) -> None:
+    path = os.environ.get("LLM_RESPONSE_FILE", "")
+    if not path:
+        return
+    try:
+        write_private(path, json.dumps(obj, separators=(",", ":")))
+    except OSError as exc:
+        die("cannot write LLM_RESPONSE_FILE %s: %s" % (path, exc))
+
+
+def write_usage(response) -> None:
+    path = os.environ.get("LLM_USAGE_FILE", "")
+    usage = (response or {}).get("usage") or {}
+    if not path or not usage:
+        return
+    record = {}
+    for key, source in (
+        ("in_tok", usage.get("input_tokens")),
+        ("out_tok", usage.get("output_tokens")),
+        ("think_tok", (usage.get("output_tokens_details") or {}).get("reasoning_tokens")),
+        ("cache_tok", (usage.get("input_tokens_details") or {}).get("cached_tokens")),
+    ):
+        if isinstance(source, int):
+            record[key] = source
+    if not record:
+        return
+    with contextlib.suppress(OSError):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, separators=(",", ":"))
+
+
+def extract_text(response) -> str:
+    parts = []
+    for item in (response or {}).get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for chunk in item.get("content") or []:
+            if chunk.get("type") in ("output_text", "refusal"):
+                parts.append(chunk.get("text") or chunk.get("refusal") or "")
+    return "".join(parts)
+
+
+def extract_reasoning(response) -> str:
+    parts = []
+    for item in (response or {}).get("output") or []:
+        if item.get("type") != "reasoning":
+            continue
+        for chunk in item.get("summary") or []:
+            parts.append(chunk.get("text") or "")
+    return "".join(parts)
+
+
+class Emitter:
+    """Turns server events into the adapter's stdout, stderr, and artifacts.
+
+    It carries the "did anything reach the caller yet" state that decides
+    whether a buffered fallback would duplicate output, which is the same rule
+    bin/llm's stream_responses follows.
+    """
+
+    def __init__(self, stream: bool):
+        self.stream = stream
+        self.text_emitted = False
+        self.reasoning_emitted = False
+        self.terminal = False
+        self.exit_code = 1
+
+    def feed(self, event) -> bool:
+        """Handle one server event. Returns True when the exchange is over."""
+        kind = event.get("type") or ""
+        if kind in ("response.output_text.delta", "response.refusal.delta"):
+            delta = event.get("delta") or ""
+            if delta and self.stream:
+                self.text_emitted = True
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+            return False
+        if kind == "response.reasoning_summary_text.delta":
+            delta = event.get("delta") or ""
+            if delta and self.stream:
+                self.reasoning_emitted = True
+                sys.stderr.write(delta)
+                sys.stderr.flush()
+            return False
+        if kind in ("response.completed", "response.incomplete"):
+            self._finish(event.get("response") or {}, kind)
+            return True
+        if kind == "response.failed":
+            response = event.get("response") or {}
+            write_sidecar(response)
+            message = ((response.get("error") or {}).get("message")) or "response failed"
+            sys.stderr.write("responses-ws: error: %s\n" % message)
+            self.terminal = True
+            self.exit_code = 1
+            return True
+        if kind == "error":
+            # Written through verbatim: shellm decides whether to fall back to
+            # its replay chain by reading this envelope, and a rejected
+            # previous_response_id is only recognisable in the provider's own
+            # fields.
+            write_sidecar(event)
+            message = (event.get("error") or {}).get("message") or event.get("message") or "unknown error"
+            sys.stderr.write("responses-ws: error: %s\n" % message)
+            self.terminal = True
+            self.exit_code = 1
+            return True
+        return False
+
+    def _finish(self, response, kind: str) -> None:
+        self.terminal = True
+        write_sidecar(response)
+        write_usage(response)
+        if not self.reasoning_emitted:
+            reasoning = extract_reasoning(response)
+            if reasoning:
+                sys.stderr.write(reasoning)
+        if not self.text_emitted:
+            text = extract_text(response)
+            if text:
+                sys.stdout.write(text)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if kind == "response.incomplete":
+            reason = (response.get("incomplete_details") or {}).get("reason") or "unknown"
+            sys.stderr.write("\nresponses-ws: warning: response incomplete (%s)\n" % reason)
+        self.exit_code = 0
+
+
+# ---------------------------------------------------------------------------
+# Line-delimited JSON over the broker's unix socket
+# ---------------------------------------------------------------------------
+
+
+def send_line(writer, obj) -> None:
+    writer.write((json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+async def drain_line(writer, obj) -> None:
+    send_line(writer, obj)
+    await writer.drain()
+
+
+def socket_is_live(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+# ---------------------------------------------------------------------------
+# Adapter role
+# ---------------------------------------------------------------------------
+
+
+def connect_kwargs():
+    key = os.environ.get("OPENAI_API_KEY", "")
+    headers = {}
+    if key:
+        # The key travels in a header, never on argv, for the same reason
+        # bin/llm's add_auth_header exists: argv is world readable.
+        headers["Authorization"] = "Bearer %s" % key
+    return {"additional_headers": headers, "max_size": None}
+
+
+async def run_one_shot(url: str, create: dict, emitter: Emitter) -> int:
+    try:
+        async with ws_connect(url, **connect_kwargs()) as ws:
+            await ws.send(json.dumps(create, separators=(",", ":")))
+            async for raw in ws:
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                if emitter.feed(event):
+                    break
+    except OSError as exc:
+        sys.stderr.write("responses-ws: error: cannot reach %s: %s\n" % (url, exc))
+        return 1
+    except websockets.exceptions.WebSocketException as exc:
+        sys.stderr.write("responses-ws: error: websocket failed: %s\n" % exc)
+        return 1
+    if not emitter.terminal:
+        sys.stderr.write("responses-ws: error: connection closed before a terminal event\n")
+        return 1
+    return emitter.exit_code
+
+
+async def run_via_broker(path: str, create: dict, emitter: Emitter) -> int:
+    reader, writer = await asyncio.open_unix_connection(path)
+    try:
+        await drain_line(writer, {"op": "create", "body": create})
+        while True:
+            raw = await reader.readline()
+            if not raw:
+                break
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                continue
+            if message.get("op") == "error":
+                sys.stderr.write("responses-ws: error: %s\n" % message.get("message", "broker error"))
+                return 1
+            if message.get("op") != "event":
+                continue
+            if emitter.feed(message.get("event") or {}):
+                break
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    if not emitter.terminal:
+        sys.stderr.write("responses-ws: error: broker closed before a terminal event\n")
+        return 1
+    return emitter.exit_code
+
+
+def run_adapter(args) -> int:
+    if args.api_format != "responses":
+        die("only --api-format responses is supported (this adapter speaks the Responses protocol)")
+    raw_input_items = sys.stdin.read()
+    try:
+        input_items = json.loads(raw_input_items) if raw_input_items.strip() else []
+    except ValueError as exc:
+        die("stdin is not valid JSON input items: %s" % exc)
+    create = build_create(args, input_items)
+    emitter = Emitter(stream=not args.no_stream)
+
+    broker = os.environ.get("RESPONSES_WS_SOCKET", "")
+    if broker and socket_is_live(broker):
+        return asyncio.run(run_via_broker(broker, create, emitter))
+    url = os.environ.get("RESPONSES_WS_URL", "") or DEFAULT_URL
+    return asyncio.run(run_one_shot(url, create, emitter))
+
+
+# ---------------------------------------------------------------------------
+# Broker role
+# ---------------------------------------------------------------------------
+
+
+class Broker:
+    def __init__(self, url: str, idle_seconds: float):
+        self.url = url
+        self.idle_seconds = idle_seconds
+        self.ws = None
+        self.opened_at = 0.0
+        self.reader_task = None
+        self.lock = asyncio.Lock()
+        self.lanes = {}
+        self.free_lanes = ["lane-%d" % i for i in range(MAX_LANES)]
+        self.slots = asyncio.Semaphore(MAX_IN_FLIGHT)
+        self.last_activity = time.monotonic()
+        self.stopping = asyncio.Event()
+
+    async def ensure_connection(self):
+        async with self.lock:
+            stale = self.ws is not None and (time.monotonic() - self.opened_at) > CONNECTION_MAX_AGE
+            if stale and not self.lanes:
+                await self.close_connection()
+            if self.ws is None:
+                self.ws = await ws_connect(self.url, **connect_kwargs())
+                self.opened_at = time.monotonic()
+                self.reader_task = asyncio.create_task(self._read_forever(self.ws))
+            return self.ws
+
+    async def close_connection(self):
+        ws, self.ws = self.ws, None
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+
+    async def _read_forever(self, ws):
+        """One reader per connection, fanning events out to their lanes.
+
+        Events are routed by stream_id. A server that omits it while exactly
+        one lane is open still lands correctly, which keeps a single-caller
+        broker working without guessing when several lanes are in flight.
+        """
+        try:
+            async for raw in ws:
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                lane = event.get("stream_id")
+                if lane is None and len(self.lanes) == 1:
+                    lane = next(iter(self.lanes))
+                queue = self.lanes.get(lane)
+                if queue is not None:
+                    await queue.put(event)
+        except Exception:
+            pass
+        finally:
+            # A closed connection is not an error for the broker, only for the
+            # calls riding it: tell them so they fail instead of hanging, and
+            # let the next call reconnect.
+            for queue in list(self.lanes.values()):
+                await queue.put({"__closed__": True})
+            if self.ws is ws:
+                self.ws = None
+
+    async def handle(self, reader, writer):
+        try:
+            raw = await reader.readline()
+            if not raw:
+                return
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                await drain_line(writer, {"op": "error", "message": "malformed request"})
+                return
+            op = message.get("op")
+            if op == "stop":
+                await drain_line(writer, {"op": "stopped"})
+                self.stopping.set()
+                return
+            if op != "create":
+                await drain_line(writer, {"op": "error", "message": "unknown op %r" % op})
+                return
+            await self._relay(message.get("body") or {}, writer)
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    async def _relay(self, body, writer):
+        self.last_activity = time.monotonic()
+        await self.slots.acquire()
+        lane = None
+        queue = asyncio.Queue()
+        try:
+            while not self.free_lanes:
+                await asyncio.sleep(0.01)
+            lane = self.free_lanes.pop(0)
+            self.lanes[lane] = queue
+            body = dict(body)
+            body["stream_id"] = lane
+            try:
+                ws = await self.ensure_connection()
+                await ws.send(json.dumps(body, separators=(",", ":")))
+            except Exception as exc:
+                await drain_line(writer, {"op": "error", "message": "connect failed: %s" % exc})
+                return
+            while True:
+                event = await queue.get()
+                if event.get("__closed__"):
+                    await drain_line(writer, {"op": "error", "message": "connection closed before a terminal event"})
+                    return
+                await drain_line(writer, {"op": "event", "event": event})
+                if event.get("type") in TERMINAL_EVENTS or event.get("type") == "error":
+                    return
+        finally:
+            if lane is not None:
+                self.lanes.pop(lane, None)
+                self.free_lanes.append(lane)
+            self.slots.release()
+            self.last_activity = time.monotonic()
+
+    async def watch_idle(self):
+        while not self.stopping.is_set():
+            await asyncio.sleep(1)
+            if self.lanes:
+                self.last_activity = time.monotonic()
+                continue
+            if time.monotonic() - self.last_activity >= self.idle_seconds:
+                self.stopping.set()
+
+
+async def serve(path: str, idle_seconds: float, url: str) -> int:
+    if socket_is_live(path):
+        sys.stderr.write("responses-ws: error: a broker is already listening on %s\n" % path)
+        return 1
+    with contextlib.suppress(OSError):
+        os.unlink(path)
+    broker = Broker(url, idle_seconds)
+    # The socket is the run's private door onto an authenticated connection,
+    # so it is created 0600 and not left readable between the bind and the
+    # chmod.
+    previous_umask = os.umask(0o077)
+    try:
+        server = await asyncio.start_unix_server(broker.handle, path=path)
+    finally:
+        os.umask(previous_umask)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    idle_task = asyncio.create_task(broker.watch_idle())
+    async with server:
+        await broker.stopping.wait()
+    idle_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await idle_task
+    await broker.close_connection()
+    with contextlib.suppress(OSError):
+        os.unlink(path)
+    return 0
+
+
+async def stop(path: str) -> int:
+    if not socket_is_live(path):
+        return 0
+    try:
+        reader, writer = await asyncio.open_unix_connection(path)
+    except OSError:
+        return 0
+    try:
+        await drain_line(writer, {"op": "stop"})
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.readline(), timeout=5)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main(argv) -> int:
+    if argv and argv[0] in ("serve", "stop"):
+        parser = argparse.ArgumentParser(prog="responses-ws %s" % argv[0])
+        parser.add_argument("--socket", required=True)
+        if argv[0] == "serve":
+            parser.add_argument("--idle", type=float, default=float(os.environ.get("RESPONSES_WS_IDLE", "10")))
+        args = parser.parse_args(argv[1:])
+        url = os.environ.get("RESPONSES_WS_URL", "") or DEFAULT_URL
+        if argv[0] == "serve":
+            return asyncio.run(serve(args.socket, max(args.idle, 0.1) * 60, url))
+        return asyncio.run(stop(args.socket))
+
+    parser = argparse.ArgumentParser(prog="responses-ws")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--max-tokens", type=int, required=True)
+    parser.add_argument("--effort", default="")
+    parser.add_argument("--thinking", nargs="?", const="", default="")
+    parser.add_argument("--no-stream", action="store_true")
+    parser.add_argument("--system-prompt-file", default="")
+    parser.add_argument("--api-format", default="chat")
+    args = parser.parse_args(argv)
+    return run_adapter(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
