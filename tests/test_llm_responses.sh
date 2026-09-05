@@ -404,13 +404,15 @@ else
 fi
 
 printf '{"background":true}' > "$WORK/body.json"
+reset
+export CURL_MODE=stream-completed
 LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
-    "$LLM" --provider openai -m gpt-5.4-mini "no" >"$WORK/stdout" 2>"$WORK/stderr"
+    "$LLM" --provider openai -m gpt-5.4-mini "yes" >"$WORK/stdout" 2>"$WORK/stderr"
 rc=$?
-if [[ "$rc" -ne 0 ]] && grep -q 'background responses require lifecycle operations' "$WORK/stderr"; then
-    ok "background Responses are rejected until lifecycle support exists"
+if [[ "$rc" -eq 0 ]] && jq -e '.background == true' "$CURL_PAYLOAD" >/dev/null; then
+    ok "background:true in the body file rides the create (tests/test_llm_responses_background.sh has the lifecycle)"
 else
-    bad "background Responses are rejected until lifecycle support exists" "rc=$rc stderr=$(cat "$WORK/stderr")"
+    bad "background:true in the body file rides the create (tests/test_llm_responses_background.sh has the lifecycle)" "rc=$rc payload=$(jq -c . "$CURL_PAYLOAD" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
 fi
 
 printf '{"conversation":"conv_123"}' > "$WORK/body.json"

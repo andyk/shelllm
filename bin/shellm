@@ -95,6 +95,7 @@ unset _shellm_process_shellm_api_url_set _shellm_process_shellm_api_url \
     _shellm_process_llm_api_url_set _shellm_process_llm_api_url 2>/dev/null || true
 SHELLM_API_FORMAT="${SHELLM_API_FORMAT:-chat}"
 SHELLM_RESPONSES_BODY_FILE="${SHELLM_RESPONSES_BODY_FILE:-}"
+SHELLM_RESPONSES_BACKGROUND="${SHELLM_RESPONSES_BACKGROUND:-}"
 # Clear any inherited LLM_API_URL so llm uses per-provider defaults
 unset LLM_API_URL 2>/dev/null || true
 if [[ -n "$SHELLM_API_URL" ]]; then
@@ -176,6 +177,10 @@ if [[ -n "$SHELLM_RESPONSES_BODY_FILE" ]]; then
         || die "SHELLM_RESPONSES_BODY_FILE not found: $SHELLM_RESPONSES_BODY_FILE"
     SHELLM_RESPONSES_BODY_FILE=$(realpath "$SHELLM_RESPONSES_BODY_FILE")
 fi
+case "$SHELLM_RESPONSES_BACKGROUND" in
+    ""|0|1) ;;
+    *) die "Invalid SHELLM_RESPONSES_BACKGROUND: $SHELLM_RESPONSES_BACKGROUND (expected 0 or 1)" ;;
+esac
 
 # A local model bound to the Docker host is usually configured as localhost
 # for thinkers and other llm calls that run on that host. Code executed in a
@@ -346,6 +351,10 @@ Environment:
   SHELLM_RESPONSES_BODY_FILE
                           Optional Responses create-body JSON object passed to
                           llm (tools, include, store, text format, etc.)
+  SHELLM_RESPONSES_BACKGROUND
+                          1 runs each Responses create in the background
+                          (llm polls or resumes the stream, and cancels the
+                          job if killed); 0 forces foreground
   SHELLM_EMPTY_RESPONSE_RETRIES
                           Empty-response retries before the run dies
                           (default 8; set empty for unlimited)
@@ -1599,6 +1608,13 @@ call_llm() {
         else
             unset LLM_RESPONSES_BODY_FILE 2>/dev/null || true
         fi
+        # Background creates change nothing here: llm still hands back one
+        # terminal object per call, polling or resuming on its own.
+        if [[ -n "${SHELLM_RESPONSES_BACKGROUND:-}" ]]; then
+            export LLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
+        else
+            unset LLM_RESPONSES_BACKGROUND 2>/dev/null || true
+        fi
         local replay_has_history=0
         if [[ -n "$replay_file" && -s "$replay_file" ]] \
             && jq -e 'type == "array" and length > 0' "$replay_file" >/dev/null 2>&1; then
@@ -1653,7 +1669,7 @@ call_llm() {
         fi
     else
         unset LLM_RESPONSE_FILE LLM_RESPONSES_BODY_FILE LLM_PREVIOUS_RESPONSE_ID \
-            2>/dev/null || true
+            LLM_RESPONSES_BACKGROUND 2>/dev/null || true
     fi
 
     while true; do
@@ -2953,6 +2969,8 @@ exit \$__shellm_rc
             LLM_API_FORMAT="$SHELLM_API_FORMAT"
             SHELLM_RESPONSES_BODY_FILE="$SHELLM_RESPONSES_BODY_FILE"
             LLM_RESPONSES_BODY_FILE="$SHELLM_RESPONSES_BODY_FILE"
+            SHELLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
+            LLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
             SHELLM_API_URL="$execution_api_url"
             LLM_API_URL="$execution_api_url"
             SHELLM_DOCKER_IMAGE="$SHELLM_DOCKER_IMAGE"

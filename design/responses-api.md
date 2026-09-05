@@ -13,7 +13,10 @@ This change covers synchronous buffered and SSE response creation, including
 reasoning summaries, function call items and outputs, structured and
 multimodal input items, terminal status and errors, usage, and continuation.
 Response retrieval/deletion/cancellation, input-item listing, Conversations,
-background responses, and WebSocket mode are separate lifecycle work.
+and WebSocket mode are separate lifecycle work (design/responses-lifecycle.md).
+Background responses live in `bin/llm` because the caller still receives one
+terminal object per call: llm polls or resumes the stream itself and cancels
+the job when it is killed or out of time; the contract is in that document.
 
 ## Wire contract
 
