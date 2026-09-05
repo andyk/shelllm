@@ -112,8 +112,8 @@ in [docs/install.md](docs/install.md).
   stream also means no hard walls between people: assume anything you
   tell the agent is shared with everyone who talks to it.
 - **Built around Ken Thompson's philosophy.** The core tooling is a
-  handful of small Bash executables (`shellm`, `traj`, `llm`, `context`,
-  `mem`, `skills`, ...), each doing one thing well and composing through
+  handful of small Bash executables (`shellm`, `traj`, `llm`, `responses`,
+  `context`, `mem`, `skills`, ...), each doing one thing well and composing through
   pipes, files, and environment variables. The model writes shell
   commands, so `curl` is the HTTP client and `jq` is the JSON processor.
 - **An agent's trajectory is a DAG of jsonl files** with fork and merge.

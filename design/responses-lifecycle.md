@@ -1,8 +1,12 @@
 # OpenAI Responses lifecycle operations
 
-Status: fork-only work on 24601/headlong, stacked on the Responses completion
-protocol (design/responses-api.md, upstream PR #101). Nothing here is proposed
-upstream until that PR lands and the pieces have run for a while.
+Status: implemented on the 24601/headlong fork (2026-09-05), stacked on the
+Responses completion protocol (design/responses-api.md, upstream PR #101).
+Each section below names its tests and any place the build departed from the
+sketch. Nothing here is proposed upstream until that PR lands and the pieces
+have run for a while. Landed as fork PRs #2 (bin/responses), #3 (background),
+#4 (WebSocket), #5 (compaction) and #6 (Conversations) on the integration
+branch `feat/responses-lifecycle` (PR #1).
 
 ## Why a second surface
 
@@ -21,6 +25,11 @@ case it, the endpoint's own 404 is the answer. `openai-compatible` endpoints
 get the same paths relative to their configured base.
 
 ## bin/responses
+
+Status: implemented (`tests/test_responses_cli.sh`). Two notes: each
+subcommand rejects flags that belong to another subcommand (exit 2) rather
+than ignoring them, and `include` arrays are sent as repeated `include[]=`
+query parameters, the encoding the official SDKs use.
 
 One bash tool, curl and jq only, sharing `bin/llm`'s environment: the vendor
 keys, `LLM_PROVIDER` / `--provider` (default `openai`), `LLM_API_URL` (when set
@@ -129,6 +138,11 @@ resume, and dies cleanly on a rejected conversation.
 
 ## Compaction
 
+Status: implemented (`tests/test_llm_responses.sh`,
+`tests/test_shellm_responses_continuation.sh`). The compact reply's window is
+its `output` array, passed on as is; a failed compact call warns and keeps the
+chain, and the next crossing tries again.
+
 - `bin/llm`: `LLM_RESPONSES_COMPACT_THRESHOLD=N` adds
   `context_management: [{type: "compaction", compact_threshold: N}]` to the
   create body (owned when the variable is set, otherwise the body file's value
@@ -185,6 +199,6 @@ prints one skip line and exits 0, like the Docker-gated tests.
 
 ## Line budget
 
-`cloc bin/ thinkers/` is capped by CI. These pieces add roughly 700 lines to
-bin/; the cap moves to 11,500 on this fork in the first slice that crosses it,
-which is the number the README already quotes.
+`cloc bin/ thinkers/` is capped by CI. These pieces added about 900 lines to
+bin/ (the tree stands near 11,560), so the cap on this fork is 12,000 and the
+README quotes that number. Upstream's cap of 11,000 is untouched by PR #101.

@@ -113,3 +113,11 @@ Replies take 15 to 45 seconds while the monolith thinker wakes.
 - The dashboard binds localhost by default and `0.0.0.0` in a container.
   A failed dashboard does not fail the install; check `dash.status` in
   `status.json` and `<state-home>/logs/web.log`.
+- Responses mode (`SHELLM_API_FORMAT=responses`) keeps its continuation
+  state per process: response ids and the replay chain live in the run's
+  temp dir and vanish with it, and a `--resume` starts a fresh chain from
+  the trajectory. Only `SHELLM_RESPONSES_CONVERSATION` is durable across
+  runs (the id is written to the `shellm-run` header row). The knobs and
+  their interplay are in the Responses sections of
+  [docs/shellm.md](docs/shellm.md); the contracts are
+  design/responses-api.md and design/responses-lifecycle.md.
