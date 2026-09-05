@@ -393,6 +393,17 @@ once with that chain and stays stateless for the rest of the run. OpenRouter's
 documented stateless Responses endpoint uses exact replay from the first turn.
 Remote response IDs and replay items are removed when the shellm process exits.
 
+`SHELLM_RESPONSES_CONVERSATION` moves that state to the server instead.
+`new` creates a Conversation at run start through `responses conversations
+create`, a `conv_...` id joins an existing one, and either way every call sends
+only the new rows with that conversation set and no `previous_response_id`. The
+id is recorded in the run's `shellm-run` header row, which is deliberate:
+Conversations do not expire, so `--resume` of that run with `new` picks the
+same one back up, while a literal id given on the resume wins over it. There is
+no replay chain and no fallback here. A conversation the provider refuses ends
+the run with its message, because durable server state is what the operator
+asked for and nothing local is a safe substitute.
+
 ### WebSocket mode
 
 Responses also has a WebSocket transport, where one connection carries every

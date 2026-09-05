@@ -38,6 +38,7 @@ printf '%s\n' "$n" > "$LLM_STUB_DIR/calls"
 printf '%s\n' "${LLM_API_FORMAT:-}" > "$LLM_STUB_DIR/format-$n"
 printf '%s\n' "${LLM_PREVIOUS_RESPONSE_ID:-}" > "$LLM_STUB_DIR/previous-$n"
 printf '%s\n' "${LLM_RESPONSES_BACKGROUND-unset}" > "$LLM_STUB_DIR/background-$n"
+printf '%s\n' "${LLM_RESPONSES_CONVERSATION-unset}" > "$LLM_STUB_DIR/conversation-$n"
 printf '%s\n' "${LLM_RESPONSE_FILE:-}" > "$LLM_STUB_DIR/response-file-$n"
 [[ -n "$messages_file" ]] && cp "$messages_file" "$LLM_STUB_DIR/messages-$n.json"
 if [[ -n "${LLM_RESPONSE_FILE:-}" ]]; then
@@ -145,6 +146,25 @@ esac
 STUB
 chmod +x "$WORK/toolbin/llm"
 
+# bin/responses is the lifecycle tool shellm asks for a conversation. The stub
+# records the create call and can refuse it, so the fail-closed path is
+# exercised without a network.
+cat > "$WORK/toolbin/responses" <<'STUB'
+#!/usr/bin/env bash
+mkdir -p "$RESPONSES_STUB_DIR"
+n=0
+[[ -f "$RESPONSES_STUB_DIR/creates" ]] && read -r n < "$RESPONSES_STUB_DIR/creates"
+n=$((n + 1))
+printf '%s\n' "$n" > "$RESPONSES_STUB_DIR/creates"
+printf '%s\n' "$@" > "$RESPONSES_STUB_DIR/create-args-$n"
+if [[ "${RESPONSES_STUB_MODE:-ok}" == reject ]]; then
+    printf '%s\n' 'responses: error: Conversation not found' >&2
+    exit 1
+fi
+printf '%s\n' '{"id":"conv_created","object":"conversation","created_at":1}'
+STUB
+chmod +x "$WORK/toolbin/responses"
+
 export PATH="$WORK/toolbin:$PATH"
 export HOME="$WORK/home"
 export HEADLONG_HOME="$WORK/home/.headlong"
@@ -165,6 +185,26 @@ run_shellm() {
 }
 
 main_calls() { cat "$WORK/stub/calls" 2>/dev/null || echo 0; }
+create_calls() { cat "$WORK/rstub/creates" 2>/dev/null || echo 0; }
+export RESPONSES_STUB_DIR="$WORK/rstub"
+
+# Resume the run just made: same trajectory and the same create counter, so a
+# reused conversation shows up as a second run without a second create.
+resume_shellm() {
+    local mode="$1"
+    rm -rf "$WORK/stub"
+    mkdir -p "$WORK/stub"
+    LLM_STUB_DIR="$WORK/stub" LLM_STUB_MODE="$mode" SHELLM_API_FORMAT=responses \
+        SHELLM_RESPONSES_CONVERSATION="${SHELLM_RESPONSES_CONVERSATION:-}" \
+        "$WORK/toolbin/shellm" --resume --workdir "$WORK/wd" --max-iterations 3 "keep going" \
+        > "$WORK/out" 2> "$WORK/err" < /dev/null
+}
+
+# The shellm-run header row of the only trajectory this test wrote.
+run_header() {
+    cat "$HEADLONG_HOME"/trajectories/*/trajectory.jsonl 2>/dev/null \
+        | jq -cR 'fromjson? | select(.type == "shellm-run")' 2>/dev/null | tail -1
+}
 
 # A successful terminal response becomes the next request's continuation ID;
 # only the messages after the last assistant turn are sent as new input.
@@ -385,6 +425,99 @@ if [[ "$rc" -ne 0 ]] && grep -q 'Invalid SHELLM_RESPONSES_BACKGROUND' "$WORK/err
     ok "an invalid SHELLM_RESPONSES_BACKGROUND fails through shellm's error contract"
 else
     bad "an invalid SHELLM_RESPONSES_BACKGROUND fails through shellm's error contract" "rc=$rc stderr=$(cat "$WORK/err")"
+fi
+
+# Conversation mode moves the history to the server: shellm creates one at
+# run start, every call names it, and no response-id chain is kept.
+rm -rf "$WORK/rstub"
+SHELLM_RESPONSES_CONVERSATION=new run_shellm continue responses
+rc=$?
+if [[ "$rc" -eq 0 && "$(main_calls)" -eq 2 && "$(create_calls)" -eq 1 \
+      && "$(cat "$WORK/stub/conversation-1")" == conv_created \
+      && "$(cat "$WORK/stub/conversation-2")" == conv_created \
+      && -z "$(cat "$WORK/stub/previous-1")" \
+      && -z "$(cat "$WORK/stub/previous-2")" \
+      && ! -e "$WORK/stub/id-value-2" ]]; then
+    ok "SHELLM_RESPONSES_CONVERSATION=new carries one conversation and no previous id"
+else
+    bad "SHELLM_RESPONSES_CONVERSATION=new carries one conversation and no previous id" "rc=$rc calls=$(main_calls) creates=$(create_calls) conv1=$(cat "$WORK/stub/conversation-1" 2>/dev/null) conv2=$(cat "$WORK/stub/conversation-2" 2>/dev/null) prev2=$(cat "$WORK/stub/previous-2" 2>/dev/null) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
+fi
+
+if grep -q 'conversations' "$WORK/rstub/create-args-1" \
+   && grep -q '^create$' "$WORK/rstub/create-args-1" \
+   && grep -q '^--metadata$' "$WORK/rstub/create-args-1"; then
+    ok "the conversation is created through bin/responses"
+else
+    bad "the conversation is created through bin/responses" "$(tr '\n' ' ' < "$WORK/rstub/create-args-1" 2>/dev/null)"
+fi
+
+if [[ "$(run_header | jq -r '.conversation // empty')" == conv_created ]]; then
+    ok "the conversation id is durable in the shellm-run header row"
+else
+    bad "the conversation id is durable in the shellm-run header row" "$(run_header)"
+fi
+
+if jq -e 'length == 1 and .[0].role == "user" and (.[0].content | contains("first output"))' \
+        "$WORK/stub/messages-2.json" >/dev/null 2>&1; then
+    ok "conversation mode sends only the new rows on later calls"
+else
+    bad "conversation mode sends only the new rows on later calls" "$(jq -c 'map(.content |= .[0:60])' "$WORK/stub/messages-2.json" 2>/dev/null)"
+fi
+
+# Resuming a run whose header carries a conversation reuses it: the operator
+# still says "new", and the durable id is what "new" resolves to.
+SHELLM_RESPONSES_CONVERSATION=new resume_shellm continue
+rc=$?
+if [[ "$rc" -eq 0 && "$(create_calls)" -eq 1 \
+      && "$(cat "$WORK/stub/conversation-1")" == conv_created ]]; then
+    ok "a resumed run reuses the conversation from its header instead of creating one"
+else
+    bad "a resumed run reuses the conversation from its header instead of creating one" "rc=$rc creates=$(create_calls) conv1=$(cat "$WORK/stub/conversation-1" 2>/dev/null) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
+fi
+
+# A literal id is used as given and never creates.
+rm -rf "$WORK/rstub"
+SHELLM_RESPONSES_CONVERSATION=conv_given run_shellm continue responses
+rc=$?
+if [[ "$rc" -eq 0 && "$(create_calls)" -eq 0 \
+      && "$(cat "$WORK/stub/conversation-1")" == conv_given \
+      && "$(run_header | jq -r '.conversation // empty')" == conv_given ]]; then
+    ok "a literal conversation id skips the create and is recorded as given"
+else
+    bad "a literal conversation id skips the create and is recorded as given" "rc=$rc creates=$(create_calls) conv1=$(cat "$WORK/stub/conversation-1" 2>/dev/null) header=$(run_header)"
+fi
+
+# Server state the operator asked for has no safe local substitute, so a
+# refused create ends the run before it spends a token.
+rm -rf "$WORK/rstub"
+RESPONSES_STUB_MODE=reject SHELLM_RESPONSES_CONVERSATION=new \
+    run_shellm continue responses
+rc=$?
+if [[ "$rc" -ne 0 && "$(main_calls)" -eq 0 ]] \
+   && grep -q 'could not create a Responses conversation' "$WORK/err" \
+   && grep -q 'Conversation not found' "$WORK/err"; then
+    ok "a refused conversation fails closed with the provider's message"
+else
+    bad "a refused conversation fails closed with the provider's message" "rc=$rc calls=$(main_calls) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
+fi
+
+SHELLM_RESPONSES_CONVERSATION=new SHELLM_API_FORMAT=chat \
+    "$WORK/toolbin/shellm" --help > "$WORK/out" 2> "$WORK/err"
+rc=$?
+if [[ "$rc" -ne 0 ]] \
+   && grep -q 'SHELLM_RESPONSES_CONVERSATION needs SHELLM_API_FORMAT=responses' "$WORK/err"; then
+    ok "a conversation under chat fails through shellm's error contract"
+else
+    bad "a conversation under chat fails through shellm's error contract" "rc=$rc stderr=$(cat "$WORK/err")"
+fi
+
+SHELLM_RESPONSES_CONVERSATION=resp_1 SHELLM_API_FORMAT=responses \
+    "$WORK/toolbin/shellm" --help > "$WORK/out" 2> "$WORK/err"
+rc=$?
+if [[ "$rc" -ne 0 ]] && grep -q 'Invalid SHELLM_RESPONSES_CONVERSATION' "$WORK/err"; then
+    ok "an id that is not a conversation is refused before the run starts"
+else
+    bad "an id that is not a conversation is refused before the run starts" "rc=$rc stderr=$(cat "$WORK/err")"
 fi
 
 # Default chat mode does not create or pass Responses state.
