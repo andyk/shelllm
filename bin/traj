@@ -958,15 +958,15 @@ _format_line() {
         return 0
     fi
 
-    local entry_type content source ts step_id traj_hex
-    { read -r entry_type
-      IFS= read -r content
-      read -r source
-      read -r ts
-      read -r step_id
-      read -r traj_hex
-    } < <(
-        printf '%s' "$line" | jq -r --argjson filters "$_filter_json" '
+    # Capture first, then guard, the way the -a branch above does. A step the
+    # filter drops makes jq print nothing, and reading six lines straight from
+    # an empty process substitution failed at the first read; under set -e
+    # that ended the whole formatted stream instead of skipping one step, so
+    # `traj tail --filter type=...` at a terminal printed nothing and exited
+    # 1, usually on the header line. The same read cut an unfiltered stream
+    # off at the first malformed line.
+    local _fields
+    _fields=$(printf '%s' "$line" | jq -r --argjson filters "$_filter_json" '
             def matches_filters($fs):
                 . as $step |
                 ($fs | length == 0) or all($fs[];
@@ -994,8 +994,21 @@ _format_line() {
             ((.ts // .timestamp // "0") | tostring),
             (.step_id // "-"),
             (._traj_hex // "-")
-        ' 2>/dev/null
-    )
+        ' 2>/dev/null) || return 0
+    [[ -n "$_fields" ]] || return 0
+
+    local entry_type content source ts step_id traj_hex
+    # The capture drops trailing newlines, so a record whose last field is the
+    # empty string arrives one line short. The process substitution this
+    # replaces kept that newline and read the field as empty; keep doing so
+    # rather than letting the sixth read fail and end the stream.
+    { read -r entry_type
+      IFS= read -r content
+      read -r source
+      read -r ts
+      read -r step_id
+      read -r traj_hex
+    } <<< "$_fields" || true
     [[ -n "$entry_type" ]] || return 0
 
     # Normalize placeholders back to empty
