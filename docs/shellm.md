@@ -318,8 +318,22 @@ function-output items in `--messages-file` pass through unchanged.
 Visible output text remains stdout; reasoning summaries go to stderr. The
 mode-0600 `LLM_RESPONSE_FILE` sidecar is the machine channel for the complete
 terminal Response or error envelope, including function-only results. Retrieval,
-cancellation, deletion, Conversations, background mode, and WebSocket sessions
-are lifecycle APIs and are not completion operations in this CLI.
+deletion, Conversations, and WebSocket sessions are lifecycle APIs and are not
+completion operations in this CLI.
+
+Background responses are the one lifecycle feature the completion CLI carries,
+because the caller still gets one terminal object per call. Set
+`LLM_RESPONSES_BACKGROUND=1` (or `background: true` in the body file; the
+variable wins when set). With `--no-stream`, llm polls the response by id every
+`LLM_RESPONSES_POLL_INTERVAL` seconds (default 2, doubling to 10) until it is
+terminal, within `LLM_MAX_TIME` overall. When streaming, a stream that drops
+after the response id is known is resumed from its last `sequence_number`
+instead of being recreated, up to `LLM_RETRIES` times, and text already
+printed is never printed twice. A killed llm (SIGINT, SIGTERM), an expired
+`LLM_MAX_TIME`, exhausted resumes, and a `--stop-after-code-block` cut all
+cancel the job on the way out, so nothing keeps generating for nobody.
+`cancelled` is terminal: the sidecar is written, nothing is printed, and llm
+exits non-zero. Under shellm, `SHELLM_RESPONSES_BACKGROUND=1` passes through.
 
 ### Lifecycle operations
 

@@ -71,9 +71,13 @@ the error contract, and that keys never appear on argv. Runs under bash 3.2.
 
 ## Background responses (bin/llm)
 
+Status: implemented (`tests/test_llm_responses_background.sh`).
+
 Opt in with `LLM_RESPONSES_BACKGROUND=1`, or `background: true` in the body
-file (no longer rejected). `store` is left to the caller; the API keeps the
-data it needs for polling either way.
+file (no longer rejected); `0` forces foreground over the body file. `store`
+is left to the caller; the API keeps the data it needs for polling either way.
+The retrieve and cancel URLs are derived from the create URL by stripping its
+`/responses` suffix, so the create endpoint must end that way.
 
 - Streaming create: `background: true, stream: true`. The handler remembers
   the response id from the first event carrying `.response.id` and the

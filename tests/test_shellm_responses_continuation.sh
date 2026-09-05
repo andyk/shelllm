@@ -37,6 +37,7 @@ n=$((n + 1))
 printf '%s\n' "$n" > "$LLM_STUB_DIR/calls"
 printf '%s\n' "${LLM_API_FORMAT:-}" > "$LLM_STUB_DIR/format-$n"
 printf '%s\n' "${LLM_PREVIOUS_RESPONSE_ID:-}" > "$LLM_STUB_DIR/previous-$n"
+printf '%s\n' "${LLM_RESPONSES_BACKGROUND-unset}" > "$LLM_STUB_DIR/background-$n"
 printf '%s\n' "${LLM_RESPONSE_FILE:-}" > "$LLM_STUB_DIR/response-file-$n"
 [[ -n "$messages_file" ]] && cp "$messages_file" "$LLM_STUB_DIR/messages-$n.json"
 if [[ -n "${LLM_RESPONSE_FILE:-}" ]]; then
@@ -359,6 +360,31 @@ if [[ "$rc" -ne 0 ]] \
     ok "invalid Responses format fails through shellm's error contract"
 else
     bad "invalid Responses format fails through shellm's error contract" "rc=$rc stderr=$(cat "$WORK/err")"
+fi
+
+# Background creates ride through to llm untouched; the continuation contract
+# is llm's terminal object either way, so nothing else changes.
+SHELLM_RESPONSES_BACKGROUND=1 run_shellm continue responses
+rc=$?
+if [[ "$rc" -eq 0 && "$(main_calls)" -eq 2 \
+      && "$(cat "$WORK/stub/background-1")" == 1 && "$(cat "$WORK/stub/background-2")" == 1 \
+      && "$(cat "$WORK/stub/previous-2")" == resp_1 ]]; then
+    ok "SHELLM_RESPONSES_BACKGROUND passes through to every llm call"
+else
+    bad "SHELLM_RESPONSES_BACKGROUND passes through to every llm call" "rc=$rc calls=$(main_calls) bg1=$(cat "$WORK/stub/background-1" 2>/dev/null) bg2=$(cat "$WORK/stub/background-2" 2>/dev/null)"
+fi
+run_shellm continue responses
+if [[ "$(cat "$WORK/stub/background-1")" == unset ]]; then
+    ok "an unset SHELLM_RESPONSES_BACKGROUND leaves llm's default alone"
+else
+    bad "an unset SHELLM_RESPONSES_BACKGROUND leaves llm's default alone" "bg1=$(cat "$WORK/stub/background-1" 2>/dev/null)"
+fi
+SHELLM_RESPONSES_BACKGROUND=sometimes "$WORK/toolbin/shellm" --help > "$WORK/out" 2> "$WORK/err"
+rc=$?
+if [[ "$rc" -ne 0 ]] && grep -q 'Invalid SHELLM_RESPONSES_BACKGROUND' "$WORK/err"; then
+    ok "an invalid SHELLM_RESPONSES_BACKGROUND fails through shellm's error contract"
+else
+    bad "an invalid SHELLM_RESPONSES_BACKGROUND fails through shellm's error contract" "rc=$rc stderr=$(cat "$WORK/err")"
 fi
 
 # Default chat mode does not create or pass Responses state.
