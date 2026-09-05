@@ -109,6 +109,13 @@ def build_create(args, input_items) -> dict:
     if previous:
         body["previous_response_id"] = previous
 
+    # Server-held conversation state, the alternative to the id chain. llm
+    # refuses the pair before it reaches an adapter, so this is a plain
+    # override of whatever the body file said.
+    conversation = os.environ.get("LLM_RESPONSES_CONVERSATION", "")
+    if conversation:
+        body["conversation"] = conversation
+
     effort = args.thinking if args.thinking else args.effort
     if effort:
         reasoning = dict(body.get("reasoning") or {})

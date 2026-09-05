@@ -98,6 +98,11 @@ SHELLM_API_TRANSPORT="${SHELLM_API_TRANSPORT:-https}"
 SHELLM_RESPONSES_BODY_FILE="${SHELLM_RESPONSES_BODY_FILE:-}"
 SHELLM_RESPONSES_BACKGROUND="${SHELLM_RESPONSES_BACKGROUND:-}"
 SHELLM_RESPONSES_COMPACT_THRESHOLD="${SHELLM_RESPONSES_COMPACT_THRESHOLD:-}"
+# Server-held conversation state instead of the process-local chain: "new"
+# creates one at run start, a conv_ id joins an existing one. The id is
+# durable on purpose (Conversations do not expire), so it is recorded in the
+# run header and a resume of that run picks it back up.
+SHELLM_RESPONSES_CONVERSATION="${SHELLM_RESPONSES_CONVERSATION:-}"
 # The provider this run inherited, kept because the websocket transport
 # overwrites LLM_PROVIDER for llm calls and the Docker sandbox must still be
 # told the original: the host broker's socket does not exist in a container.
@@ -202,6 +207,17 @@ esac
 if [[ -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ]]; then
     [[ "$SHELLM_RESPONSES_COMPACT_THRESHOLD" =~ ^[1-9][0-9]*$ ]] \
         || die "Invalid SHELLM_RESPONSES_COMPACT_THRESHOLD: $SHELLM_RESPONSES_COMPACT_THRESHOLD (expected a positive integer)"
+fi
+if [[ -n "$SHELLM_RESPONSES_CONVERSATION" ]]; then
+    # Conversations are a Responses-only container, and an operator who asked
+    # for durable server state under Chat Completions has a configuration
+    # mistake rather than something to silently ignore.
+    [[ "$SHELLM_API_FORMAT" == "responses" ]] \
+        || die "SHELLM_RESPONSES_CONVERSATION needs SHELLM_API_FORMAT=responses"
+    case "$SHELLM_RESPONSES_CONVERSATION" in
+        new|conv_*) ;;
+        *) die "Invalid SHELLM_RESPONSES_CONVERSATION: $SHELLM_RESPONSES_CONVERSATION (expected new or a conv_ id)" ;;
+    esac
 fi
 
 # A local model bound to the Docker host is usually configured as localhost
@@ -387,6 +403,11 @@ Environment:
                           (OpenRouter, ZDR, after a continuation fallback)
                           call the compact endpoint and swap the chain for
                           the window it returns
+  SHELLM_RESPONSES_CONVERSATION
+                          new, or a conv_ id: keep the turns in a server-side
+                          Conversation instead of the process-local chain.
+                          new creates one per run, the id is recorded in the
+                          run header, and --resume of that run reuses it
   SHELLM_EMPTY_RESPONSE_RETRIES
                           Empty-response retries before the run dies
                           (default 8; set empty for unlimited)
@@ -1682,6 +1703,7 @@ call_llm() {
     local replay_file="${SHELLM_RESPONSES_REPLAY_FILE:-}"
     local context_file="${SHELLM_RESPONSES_CONTEXT_FILE:-}"
     local stateless="${SHELLM_RESPONSES_STATELESS:-0}"
+    local conversation="${SHELLM_RESPONSES_CONVERSATION_ID:-}"
     local request_messages_json="$full_messages_json"
     local new_messages_json="$full_messages_json"
     local previous_response_id=""
@@ -1710,6 +1732,13 @@ call_llm() {
         else
             unset LLM_RESPONSES_BACKGROUND 2>/dev/null || true
         fi
+        # Conversation mode and previous_response_id are alternatives, and llm
+        # refuses the pair; the id file this run never writes keeps them apart.
+        if [[ -n "$conversation" ]]; then
+            export LLM_RESPONSES_CONVERSATION="$conversation"
+        else
+            unset LLM_RESPONSES_CONVERSATION 2>/dev/null || true
+        fi
         local replay_has_history=0
         if [[ -n "$replay_file" && -s "$replay_file" ]] \
             && jq -e 'type == "array" and length > 0' "$replay_file" >/dev/null 2>&1; then
@@ -1733,7 +1762,8 @@ call_llm() {
         local seen_src=/dev/null sent_ids_json='{}'
         [[ -n "$context_file" && -s "$context_file" ]] && seen_src="$context_file"
         if [[ "$messages_are_delta" != "1" \
-            && ( -n "$previous_response_id" || "$replay_has_history" -eq 1 ) ]]; then
+            && ( -n "$previous_response_id" || "$replay_has_history" -eq 1 \
+                 || ( -n "$conversation" && "$seen_src" != /dev/null ) ) ]]; then
             [[ "$seen_src" != /dev/null ]] \
                 || die "Responses continuation context is missing"
             new_messages_json=$(printf '%s' "$full_messages_json" | jq -c --slurpfile seen_file "$seen_src" '
@@ -1760,12 +1790,13 @@ call_llm() {
             else
                 request_messages_json="$new_messages_json"
             fi
-        elif [[ -n "$previous_response_id" ]]; then
+        elif [[ -n "$previous_response_id" || -n "$conversation" ]]; then
             request_messages_json="$new_messages_json"
         fi
     else
         unset LLM_RESPONSE_FILE LLM_RESPONSES_BODY_FILE LLM_PREVIOUS_RESPONSE_ID \
             LLM_RESPONSES_BACKGROUND LLM_RESPONSES_COMPACT_THRESHOLD 2>/dev/null || true
+            LLM_RESPONSES_BACKGROUND LLM_RESPONSES_CONVERSATION 2>/dev/null || true
     fi
 
     while true; do
@@ -2478,6 +2509,8 @@ run_loop() {
     mkdir -p "$_run_traj_dir"
 
     local _run_traj_id _new_output run_name
+    # A conversation carried by the trajectory this run resumes.
+    local _resume_conversation=""
 
     if [[ -n "$_use_traj" ]]; then
         # --- Use existing trajectory (--traj / --resume) ---
@@ -2504,6 +2537,7 @@ run_loop() {
             _orig_workdir=$(printf '%s' "$_orig_meta" | jq -r '.workdir // empty')
             _orig_env=$(printf '%s' "$_orig_meta" | jq -r '.env.name // empty')
             _orig_image=$(printf '%s' "$_orig_meta" | jq -r '.env.docker_image // empty')
+            _resume_conversation=$(printf '%s' "$_orig_meta" | jq -r '.conversation // empty')
             [[ -z "$_SHELLM_WORKDIR_USER" && -n "$_orig_workdir" ]] && _SHELLM_WORKDIR_USER="$_orig_workdir"
             [[ -z "$_SHELLM_ENV_NAME" && -n "$_orig_env" ]] && _SHELLM_ENV_NAME="$_orig_env"
             SHELLM_DOCKER_IMAGE=$(_resume_docker_image \
@@ -2716,6 +2750,39 @@ run_loop() {
         _ctx_files_json=$(printf '%s' "$_ctx_files_json" | jq --arg f "$_cf" '. + [$f]')
     done
 
+    # Resolve the conversation before the header row, because the row is where
+    # the id becomes durable. "new" means one per run, except on a resume of a
+    # run that already has one: reusing it is the whole point of recording it.
+    # A literal id always wins, so an operator can redirect a resumed run.
+    local _run_conversation=""
+    if [[ -n "$SHELLM_RESPONSES_CONVERSATION" ]]; then
+        if [[ "$SHELLM_RESPONSES_CONVERSATION" != "new" ]]; then
+            _run_conversation="$SHELLM_RESPONSES_CONVERSATION"
+        elif [[ -n "$_resume_conversation" ]]; then
+            _run_conversation="$_resume_conversation"
+            progress "Reusing conversation $_run_conversation from the resumed run"
+        else
+            local _conv_tool _conv_json _conv_err
+            _conv_tool=$(resolve_shellm_tool_path "$_SHELLM_SCRIPT_PATH" "responses" || true)
+            [[ -n "$_conv_tool" ]] \
+                || die "SHELLM_RESPONSES_CONVERSATION=new needs bin/responses, which was not found next to bin/shellm"
+            _conv_err=$(mktemp)
+            _conv_json=$("$_conv_tool" conversations create \
+                --metadata "$(jq -nc --arg run "$_run_traj_id" '{shellm_run: $run}')" \
+                2>"$_conv_err") || {
+                local _conv_msg=""
+                [[ -s "$_conv_err" ]] && _conv_msg=$(tail -c 500 "$_conv_err")
+                rm -f "$_conv_err"
+                die "could not create a Responses conversation: $_conv_msg"
+            }
+            rm -f "$_conv_err"
+            _run_conversation=$(printf '%s' "$_conv_json" | jq -r '.id // empty')
+            [[ -n "$_run_conversation" ]] \
+                || die "responses conversations create returned no conversation id"
+            progress "Created conversation $_run_conversation"
+        fi
+    fi
+
     # Write shellm-run step
     local _shellm_run_json
     _shellm_run_json=$(jq -nc \
@@ -2724,6 +2791,7 @@ run_loop() {
         --arg model "$SHELLM_MODEL" \
         --arg effort "$SHELLM_EFFORT" \
         --arg api_format "$SHELLM_API_FORMAT" \
+        --arg conversation "$_run_conversation" \
         --arg max_iter "${SHELLM_MAX_ITERATIONS:-}" \
         --arg max_tok "${SHELLM_MAX_TOKENS:-}" \
         --arg inactivity_timeout "$SHELLM_INACTIVITY_TIMEOUT" \
@@ -2734,6 +2802,7 @@ run_loop() {
         --arg launched_by "${SHELLM_LAUNCHED_BY:-}" \
         --arg wake "${SHELLM_WAKE:-}" \
         '{type:"shellm-run", command:$cmd, workdir:$wd, model:$model, effort:$effort, api_format:$api_format, max_iterations:$max_iter, max_tokens:$max_tok, inactivity_timeout:$inactivity_timeout, context_files:$ctx, env:$env, resumed:$resumed}
+         + (if $conversation == "" then {} else {conversation: $conversation} end)
          + (if $trigger == "" then {} else {trigger_step: $trigger} end)
          + (if $launched_by == "" then {} else {launched_by: $launched_by} end)
          + (if $wake == "" then {} else {wake: $wake} end)')
@@ -2752,22 +2821,31 @@ run_loop() {
     local SHELLM_RESPONSES_REPLAY_FILE=""
     local SHELLM_RESPONSES_CONTEXT_FILE=""
     local SHELLM_RESPONSES_STATELESS=0
+    local SHELLM_RESPONSES_CONVERSATION_ID=""
     if [[ "$SHELLM_API_FORMAT" == "responses" ]]; then
         SHELLM_RESPONSE_FILE="$rundir/.last_response.json"
-        SHELLM_RESPONSE_ID_FILE="$rundir/.response-id"
-        SHELLM_RESPONSES_DISABLED_FILE="$rundir/.continuation-disabled"
-        SHELLM_RESPONSES_REPLAY_FILE="$rundir/.responses-replay.json"
         SHELLM_RESPONSES_CONTEXT_FILE="$rundir/.responses-sent-ids.json"
-        ( umask 077; printf '[]' > "$SHELLM_RESPONSES_REPLAY_FILE" )
-        chmod 600 "$SHELLM_RESPONSES_REPLAY_FILE"
+        if [[ -n "$_run_conversation" ]]; then
+            # The conversation holds the history, so none of the local chain
+            # applies: no response id to carry, no replay to keep, and no
+            # fallback, because the operator asked for durable server state
+            # and there is nothing safe to quietly downgrade to.
+            SHELLM_RESPONSES_CONVERSATION_ID="$_run_conversation"
+        else
+            SHELLM_RESPONSE_ID_FILE="$rundir/.response-id"
+            SHELLM_RESPONSES_DISABLED_FILE="$rundir/.continuation-disabled"
+            SHELLM_RESPONSES_REPLAY_FILE="$rundir/.responses-replay.json"
+            ( umask 077; printf '[]' > "$SHELLM_RESPONSES_REPLAY_FILE" )
+            chmod 600 "$SHELLM_RESPONSES_REPLAY_FILE"
 
-        # OpenRouter documents /responses as stateless: store=true and a
-        # non-null previous_response_id are rejected. Native OpenAI and
-        # generic compatible endpoints optimistically use continuation and
-        # fall back to this same exact replay chain when needed.
-        if [[ "${LLM_PROVIDER:-}" == "openrouter" \
-            || ( -z "${LLM_PROVIDER:-}" && "$SHELLM_MODEL" == */* ) ]]; then
-            SHELLM_RESPONSES_STATELESS=1
+            # OpenRouter documents /responses as stateless: store=true and a
+            # non-null previous_response_id are rejected. Native OpenAI and
+            # generic compatible endpoints optimistically use continuation and
+            # fall back to this same exact replay chain when needed.
+            if [[ "${LLM_PROVIDER:-}" == "openrouter" \
+                || ( -z "${LLM_PROVIDER:-}" && "$SHELLM_MODEL" == */* ) ]]; then
+                SHELLM_RESPONSES_STATELESS=1
+            fi
         fi
     fi
 
@@ -3125,6 +3203,10 @@ exit \$__shellm_rc
             LLM_RESPONSES_BODY_FILE="$SHELLM_RESPONSES_BODY_FILE"
             SHELLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
             LLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
+            # The resolved id, never "new": a nested run inside the sandbox
+            # joins this run's conversation instead of creating its own.
+            SHELLM_RESPONSES_CONVERSATION="${SHELLM_RESPONSES_CONVERSATION_ID:-}"
+            LLM_RESPONSES_CONVERSATION="${SHELLM_RESPONSES_CONVERSATION_ID:-}"
             SHELLM_API_URL="$execution_api_url"
             LLM_API_URL="$execution_api_url"
             SHELLM_DOCKER_IMAGE="$SHELLM_DOCKER_IMAGE"

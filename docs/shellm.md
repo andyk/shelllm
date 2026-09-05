@@ -404,6 +404,17 @@ terminal output cuts the chain back to that item, which is where the API says
 the next window begins. A failed compact call is a warning, not an error: the
 chain stands and the next crossing tries again.
 
+`SHELLM_RESPONSES_CONVERSATION` moves that state to the server instead.
+`new` creates a Conversation at run start through `responses conversations
+create`, a `conv_...` id joins an existing one, and either way every call sends
+only the new rows with that conversation set and no `previous_response_id`. The
+id is recorded in the run's `shellm-run` header row, which is deliberate:
+Conversations do not expire, so `--resume` of that run with `new` picks the
+same one back up, while a literal id given on the resume wins over it. There is
+no replay chain and no fallback here. A conversation the provider refuses ends
+the run with its message, because durable server state is what the operator
+asked for and nothing local is a safe substitute.
+
 ### WebSocket mode
 
 Responses also has a WebSocket transport, where one connection carries every

@@ -84,6 +84,10 @@ _llm_or_env="$LLM_OR_ONLY$LLM_OR_DATA_COLLECTION$LLM_OR_ZDR"
 LLM_API_FORMAT="${LLM_API_FORMAT:-chat}"
 LLM_RESPONSES_BODY_FILE="${LLM_RESPONSES_BODY_FILE:-}"
 LLM_PREVIOUS_RESPONSE_ID="${LLM_PREVIOUS_RESPONSE_ID:-}"
+# A Conversation is the other way to carry state: the server keeps the items
+# and this call names the container instead of its predecessor. The two are
+# alternatives, so the pair is refused here rather than at the provider.
+LLM_RESPONSES_CONVERSATION="${LLM_RESPONSES_CONVERSATION:-}"
 LLM_RESPONSE_FILE="${LLM_RESPONSE_FILE:-}"
 # Background Responses (design/responses-lifecycle.md): the create returns at
 # once and the model keeps working server-side. llm then polls, or streams and
@@ -364,6 +368,11 @@ Environment:
                            previous_response_id, max_output_tokens, stream, and
                            command-line reasoning settings
   LLM_PREVIOUS_RESPONSE_ID Continue a stored Responses chain from this response
+  LLM_RESPONSES_CONVERSATION
+                           Send this call into a stored Conversation (conv_...)
+                           instead of chaining response ids. Owns the body
+                           file's conversation field, and cannot be combined
+                           with LLM_PREVIOUS_RESPONSE_ID
   LLM_RESPONSE_FILE        Atomically write the full terminal Response object,
                            or a provider error envelope, to this mode-0600 file
   LLM_RESPONSES_BACKGROUND 1 runs the Responses create in the background: llm
@@ -552,9 +561,13 @@ case "$LLM_API_FORMAT" in
                 || die "Responses body file not found: $LLM_RESPONSES_BODY_FILE"
             jq -e 'type == "object"' "$LLM_RESPONSES_BODY_FILE" >/dev/null 2>&1 \
                 || die "Responses body file must contain a JSON object: $LLM_RESPONSES_BODY_FILE"
-            if jq -e 'has("conversation")' "$LLM_RESPONSES_BODY_FILE" >/dev/null 2>&1; then
-                die "conversation state cannot be combined with llm's previous_response_id continuation; omit conversation"
+            if jq -e '.conversation != null' "$LLM_RESPONSES_BODY_FILE" >/dev/null 2>&1; then
+                _body_conversation=1
             fi
+        fi
+        if [[ -n "$LLM_PREVIOUS_RESPONSE_ID" ]] \
+            && [[ -n "$LLM_RESPONSES_CONVERSATION" || "${_body_conversation:-0}" -eq 1 ]]; then
+            die "conversation and previous_response_id cannot both be set (LLM_RESPONSES_CONVERSATION or the body file's conversation, against LLM_PREVIOUS_RESPONSE_ID); pick one"
         fi
         # A sidecar the caller asked for must be writable before any tokens
         # are spent: the streaming handler cannot fail the call cleanly for a
@@ -859,6 +872,7 @@ _build_payload_responses() {
         --arg model "$LLM_MODEL"
         --arg system "$LLM_SYSTEM"
         --arg previous "$LLM_PREVIOUS_RESPONSE_ID"
+        --arg conversation "$LLM_RESPONSES_CONVERSATION"
         --arg effort "$reasoning_effort"
         --arg background "${LLM_RESPONSES_BACKGROUND:-}"
         --arg compact_threshold "$LLM_RESPONSES_COMPACT_THRESHOLD"
@@ -893,6 +907,8 @@ _build_payload_responses() {
           else .instructions = $system end
         | if $previous == "" then del(.previous_response_id)
           else .previous_response_id = $previous end
+        | if $conversation == "" then .
+          else .conversation = $conversation end
         | if $background == "1" then .background = true
           elif $background == "0" then del(.background)
           else . end
@@ -1721,7 +1737,7 @@ if [[ "$LLM_PROVIDER" == "adapter" ]]; then
     # exported to reach a child process.
     if [[ "$LLM_API_FORMAT" == responses ]]; then
         export LLM_API_FORMAT LLM_RESPONSE_FILE LLM_PREVIOUS_RESPONSE_ID \
-            LLM_RESPONSES_BODY_FILE
+            LLM_RESPONSES_BODY_FILE LLM_RESPONSES_CONVERSATION
     fi
     _adapter_rc=0
     if [[ "$LLM_MAX_TIME" =~ ^[0-9]+$ && "$LLM_MAX_TIME" -gt 0 ]]; then

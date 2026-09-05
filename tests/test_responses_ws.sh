@@ -318,6 +318,27 @@ else
     bad "usage is recorded in LLM_USAGE_FILE" "$(cat "$WORK/usage.json" 2>/dev/null)"
 fi
 
+# Conversation mode travels over the connection the same way the id chain
+# does: the create names the container and nothing else changes.
+rm -f "$REQ_DIR"/*.json
+run_limited 90 env \
+    LLM_PROVIDER=adapter LLM_ADAPTER="$ADAPTER" \
+    LLM_API_FORMAT=responses \
+    LLM_RESPONSE_FILE="$WORK/response.json" \
+    LLM_RESPONSES_CONVERSATION=conv_ws \
+    RESPONSES_WS_URL="$WS_URL" \
+    "$REPO/bin/llm" -m gpt-5.5 -t 321 "world" \
+    >"$WORK/out" 2>"$WORK/err"
+rc=$?
+REQ=$(ls "$REQ_DIR"/*.json 2>/dev/null | head -1)
+if [[ "$rc" -eq 0 && -n "$REQ" ]] \
+    && jq -e '.conversation == "conv_ws" and (has("previous_response_id") | not)' \
+        "$REQ" >/dev/null 2>&1; then
+    ok "LLM_RESPONSES_CONVERSATION rides the response.create payload"
+else
+    bad "LLM_RESPONSES_CONVERSATION rides the response.create payload" "rc=$rc payload=$(jq -c . "$REQ" 2>/dev/null | head -c 200) err=$(head -3 "$WORK/err")"
+fi
+
 stop_server
 
 # ---------------------------------------------------------------------------

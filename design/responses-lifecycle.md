@@ -104,6 +104,11 @@ duplicated text; TERM during a job records a cancel POST.
 
 ## Conversations
 
+Status: implemented (`tests/test_llm_responses.sh`,
+`tests/test_shellm_responses_continuation.sh`). One addition to the sketch
+below: the WebSocket adapter puts `conversation` on its `response.create` too,
+so the choice of transport does not change which state a run carries.
+
 `bin/llm` accepts `conversation` from the body file, or
 `LLM_RESPONSES_CONVERSATION=<conv id>`, when `LLM_PREVIOUS_RESPONSE_ID` is
 empty; both at once is still an error, because the API rejects the pair.
