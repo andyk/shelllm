@@ -1966,8 +1966,13 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
         fi
         if [[ "$_bg_active" -eq 1 ]]; then
             # As a job, so a signal reaches the cancel trap at once instead of
-            # after the stream ends.
-            ( "$_stream_handler" < <("${_stream_curl[@]}" 2>"$_curl_err") ) &
+            # after the stream ends. The `|| exit` keeps the handler in the
+            # same errexit-ignored context the foreground form below gives it:
+            # a bare `( ... ) &` would run it with set -e live, and one
+            # transiently failing write (stderr to a busy pipe, say) would end
+            # the stream with a silent exit 1 instead of the handler's own
+            # verdict.
+            ( "$_stream_handler" < <("${_stream_curl[@]}" 2>"$_curl_err") || exit "$?" ) &
             _bg_job=$!
             wait "$_bg_job" || _rc=$?
             _bg_job=""
