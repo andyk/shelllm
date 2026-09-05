@@ -321,6 +321,32 @@ terminal Response or error envelope, including function-only results. Retrieval,
 cancellation, deletion, Conversations, background mode, and WebSocket sessions
 are lifecycle APIs and are not completion operations in this CLI.
 
+### Lifecycle operations
+
+Stored Responses state has its own tool, `responses`. It shares `llm`'s
+provider resolution, keys, `LLM_API_URL` (its `/responses` suffix is stripped
+to find the API base), and net guards. Stdout is the API object and nothing
+else, one JSON document per command; a non-2xx prints
+`responses: error: <message>` on stderr and exits 1, and a usage error exits 2.
+
+```bash
+responses get resp_123 --include reasoning.encrypted_content
+responses cancel resp_123                  # background responses only
+responses input-items resp_123 --all       # follows has_more, merged output
+responses get resp_123 --stream --starting-after 42   # resume a background stream
+
+cid=$(responses conversations create --metadata '{"run":"r1"}' | jq -r .id)
+responses conversations add "$cid" --items-file items.json   # 20 items at a time
+responses conversations items "$cid" --all
+```
+
+`responses compact --model M --input-file chain.json` rewrites a long window
+into an opaque compaction item. The full command list is `responses --help`
+and the contract is in
+[design/responses-lifecycle.md](../design/responses-lifecycle.md).
+OpenRouter's `/responses` is stateless, so these paths return its own 404
+there.
+
 Set `LLM_API_KEY` if the endpoint wants a bearer token. The policy for
 which providers live in core is in
 [design/providers.md](../design/providers.md).
