@@ -220,9 +220,29 @@ jobs:
     # apt-get path and the container branch of its PATH handling.
     container: ubuntu:24.04
     steps:
-      - name: Install git (checkout + the smoke test's local clone need it)
+      - name: Read apt from the Azure mirror, as the runner host does
+        # The bare image points apt at archive.ubuntu.com, the public host.
+        # The runner host does not: its image routes apt through a mirror
+        # list with azure.archive.ubuntu.com first and the public hosts as
+        # fallbacks (actions/runner-images, images/ubuntu/scripts/build/
+        # configure-apt-sources.sh). When the public host crawls, as it did
+        # from every Azure region for about 95 minutes on 2026-09-05, the
+        # host jobs' apt-get calls keep their usual speed while this job's
+        # take 5 to 15 minutes per round trip and the job dies at
+        # timeout-minutes as "cancelled", with nothing in the log. Same
+        # list here (http, not https: the bare image has no ca-certificates
+        # until the next step installs them), applied before the first
+        # apt-get so install.sh's own apt-get path inherits it too.
         run: |
-          apt-get update -qq
+          printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\nhttp://security.ubuntu.com/ubuntu/\tpriority:3\n' > /etc/apt/apt-mirrors.txt
+          sed -i -E 's#^URIs: http://(archive|security)\.ubuntu\.com/ubuntu/$#URIs: mirror+file:/etc/apt/apt-mirrors.txt#' /etc/apt/sources.list.d/ubuntu.sources
+          grep -n '^URIs:' /etc/apt/sources.list.d/ubuntu.sources
+          test "$(grep -c '^URIs: mirror+file:/etc/apt/apt-mirrors.txt$' /etc/apt/sources.list.d/ubuntu.sources)" -eq 2
+      - name: Install git (checkout + the smoke test's local clone need it)
+        # -q, not -qq: the Get:/Hit: lines name the mirror each index came
+        # from, which is the one thing the log lacked while this stalled.
+        run: |
+          apt-get update -q
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
       - uses: actions/checkout@v5
       - name: Trust the workspace (owned by the runner user, we are root)
