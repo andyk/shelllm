@@ -64,21 +64,31 @@ terminal response from `response.completed`, `response.incomplete`, or
 Incomplete responses warn with their reason. Failed responses and `error`
 events fail the call.
 
-**HTTP hardening contract:** Responses
-CREATE is not automatically retried after uncertain failure. No emitted output
-does not prove no generation began; unknown results fail with
-`error.code=outcome_unknown`. Chat retry policy is unchanged. Known background
-responses may be retrieved/resumed, not recreated. Immediate, polled, and
-streamed terminal objects share validation; cancelled, failed, malformed, or
-embedded-error replies cannot be reported as successful completions.
+Responses CREATE is never automatically retried by llm, including before the
+first token. No emitted output does not prove that generation or hosted tools
+never began. Lost acknowledgements, missing terminal events, and malformed
+success bodies fail with `error.code=outcome_unknown` in the sidecar (with a
+response ID when known). Reconcile before deciding whether to create again.
+Request tracing IDs are not an idempotency guarantee. Chat retry policy stays
+unchanged.
 
-One absolute `LLM_MAX_TIME` budget covers create, polling, reconnects, and
-backoff, plus up to five additional seconds for best-effort cancellation.
-Confirmation requires the same response ID and a terminal status; otherwise
-the unknown-outcome sidecar and known ID remain available for reconciliation.
-See [the lifecycle contract](responses-lifecycle.md#background-responses-binllm).
+Buffered and streamed completion require a terminal object with a nonempty
+ID, an output array, completed/incomplete status, and no embedded error. Failed
+or cancelled Responses fail without recreating; incomplete Responses still
+deliver partial output with a warning. Stream identity and terminal event/status
+must agree. A function-only result remains a valid protocol success.
+
 A deterministic rejection of `previous_response_id` still allows shellm's
-explicit replay fallback; an uncertain create outcome does not.
+explicit replay fallback. A known response, terminal failure, or typed unknown
+outcome cannot enter that fallback merely because its diagnostic mentions a
+previous response. This decision does not depend on visible text alone.
+
+The fork's background Responses may be retrieved/resumed, not recreated. One
+absolute `LLM_MAX_TIME` budget covers create, polling, reconnects, and backoff,
+plus up to five additional seconds for best-effort cancellation. Confirmation
+requires the same response ID and a terminal status; otherwise the unknown-
+outcome sidecar and known ID remain available for reconciliation. See
+[the lifecycle contract](responses-lifecycle.md#background-responses-binllm).
 
 `LLM_STOP_AFTER_CODE_BLOCK` keeps its contract in Responses mode: the stream
 is cut when the first fenced block closes and the cut is a clean finish. The

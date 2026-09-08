@@ -2252,8 +2252,10 @@ else
             _llm_note error "" "$_final_err"
             die "API error: $_final_err"
         fi
-        valid_response_terminal < "$local_resp" \
-            || responses_outcome_unknown "invalid or nonterminal response body" "${_bg_id:-$_response_id}"
+        if ! valid_response_terminal < "$local_resp"; then
+            rm -f "$local_resp"
+            responses_outcome_unknown "invalid or nonterminal response body" "${_bg_id:-$_response_id}"
+        fi
     fi
     _llm_note ok
 
