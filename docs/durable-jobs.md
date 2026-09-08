@@ -84,15 +84,45 @@ complete admission JSON. These environment variables identify its custody:
 Write `{ "outcome": "completed"|"cancelled"|"unknown", "result": ... }` to the
 result file and exit. Stdout/stderr are evidence files, not canonical replies.
 The supervisor fsyncs and records the terminal receipt after stopping the whole
-owned process group. A missing, malformed, or unconfirmed result stays unknown.
+owned process group. Completion also requires a successful handler exit. A
+missing, malformed, or unconfirmed result stays unknown.
 A handler's completed result cannot hide an unsettled model attempt. A late
 completion after the durable cancellation fence is retained as unknown evidence.
+If settle completed while a speculative attempt remains unknown, the job result
+is `{ "outcome": "unknown", "reason": "unsettled_model_attempts", "evidence":
+<the handler's completed result> }`. The full typed attempt sidecars remain
+available through `jobs attempts`. Explicit disposition of an unused speculative
+attempt requires a future application effect-reconciliation contract; this
+implementation does not infer that acceptance or claim the parent completed.
 
 A child commission is another admission with the exact parent job ID. The
 registered handler executes the worker/task command and returns its candidate
 and evidence. It cannot grant Room/customer membership, commit application
 effects, approve its own output, or promote its candidate. Those remain the
 application's authenticated effect boundary.
+
+When a handler needs its child result synchronously, use:
+
+```sh
+thinkers jobs wait-child "$HEADLONG_JOB_ID" "$CHILD_JOB_ID"
+```
+
+This requires the actual live parent process group and the exact admitted
+parent/child relationship. Finish active model attempts before yielding. The
+parent stays supervised and cancellable in durable `waiting` state; it releases
+its execution slot without restarting its handler. The sole dispatcher gives
+queued awaited children priority and resumes the parent only after a terminal
+child receipt and reacquisition of an execution slot. The command then prints
+that receipt. A FIFO notification wakes the waiting process; the ledger remains
+authoritative across lost notifications or dispatcher restart. Cancellation
+wakes the wait as a refusal and stops the same admitted child tree.
+
+Use this API instead of keeping a running parent in an application polling
+loop. Four running parents otherwise occupy the default four slots needed by
+their children. Nested child waits follow the same contract. Active execution
+remains bounded by `HEADLONG_JOBS_MAX_CONCURRENT`; the separate bound for
+supervised waiting parents is `HEADLONG_JOBS_MAX_WAITING` (default 32). A full
+waiting budget refuses a new yield without dropping the admitted child.
 
 ## Model attempts
 
@@ -119,6 +149,15 @@ successful attempts replay their durable stdout. Duplicate started or unknown
 attempts return exit 75 and never CREATE again. Distinct stable phase and tool
 continuation IDs permit legitimate multiple completions inside one job.
 
+The attempt controller and bundled `llm` stay in the job group. Adapter
+execution uses an attempt-owned subgroup recorded in the same durable ledger,
+with a reserved group leader and a control-pipe guardian. An adapter deadline
+stops only that attempt's subgroup and returns cancelled/unknown evidence to
+the same handler. Sibling phases and child commissions remain independent.
+Whole-job cancellation or supervisor death closes the guardian's control pipe
+and sweeps the subgroup. A job cannot become terminal while a subgroup still
+holds custody. Standalone `llm` retains its existing deadline behavior.
+
 `thinkers jobs attempts JOB_ID` exposes typed attempt evidence for reconciliation.
 After custody loss, a valid terminal sidecar can settle an attempt, but partial
 stdout is never advertised as a replayable completed response. This operation
@@ -129,7 +168,10 @@ single model phase.
 
 `thinkers jobs cancel JOB_ID` atomically fences that job and its current child
 tree. Subsequent child admissions are refused. A queued job becomes cancelled;
-a running supervisor requests TERM, then stops the entire owned group. The
+a running supervisor requests TERM, then stops the entire owned group after a
+six-second grace for the primitive's remote cancellation receipt. The local
+grace is configurable with `HEADLONG_JOB_CANCEL_GRACE` (0–60 seconds); shortening
+it can leave more remote outcomes unknown. The
 group leader remains unreaped until after killpg, reserving its PID/PGID so
 cancellation cannot target a recycled unrelated process. A control-pipe EOF
 stops descendants if the supervisor crashes. Process-group escape (`setsid`,
@@ -142,6 +184,26 @@ queued admissions, and lets supervised running jobs finish. It is not job
 cancellation. `thinkers start --jobs-only` restarts dispatch; a concurrent start
 fails closed. Legacy `thinkers start` is refused once an identity has selected
 jobs-only mode, including after deletion of `run/`.
+
+Legacy execution needs an explicit migration fence. Before any legacy start,
+Headlong records a durable execution epoch outside `run/`. Pre-upgrade
+identities with an `info.txt` or `thinkers/` directory also receive an untracked
+epoch: absence of old bookkeeping cannot prove they have stopped. Jobs-only
+adoption refuses until trusted operator code verifies that legacy processes and
+effects are quiescent and records evidence for that exact current epoch:
+
+```sh
+thinkers jobs legacy-status
+# => {"legacy_execution":"current-epoch"}
+thinkers jobs retire-legacy < verified-quiescence.json
+# {"legacy_execution":"current-epoch","quiescent":true,
+#  "receipt_ref":"process-and-effect-inventory","receipt_sha256":"...64 lowercase hex..."}
+```
+
+This is a trusted operator attestation, not automatic verification of legacy
+process death. Stale-epoch evidence is refused; a later legacy start invalidates
+the prior retirement. Never fabricate this receipt to work around a lost
+`run/` directory. The application deployment owns the actual migration proof.
 
 Startup reconciles existing custody before scheduling queued work. Live
 supervisor locks remain authoritative after dispatcher death. A started job
@@ -170,6 +232,9 @@ The offline test is `tests/test_durable_jobs.sh`. It exercises concurrent
 admission/dedupe, more than 16 queued jobs, actual handler context, dispatcher
 and supervisor crashes, runtime-directory deletion, descendant cancellation,
 independent concurrent jobs, child fences, typed attempt dedupe, and explicit
-unknown reconciliation. It uses real local processes and synthetic typed
+unknown reconciliation. It also checks the actual `llm` adapter's phase-local
+deadline, sibling settle/commission survival, four parent waits through two
+child levels, and restart/cancellation while waiting. It uses real local
+processes and synthetic typed
 Responses receipts; it does not claim live provider or application effect-door
 verification.

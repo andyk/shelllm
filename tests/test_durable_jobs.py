@@ -45,6 +45,32 @@ if mode=='uncertain':
     while not directory.joinpath('release').exists(): time.sleep(.03)
 if mode=='slowattempt':
     subprocess.run([os.environ['JOB_TEST_TOOL'],'attempt',envelope['job_id'],'fast/1','--',envelope['admitted']['stub']],input=b'hello')
+if mode=='adapter':
+    env=dict(os.environ,LLM_ADAPTER=envelope['admitted']['stub'],LLM_MAX_TIME=envelope['admitted'].get('deadline','600'),LLM_API_FORMAT='responses')
+    subprocess.run([os.environ['JOB_TEST_TOOL'],'attempt',envelope['job_id'],'fast/1','--',envelope['admitted']['llm'],'--provider','adapter','--model','fixture-model'],input=b'hello',env=env)
+if mode=='parallel-adapters':
+    commands=[]
+    for phase,deadline in [('fast/1','1'),('settle/1','10')]:
+        env=dict(os.environ,LLM_ADAPTER=envelope['admitted']['stub'],LLM_MAX_TIME=deadline,LLM_API_FORMAT='responses')
+        command=[os.environ['JOB_TEST_TOOL'],'attempt',envelope['job_id'],phase,'--',envelope['admitted']['llm'],'--provider','adapter','--model','fixture-model']
+        command_process=subprocess.Popen(command,stdin=subprocess.PIPE,env=env)
+        command_process.stdin.write(b'hello'); command_process.stdin.close()
+        commands.append(command_process)
+    directory.joinpath('phases-running').touch()
+    outcomes=[process.wait() for process in commands]
+    directory.joinpath('phase-exits.json').write_text(json.dumps(outcomes))
+if mode=='await-child':
+    directory.joinpath('parent-ready').touch()
+    if envelope['admitted'].get('barrier'):
+        while not Path(os.environ['IDENTITY_DIR']).joinpath('begin-waits').exists(): time.sleep(.03)
+    depth=envelope['admitted']['depth']
+    child=dict(envelope,job_id=envelope['job_id']+'/child',parent_job_id=envelope['job_id'])
+    child['admitted']={'mode':'await-child' if depth>1 else ('hold' if envelope['admitted'].get('leaf_hold') else 'complete'),'depth':depth-1}
+    admitted=subprocess.run([os.environ['JOB_TEST_TOOL'],'admit'],input=json.dumps(child).encode(),capture_output=True)
+    if admitted.returncode: raise RuntimeError(admitted.stderr.decode())
+    receipt=subprocess.run([os.environ['JOB_TEST_TOOL'],'wait-child',envelope['job_id'],child['job_id']],capture_output=True)
+    if receipt.returncode: raise RuntimeError(receipt.stderr.decode())
+    directory.joinpath('child-receipt.json').write_bytes(receipt.stdout)
 if mode=='cooperative':
     def cancel(*_):
         Path(os.environ['HEADLONG_JOB_RESULT_FILE']).write_text(json.dumps({'outcome':'cancelled','evidence':'cooperative local stop'}))
@@ -53,6 +79,7 @@ if mode=='cooperative':
     directory.joinpath('ready').touch()
     while True: time.sleep(.03)
 Path(os.environ['HEADLONG_JOB_RESULT_FILE']).write_text(json.dumps({'outcome':'completed','result':{'subject':envelope['trigger_step']}}))
+if mode=='failed-after-result': sys.exit(1)
 '''
 
 
@@ -77,7 +104,9 @@ class DurableJobs(unittest.TestCase):
         self.identity = Path(self.temp.name) / "identity"
         self.identity.mkdir()
         self.env = dict(os.environ, IDENTITY_DIR=str(self.identity), JOB_TEST_TOOL=str(JOBS),
-                        PATH=str(REPO / "bin") + os.pathsep + os.environ["PATH"], HEADLONG_JOBS_MAX_CONCURRENT="4")
+                        PATH=str(REPO / "bin") + os.pathsep + os.environ["PATH"], HEADLONG_JOBS_MAX_CONCURRENT="4",
+                        HEADLONG_JOB_CANCEL_GRACE="0.2", HEADLONG_HOME=str(self.identity / "framework-home"),
+                        LLM_USAGE_LEDGER=str(self.identity / "usage.jsonl"))
         self.handler = Path(self.temp.name) / "handler"
         self.handler.write_text(HANDLER)
         self.handler.chmod(0o700)
@@ -273,10 +302,10 @@ time.sleep(120)
         self.state("queued", "completed")
         self.assertFalse((self.directory("fenced") / "received.json").exists())
 
-    def test_legacy_start_still_dispatches_in_non_job_identity(self):
+    def test_legacy_dispatch_works_but_custody_loss_refuses_jobs_migration(self):
         thinker = self.identity / "thinkers" / "fixture"
         thinker.mkdir(parents=True)
-        (thinker / "step").write_text('#!/usr/bin/env bash\ncat > "$IDENTITY_DIR/legacy-received"\n')
+        (thinker / "step").write_text('#!/usr/bin/env bash\ncat > "$IDENTITY_DIR/legacy-received"\necho $$ > "$IDENTITY_DIR/legacy-child"\nexec sleep 120\n')
         (thinker / "step").chmod(0o700)
         (thinker / "subscriptions.jsonl").write_text('{"types":["action"]}\n')
         trajectory = self.identity / "trajectories" / "fixture"
@@ -293,9 +322,157 @@ time.sleep(120)
             with (trajectory / "trajectory.jsonl").open("a") as out:
                 out.write('{"type":"action","content":"legacy"}\n')
             wait_for(lambda: (self.identity / "legacy-received").exists())
+            wait_for(lambda: (self.identity / "legacy-child").exists())
+            legacy_child = int((self.identity / "legacy-child").read_text())
+            shutil.rmtree(self.identity / "run")
+            denied = subprocess.run([str(CLI), "start", "--jobs-only"], env=self.env, capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn("legacy execution has not been reconciled", denied.stderr)
+            self.assertTrue(is_running(legacy_child))
+            os.kill(legacy_child, signal.SIGTERM)
+            wait_for(lambda: not is_running(legacy_child) and not is_running(pid))
+            epoch = self.call("legacy-status")["legacy_execution"]
+            evidence = {"quiescent": True, "receipt_ref": "local-process-inventory", "receipt_sha256": "b" * 64}
+            self.call("retire-legacy", data=dict(evidence, legacy_execution="stale-epoch"), success=False)
+            self.call("retire-legacy", data=dict(evidence, legacy_execution=epoch))
+            self.start()
         finally:
-            stopped = subprocess.run([str(CLI), "stop", "--force"], env=env, capture_output=True, text=True, timeout=15)
+            stop_args = ["stop"] if (self.identity / "jobs" / "mode.json").exists() else ["stop", "--force"]
+            stopped = subprocess.run([str(CLI), *stop_args], env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(stopped.returncode, 0, stopped.stderr)
+
+    def test_real_llm_adapter_subgroup_is_owned_on_cancel_deadline_and_crash(self):
+        stub = Path(self.temp.name) / "adapter"
+        stub.write_text('''#!/usr/bin/env python3
+import json,os,signal,sys,time
+from pathlib import Path
+sys.stdin.read()
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+Path(os.environ['HEADLONG_JOB_DIR']).joinpath('adapter.json').write_text(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp()}))
+while True: time.sleep(.05)
+''')
+        stub.chmod(0o700)
+        self.call("admit", data=self.envelope("adapter-cancel", mode="adapter", stub=str(stub), llm=str(REPO / "bin" / "llm")))
+        self.start()
+        wait_for(lambda: (self.directory("adapter-cancel") / "adapter.json").exists())
+        adapter = json.loads((self.directory("adapter-cancel") / "adapter.json").read_text())
+        db = sqlite3.connect(self.identity / "jobs" / "ledger.sqlite3")
+        owned_group = db.execute("SELECT adapter_pgid FROM attempts WHERE job_id='adapter-cancel'").fetchone()[0]
+        db.close()
+        self.assertEqual(adapter["pgid"], owned_group)
+        self.call("cancel", "adapter-cancel")
+        self.state("adapter-cancel", "unknown")
+        wait_for(lambda: not is_running(adapter["pid"]))
+        self.call("admit", data=self.envelope("adapter-deadline", mode="adapter", stub=str(stub), llm=str(REPO / "bin" / "llm"), deadline="1"))
+        wait_for(lambda: (self.directory("adapter-deadline") / "adapter.json").exists())
+        adapter = json.loads((self.directory("adapter-deadline") / "adapter.json").read_text())
+        row = self.state("adapter-deadline", "unknown")
+        self.assertFalse(row["cancel_requested"], "attempt deadline cancelled the whole job")
+        wait_for(lambda: not is_running(adapter["pid"]))
+        self.call("admit", data=self.envelope("adapter-crash", mode="adapter", stub=str(stub), llm=str(REPO / "bin" / "llm")))
+        wait_for(lambda: (self.directory("adapter-crash") / "adapter.json").exists())
+        adapter = json.loads((self.directory("adapter-crash") / "adapter.json").read_text())
+        os.kill(self.dbrow("adapter-crash")["worker_pid"], signal.SIGKILL)
+        self.state("adapter-crash", "unknown")
+        wait_for(lambda: not is_running(adapter["pid"]))
+
+    def test_fast_deadline_preserves_settle_attempt_and_child_commission(self):
+        stub = Path(self.temp.name) / "phase-adapter"
+        stub.write_text('''#!/usr/bin/env python3
+import json,os,sys,time
+from pathlib import Path
+sys.stdin.read()
+if os.environ['HEADLONG_JOB_ATTEMPT_ID']=='fast/1': time.sleep(120)
+else:
+    time.sleep(2)
+    Path(os.environ['LLM_RESPONSE_FILE']).write_text(json.dumps({'id':'response_settle','status':'completed','output':[]}))
+    print('settle completed')
+''')
+        stub.chmod(0o700)
+        self.call("admit", data=self.envelope("parallel", mode="parallel-adapters", stub=str(stub), llm=str(REPO / "bin" / "llm")))
+        self.start()
+        wait_for(lambda: (self.directory("parallel") / "phases-running").exists())
+        child = self.envelope("commission", mode="hold")
+        child["parent_job_id"] = "parallel"
+        self.call("admit", data=child)
+        wait_for(lambda: (self.directory("commission") / "child.pid").exists())
+        row = self.state("parallel", "unknown")
+        self.assertFalse(row["cancel_requested"])
+        self.assertEqual(json.loads((self.directory("parallel") / "phase-exits.json").read_text()), [75, 0])
+        attempts = {row["attempt_id"]: row for row in self.call("attempts", "parallel")}
+        self.assertEqual(attempts["fast/1"]["state"], "unknown")
+        self.assertEqual(attempts["settle/1"]["state"], "completed")
+        commission = self.call("get", "commission")
+        self.assertEqual(commission["state"], "running")
+        self.assertFalse(commission["cancel_requested"])
+        (self.directory("commission") / "release").touch()
+        self.state("commission", "completed")
+
+    def test_four_waiting_parents_release_slots_through_two_child_levels(self):
+        for index in range(4):
+            self.call("admit", data=self.envelope("parent-" + str(index), mode="await-child", depth=2, barrier=True))
+        self.start()
+        for index in range(4):
+            wait_for(lambda index=index: (self.directory("parent-" + str(index)) / "parent-ready").exists())
+        before = {row["job_id"]: row["execution_id"] for row in self.call("list")}
+        (self.identity / "begin-waits").touch()
+        observed = []
+        def all_complete():
+            rows = self.call("list")
+            observed.append(sum(row["state"] in {"starting", "running"} for row in rows))
+            return rows if len(rows) == 12 and all(row["state"] == "completed" for row in rows) else None
+        rows = wait_for(all_complete, timeout=20)
+        self.assertLessEqual(max(observed), 4)
+        for row in rows:
+            if row["job_id"] in before:
+                self.assertEqual(row["execution_id"], before[row["job_id"]])
+                self.assertEqual(json.loads((self.directory(row["job_id"]) / "child-receipt.json").read_text())["state"], "completed")
+
+    def test_cancellation_wakes_waiting_parent_and_stops_its_child(self):
+        self.call("admit", data=self.envelope("waiting", mode="await-child", depth=1, leaf_hold=True))
+        self.call("wait-child", "waiting", "wrong-child", success=False)
+        self.start()
+        self.state("waiting", "waiting")
+        wait_for(lambda: (self.directory("waiting/child") / "child.pid").exists())
+        child_pid = int((self.directory("waiting/child") / "child.pid").read_text())
+        self.call("cancel", "waiting")
+        self.state("waiting", "unknown")
+        self.state("waiting/child", "unknown")
+        wait_for(lambda: not is_running(child_pid))
+
+    def test_waiting_parent_restart_preserves_execution_and_crash_stays_unknown(self):
+        envelope = self.envelope("waiting-restart", mode="await-child", depth=1, leaf_hold=True)
+        self.call("admit", data=envelope)
+        dispatcher = self.start()
+        row = self.state("waiting-restart", "waiting")
+        wait_for(lambda: (self.directory("waiting-restart/child") / "child.pid").exists())
+        execution = row["execution_id"]
+        os.kill(dispatcher, signal.SIGKILL)
+        wait_for(lambda: not is_running(dispatcher))
+        shutil.rmtree(self.identity / "run")
+        self.start()
+        self.assertEqual(self.state("waiting-restart", "waiting")["execution_id"], execution)
+        os.kill(self.dbrow("waiting-restart")["worker_pid"], signal.SIGKILL)
+        self.state("waiting-restart", "unknown")
+        repeated = self.call("admit", data=envelope)
+        self.assertEqual(repeated["state"], "unknown")
+        self.assertEqual(repeated["execution_id"], execution)
+        self.assertEqual(len(self.call("list")), 2)
+        self.call("cancel", "waiting-restart")
+        self.state("waiting-restart/child", "unknown")
+
+    def test_completed_handler_receipt_cannot_hide_nonzero_exit(self):
+        self.call("admit", data=self.envelope("failed", mode="failed-after-result"))
+        self.start()
+        row = self.state("failed", "unknown")
+        self.assertEqual(row["result"]["reason"], "handler_did_not_exit_successfully")
+
+    def test_preupgrade_identity_requires_explicit_quiescence(self):
+        (self.identity / "info.txt").write_text("name=historical\n")
+        denied = subprocess.run([str(CLI), "start", "--jobs-only"], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("legacy execution has not been reconciled", denied.stderr)
+        self.assertTrue(self.call("legacy-status")["legacy_execution"].startswith("untracked-"))
 
     def test_parent_cancel_fence_and_cooperative_terminal(self):
         self.call("admit", data=self.envelope("parent", mode="cooperative"))
