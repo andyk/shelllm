@@ -16,7 +16,8 @@ Response retrieval/deletion/cancellation, input-item listing, Conversations,
 and WebSocket mode are separate lifecycle work (design/responses-lifecycle.md).
 Background responses live in `bin/llm` because the caller still receives one
 terminal object per call: llm polls or resumes the stream itself and cancels
-the job when it is killed or out of time; the contract is in that document.
+the job best effort when it is killed or out of time; the contract is in that
+document. Cancellation requests do not guarantee server settlement.
 
 ## Wire contract
 
@@ -35,8 +36,10 @@ the job when it is killed or out of time; the contract is in that document.
 - `LLM_RESPONSES_BODY_FILE` may name a JSON object containing other synchronous
   create fields. `bin/llm` owns and overwrites `model`, `input`, `instructions`,
   `max_output_tokens`, `stream`, and `previous_response_id` so command-line and
-  continuation semantics remain deterministic. Conversation state is rejected
-  because it conflicts with this continuation contract.
+  continuation semantics remain deterministic. A body-file `conversation` or
+  `LLM_RESPONSES_CONVERSATION` selects Conversation state instead, and cannot be
+  combined with `LLM_PREVIOUS_RESPONSE_ID`. Shellm requires its dedicated
+  `SHELLM_RESPONSES_CONVERSATION` setting rather than a body-file Conversation.
 - Every create requests `reasoning.encrypted_content`, preserving exact
   reasoning-item replay for stateless and Zero Data Retention paths while
   retaining any other caller-supplied `include` values.
@@ -61,19 +64,21 @@ terminal response from `response.completed`, `response.incomplete`, or
 Incomplete responses warn with their reason. Failed responses and `error`
 events fail the call.
 
-Retries remain legal only before protocol output is emitted. A terminal output
-item counts as output even when it is a function call with no visible text.
-After a text, reasoning, or output-item event, a truncated or failed stream is
-never replayed automatically.
+**HTTP hardening contract:** Responses
+CREATE is not automatically retried after uncertain failure. No emitted output
+does not prove no generation began; unknown results fail with
+`error.code=outcome_unknown`. Chat retry policy is unchanged. Known background
+responses may be retrieved/resumed, not recreated. Immediate, polled, and
+streamed terminal objects share validation; cancelled, failed, malformed, or
+embedded-error replies cannot be reported as successful completions.
 
-The shared stream retry loop keeps its pre-existing rule for every protocol:
-any failure before output is retried, whatever the handler's exit status (an
-Anthropic overloaded error arrives as an in-stream event and exits 1). The one
-exception is a rejected `previous_response_id`, which is deterministic. The
-Responses handler reports it through a private exit code (`die_permanent`) so
-the loop stops at once and `shellm` can fall back to its replay chain without
-waiting through retries. That decision is made on the error body alone and
-does not depend on `LLM_RESPONSE_FILE` being set.
+One absolute `LLM_MAX_TIME` budget covers create, polling, reconnects, and
+backoff, plus up to five additional seconds for best-effort cancellation.
+Confirmation requires the same response ID and a terminal status; otherwise
+the unknown-outcome sidecar and known ID remain available for reconciliation.
+See [the lifecycle contract](responses-lifecycle.md#background-responses-binllm).
+A deterministic rejection of `previous_response_id` still allows shellm's
+explicit replay fallback; an uncertain create outcome does not.
 
 `LLM_STOP_AFTER_CODE_BLOCK` keeps its contract in Responses mode: the stream
 is cut when the first fenced block closes and the cut is a clean finish. The
@@ -83,7 +88,8 @@ continuation needs the terminal object.
 
 ## shellm continuation
 
-Responses mode keeps completion state only for the current `shellm` process:
+Without Conversation mode, Responses keeps completion state only for the current
+`shellm` process:
 
 1. The first call sends the trajectory-derived context in full.
 2. Later calls send only newly appended user-side context plus the stable
@@ -106,13 +112,22 @@ Responses mode keeps completion state only for the current `shellm` process:
 5. A resumed process starts a new chain from the durable trajectory. Remote
    response IDs are not persisted as durable trajectory state.
 
+Conversation mode instead restores local atomic mode-0600 sent-step checkpoints
+and holds a local exclusive lock for the whole run. Ambiguous delivery and
+stale locks fail closed without automatic stealing; this is not fsync-backed
+power-loss durability or distributed coordination. See
+[Conversations](responses-lifecycle.md#conversations) for resume and ownership.
+
 `SHELLM_RESPONSES_BODY_FILE` is mounted read-only into the Docker sandbox at
 its host path, so nested `llm` and `shellm` calls inside the container read
 the same file.
 
-OpenRouter's Responses endpoint is stateless and therefore starts directly in
-replay mode. Native OpenAI and generic compatible endpoints use automatic
-stateful continuation with the safe replay fallback.
+OpenRouter's Responses endpoint and explicit `store:false` start directly in
+replay mode. Otherwise native OpenAI and generic compatible endpoints use
+automatic stateful continuation with the safe replay fallback. Compaction
+capability is independent: native OpenAI supports server compaction with
+stateless replay; see [compaction](responses-lifecycle.md#compaction) for
+`SHELLM_RESPONSES_COMPACT_MODE=auto|server|standalone`.
 
 The existing thinking-text empty-response workaround remains the Chat
 Completions behavior. In Responses mode, an incomplete reasoning-only Response

@@ -30,7 +30,7 @@ IDENTITIES="ask"      # ask | keep | delete
 # tests/test_uninstall.sh checks the two lists agree.
 TOOLS=(shellm shellm-docker skills mem llm responses context traj thinkers chat recap
        shellm-docker-broker identity shellm-explore headlong-skills headlong-init headlong-killall persona headlong-web
-       headlong-slack-bridge headlong-telegram-bridge headlong-tui)
+       headlong-slack-bridge headlong-telegram-bridge responses-ws headlong-tui)
 
 _usage() {
     cat <<'EOF'

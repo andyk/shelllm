@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["websockets>=13"]
+# dependencies = ["websockets==17.1"]
 # ///
 """WebSocket transport for the OpenAI Responses API, as a headlong adapter.
 
@@ -33,6 +33,7 @@ import socket
 import sys
 import time
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 
 import websockets
 from websockets.asyncio.client import connect as ws_connect
@@ -50,8 +51,13 @@ DEFAULT_URL = "wss://api.openai.com/v1/responses"
 MAX_IN_FLIGHT = 16
 MAX_LANES = 32
 CONNECTION_MAX_AGE = 55 * 60
+MAX_FRAME = 16 * 1024 * 1024  # UTF-8 bytes, excluding the local newline
+MAX_QUEUE_EVENTS = 64
+MAX_QUEUE_BYTES = MAX_FRAME
+MAX_CLIENTS = 32  # Active plus queued local calls; reject excess admission.
+IO_TIMEOUT = 30
 
-TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed")
+TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed", "response.cancelled")
 
 
 def die(message: str) -> None:
@@ -82,15 +88,27 @@ def build_create(args, input_items) -> dict:
     Mirrors bin/llm's build_payload_responses so the two transports send the
     same request: the caller's extra body is the base, llm owns the fields
     coupled to its CLI, and encrypted reasoning content is always requested so
-    a stateless replay keeps exact reasoning items. Fields that belong to the
-    HTTP transport rather than the request (stream, background) are dropped,
-    because in WebSocket mode every response streams and the connection is the
-    thing that stays open.
+    a stateless replay keeps exact reasoning items. WebSocket responses always
+    stream; unsupported lifecycle and policy settings are rejected, not dropped.
     """
     body = {}
     body_file = os.environ.get("LLM_RESPONSES_BODY_FILE", "")
     if body_file:
         body.update(read_body_file(body_file))
+    background = os.environ.get("LLM_RESPONSES_BACKGROUND", "")
+    if background not in ("", "0", "1"):
+        die("LLM_RESPONSES_BACKGROUND must be 0 or 1")
+    # An explicit foreground override has the same precedence as HTTP. Only
+    # an effectively background request is unsupported; never silently drop it.
+    if background == "0":
+        body.pop("background", None)
+    if background == "1" or body.get("background") is True:
+        die("background responses are not supported over WebSocket; use HTTP")
+    if body.get("background") is not None and body.get("background") is not False:
+        die("background must be a boolean")
+    for field in ("stream_options", "provider"):
+        if field in body:
+            die("%s is not supported over WebSocket" % field)
     body.pop("stream", None)
     body.pop("background", None)
 
@@ -104,10 +122,16 @@ def build_create(args, input_items) -> dict:
                 body["instructions"] = handle.read()
         except OSError as exc:
             die("cannot read --system-prompt-file: %s" % exc)
+    else:
+        body.pop("instructions", None)
+    if not body.get("instructions"):
+        body.pop("instructions", None)
 
     previous = os.environ.get("LLM_PREVIOUS_RESPONSE_ID", "")
     if previous:
         body["previous_response_id"] = previous
+    else:
+        body.pop("previous_response_id", None)
 
     # Server-held conversation state, the alternative to the id chain. llm
     # refuses the pair before it reaches an adapter, so this is a plain
@@ -115,14 +139,26 @@ def build_create(args, input_items) -> dict:
     conversation = os.environ.get("LLM_RESPONSES_CONVERSATION", "")
     if conversation:
         body["conversation"] = conversation
+    if previous and body.get("conversation") is not None:
+        die("conversation and previous_response_id cannot both be set; pick one")
+
+    threshold = os.environ.get("LLM_RESPONSES_COMPACT_THRESHOLD", "")
+    if threshold:
+        if not threshold.isascii() or not threshold.isdecimal() or int(threshold) <= 0:
+            die("LLM_RESPONSES_COMPACT_THRESHOLD must be a positive integer")
+        body["context_management"] = [{"type": "compaction", "compact_threshold": int(threshold)}]
 
     effort = args.thinking if args.thinking else args.effort
     if effort:
+        if body.get("reasoning") is not None and not isinstance(body["reasoning"], dict):
+            die("reasoning must be an object")
         reasoning = dict(body.get("reasoning") or {})
         reasoning["effort"] = effort
         reasoning["summary"] = "auto"
         body["reasoning"] = reasoning
 
+    if body.get("include") is not None and not isinstance(body["include"], list):
+        die("include must be an array")
     include = list(body.get("include") or [])
     if "reasoning.encrypted_content" not in include:
         include.append("reasoning.encrypted_content")
@@ -239,10 +275,10 @@ class Emitter:
         if kind in ("response.completed", "response.incomplete"):
             self._finish(event.get("response") or {}, kind)
             return True
-        if kind == "response.failed":
+        if kind in ("response.failed", "response.cancelled"):
             response = event.get("response") or {}
             write_sidecar(response)
-            message = ((response.get("error") or {}).get("message")) or "response failed"
+            message = ((response.get("error") or {}).get("message")) or kind
             sys.stderr.write("responses-ws: error: %s\n" % message)
             self.terminal = True
             self.exit_code = 1
@@ -261,6 +297,12 @@ class Emitter:
         return False
 
     def _finish(self, response, kind: str) -> None:
+        if (not isinstance(response, dict) or response.get("error") is not None
+                or response.get("status") != kind.removeprefix("response.")
+                or not isinstance(response.get("id"), str) or not response["id"]
+                or not isinstance(response.get("output"), list)):
+            self.feed(transport_error("invalid terminal response"))
+            return
         self.terminal = True
         write_sidecar(response)
         write_usage(response)
@@ -285,13 +327,40 @@ class Emitter:
 # ---------------------------------------------------------------------------
 
 
+def encode_frame(obj) -> bytes:
+    raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(raw) > MAX_FRAME:
+        raise ValueError("frame_too_large: maximum JSON frame is 16 MiB")
+    return raw
+
+
+async def read_line(reader):
+    try:
+        raw = await reader.readline()
+    except ValueError:
+        raise ValueError("frame_too_large: maximum JSON frame is 16 MiB") from None
+    if len(raw.rstrip(b"\n")) > MAX_FRAME:
+        raise ValueError("frame_too_large: maximum JSON frame is 16 MiB")
+    if raw and not raw.endswith(b"\n"):
+        raise ValueError("incomplete JSON frame")
+    return raw
+
+
 def send_line(writer, obj) -> None:
-    writer.write((json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8"))
+    writer.write(encode_frame(obj) + b"\n")
 
 
 async def drain_line(writer, obj) -> None:
     send_line(writer, obj)
-    await writer.drain()
+    await asyncio.wait_for(writer.drain(), IO_TIMEOUT)
+
+
+async def close_writer(writer):
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), IO_TIMEOUT)
+    except (OSError, asyncio.TimeoutError):
+        writer.transport.abort()
 
 
 def socket_is_live(path: str) -> bool:
@@ -313,45 +382,86 @@ def socket_is_live(path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def endpoint_config():
+    """Resolve the underlying provider before choosing destination or credentials.
+
+    An explicit URL is authoritative (including its path and query). Merely
+    selecting this adapter must never turn a compatible request into OpenAI.
+    """
+    provider = os.environ.get("RESPONSES_WS_PROVIDER", "")
+    if not provider:
+        provider = os.environ.get("LLM_PROVIDER", "")
+        if provider == "adapter":
+            provider = ""
+    configured_url = os.environ.get("LLM_API_URL") or os.environ.get("SHELLM_API_URL")
+    provider = provider or ("openai-compatible" if configured_url else "openai")
+    if provider not in ("openai", "openai-compatible"):
+        die("provider %s is not supported over WebSocket; use HTTP" % provider)
+    for setting in ("LLM_OR_ONLY", "LLM_OR_DATA_COLLECTION", "LLM_OR_ZDR"):
+        if os.environ.get(setting):
+            die("%s policy cannot be enforced over this WebSocket transport" % setting)
+    if os.environ.get("LLM_STOP_AFTER_CODE_BLOCK", "0") != "0":
+        die("LLM_STOP_AFTER_CODE_BLOCK is not supported over WebSocket")
+    url = os.environ.get("RESPONSES_WS_URL") or configured_url
+    if not url:
+        if provider == "openai-compatible":
+            die("LLM_API_URL is required for openai-compatible (or RESPONSES_WS_URL)")
+        url = DEFAULT_URL
+    try:
+        parts = urlsplit(url)
+        scheme = {"http": "ws", "https": "wss"}.get(parts.scheme, parts.scheme)
+        if scheme not in ("ws", "wss") or not parts.hostname or parts.username or parts.password or parts.fragment:
+            raise ValueError()
+        url = urlunsplit((scheme, parts.netloc, parts.path, parts.query, ""))
+    except ValueError:
+        die("invalid WebSocket endpoint: expected http(s) or ws(s), without userinfo or fragment")
+    key = os.environ.get("OPENAI_API_KEY" if provider == "openai" else "LLM_API_KEY", "")
+    return url, key
+
+
 def connect_kwargs():
-    key = os.environ.get("OPENAI_API_KEY", "")
+    _, key = endpoint_config()
     headers = {}
     if key:
         # The key travels in a header, never on argv, for the same reason
         # bin/llm's add_auth_header exists: argv is world readable.
         headers["Authorization"] = "Bearer %s" % key
-    return {"additional_headers": headers, "max_size": None}
+    return {"additional_headers": headers, "max_size": MAX_FRAME, "max_queue": 16,
+            "open_timeout": 10, "close_timeout": 5}
 
 
 async def run_one_shot(url: str, create: dict, emitter: Emitter) -> int:
+    identity = ResponseIdentity()
     try:
+        payload = encode_frame(create).decode("utf-8")
         async with ws_connect(url, **connect_kwargs()) as ws:
-            await ws.send(json.dumps(create, separators=(",", ":")))
+            await ws.send(payload)
             async for raw in ws:
-                try:
-                    event = json.loads(raw)
-                except ValueError:
-                    continue
+                event = json.loads(raw)
+                identity.validate(event)
                 if emitter.feed(event):
                     break
-    except OSError as exc:
-        sys.stderr.write("responses-ws: error: cannot reach %s: %s\n" % (url, exc))
-        return 1
-    except websockets.exceptions.WebSocketException as exc:
-        sys.stderr.write("responses-ws: error: websocket failed: %s\n" % exc)
+    except (OSError, ValueError, websockets.exceptions.WebSocketException) as exc:
+        error = transport_error("WebSocket failure; response outcome unknown: %s" % exc)
+        if identity.response_id:
+            error["id"] = identity.response_id
+        emitter.feed(error)
         return 1
     if not emitter.terminal:
-        sys.stderr.write("responses-ws: error: connection closed before a terminal event\n")
+        error = transport_error("connection closed before a terminal event")
+        if identity.response_id:
+            error["id"] = identity.response_id
+        emitter.feed(error)
         return 1
     return emitter.exit_code
 
 
 async def run_via_broker(path: str, create: dict, emitter: Emitter) -> int:
-    reader, writer = await asyncio.open_unix_connection(path)
+    reader, writer = await asyncio.open_unix_connection(path, limit=MAX_FRAME + 1)
     try:
         await drain_line(writer, {"op": "create", "body": create})
         while True:
-            raw = await reader.readline()
+            raw = await read_line(reader)
             if not raw:
                 break
             try:
@@ -359,18 +469,16 @@ async def run_via_broker(path: str, create: dict, emitter: Emitter) -> int:
             except ValueError:
                 continue
             if message.get("op") == "error":
-                sys.stderr.write("responses-ws: error: %s\n" % message.get("message", "broker error"))
+                emitter.feed(transport_error(message.get("message", "broker error")))
                 return 1
             if message.get("op") != "event":
                 continue
             if emitter.feed(message.get("event") or {}):
                 break
     finally:
-        writer.close()
-        with contextlib.suppress(Exception):
-            await writer.wait_closed()
+        await close_writer(writer)
     if not emitter.terminal:
-        sys.stderr.write("responses-ws: error: broker closed before a terminal event\n")
+        emitter.feed(transport_error("broker closed before a terminal event"))
         return 1
     return emitter.exit_code
 
@@ -378,7 +486,10 @@ async def run_via_broker(path: str, create: dict, emitter: Emitter) -> int:
 def run_adapter(args) -> int:
     if args.api_format != "responses":
         die("only --api-format responses is supported (this adapter speaks the Responses protocol)")
-    raw_input_items = sys.stdin.read()
+    url, _ = endpoint_config()  # Validate even when using a broker.
+    raw_input_items = sys.stdin.read(MAX_FRAME + 1)
+    if len(raw_input_items.encode("utf-8")) > MAX_FRAME:
+        die("frame_too_large: maximum input is 16 MiB")
     try:
         input_items = json.loads(raw_input_items) if raw_input_items.strip() else []
     except ValueError as exc:
@@ -387,9 +498,10 @@ def run_adapter(args) -> int:
     emitter = Emitter(stream=not args.no_stream)
 
     broker = os.environ.get("RESPONSES_WS_SOCKET", "")
-    if broker and socket_is_live(broker):
+    if broker:
+        # A configured broker is authoritative. Its absence is not permission
+        # to dispatch the model request through a new independent connection.
         return asyncio.run(run_via_broker(broker, create, emitter))
-    url = os.environ.get("RESPONSES_WS_URL", "") or DEFAULT_URL
     return asyncio.run(run_one_shot(url, create, emitter))
 
 
@@ -398,77 +510,171 @@ def run_adapter(args) -> int:
 # ---------------------------------------------------------------------------
 
 
+def transport_error(message, code="outcome_unknown"):
+    return {"type": "error", "error": {"code": code, "message": message}}
+
+
+class ResponseIdentity:
+    def __init__(self):
+        self.response_id = None
+
+    def validate(self, event):
+        if not isinstance(event, dict):
+            raise ValueError("malformed upstream event: expected an object")
+        response = event.get("response")
+        if response is not None and not isinstance(response, dict):
+            raise ValueError("malformed upstream response")
+        ids = [event.get("response_id"), (response or {}).get("id")]
+        for rid in ids:
+            if rid is None:
+                continue
+            if not isinstance(rid, str) or not rid:
+                raise ValueError("invalid response ID")
+            if self.response_id is not None and self.response_id != rid:
+                raise ValueError("response ID mismatch")
+            self.response_id = rid
+
+
+class Lane(ResponseIdentity):
+    def __init__(self):
+        super().__init__()
+        self.queue = asyncio.Queue(maxsize=MAX_QUEUE_EVENTS)
+        self.queued_bytes = 0
+        self.settled = False
+
+    def put(self, event):
+        size = len(encode_frame({"op": "event", "event": event}))
+        if self.queued_bytes + size > MAX_QUEUE_BYTES or self.queue.full():
+            raise ValueError("slow consumer: bounded event queue exceeded")
+        self.queue.put_nowait((event, size))
+        self.queued_bytes += size
+
+    def fail(self, event):
+        # Retirement must never wait on a slow downstream consumer.
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.queued_bytes = 0
+        self.put(event)
+
+
+class Connection:
+    """An exact ownership generation, never shared with its replacement."""
+    def __init__(self, ws):
+        self.ws = ws
+        self.opened_at = time.monotonic()
+        self.lanes = {}
+        self.free_lanes = ["lane-%d" % i for i in range(MAX_LANES)]
+        self.retired = False
+
+
 class Broker:
     def __init__(self, url: str, idle_seconds: float):
         self.url = url
         self.idle_seconds = idle_seconds
-        self.ws = None
-        self.opened_at = 0.0
-        self.reader_task = None
+        self.connection = None
+        self.tasks = set()
         self.lock = asyncio.Lock()
-        self.lanes = {}
-        self.free_lanes = ["lane-%d" % i for i in range(MAX_LANES)]
         self.slots = asyncio.Semaphore(MAX_IN_FLIGHT)
+        self.clients = 0
         self.last_activity = time.monotonic()
         self.stopping = asyncio.Event()
 
+    def track(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
     async def ensure_connection(self):
-        async with self.lock:
-            stale = self.ws is not None and (time.monotonic() - self.opened_at) > CONNECTION_MAX_AGE
-            if stale and not self.lanes:
-                await self.close_connection()
-            if self.ws is None:
-                self.ws = await ws_connect(self.url, **connect_kwargs())
-                self.opened_at = time.monotonic()
-                self.reader_task = asyncio.create_task(self._read_forever(self.ws))
-            return self.ws
+        """Called under the admission lock, BEFORE inserting a lane."""
+        generation = self.connection
+        if generation and time.monotonic() - generation.opened_at > CONNECTION_MAX_AGE:
+            if not generation.lanes:
+                self.retire(generation, transport_error("idle connection rotated"))
+        if self.connection is None:
+            ws = await ws_connect(self.url, **connect_kwargs())
+            self.connection = Connection(ws)
+            self.track(self._read_forever(self.connection))
+        return self.connection
+
+    def retire(self, generation, error):
+        if generation.retired:
+            return
+        generation.retired = True
+        if self.connection is generation:
+            self.connection = None
+        try:
+            encode_frame({"op": "event", "event": error})
+        except ValueError:
+            error = transport_error("frame_too_large: upstream error exceeds local frame limit")
+        for state in generation.lanes.values():
+            # A valid terminal already received remains deliverable even if
+            # the server closes immediately afterward. It isn't in flight.
+            if not state.settled:
+                state.fail(error)
+        # Detach synchronously; old readers, relays and close callbacks only
+        # ever access their captured generation, even after new admission.
+        self.track(self._close(generation.ws))
+
+    async def _close(self, ws):
+        with contextlib.suppress(Exception):
+            await ws.close()
 
     async def close_connection(self):
-        ws, self.ws = self.ws, None
-        if ws is not None:
-            with contextlib.suppress(Exception):
-                await ws.close()
+        if self.connection:
+            self.retire(self.connection, transport_error("broker stopped; response outcome unknown"))
+        if self.tasks:
+            await asyncio.gather(*list(self.tasks), return_exceptions=True)
 
-    async def _read_forever(self, ws):
-        """One reader per connection, fanning events out to their lanes.
-
-        Events are routed by stream_id. A server that omits it while exactly
-        one lane is open still lands correctly, which keeps a single-caller
-        broker working without guessing when several lanes are in flight.
-        """
+    async def _read_forever(self, generation):
+        error = transport_error("connection closed before terminal settlement; response outcome unknown")
         try:
-            async for raw in ws:
-                try:
-                    event = json.loads(raw)
-                except ValueError:
-                    continue
+            async for raw in generation.ws:
+                if generation.retired:
+                    return
+                event = json.loads(raw)
+                if not isinstance(event, dict):
+                    raise ValueError("malformed upstream event")
                 lane = event.get("stream_id")
-                if lane is None and len(self.lanes) == 1:
-                    lane = next(iter(self.lanes))
-                queue = self.lanes.get(lane)
-                if queue is not None:
-                    await queue.put(event)
-        except Exception:
-            pass
+                if lane is None and event.get("type") == "error":
+                    error = event  # Connection errors retain the provider diagnostic.
+                    return
+                if lane is None and len(generation.lanes) == 1:
+                    lane = next(iter(generation.lanes))
+                state = generation.lanes.get(lane)
+                if state is None:
+                    raise ValueError("upstream event has no owned stream_id")
+                if state.settled:
+                    raise ValueError("upstream event after terminal settlement")
+                state.validate(event)
+                if state.response_id and any(
+                    other is not state and other.response_id == state.response_id
+                    for other in generation.lanes.values()
+                ):
+                    raise ValueError("response ID belongs to another stream_id")
+                state.put(event)
+                if event.get("type") in TERMINAL_EVENTS or event.get("type") == "error":
+                    state.settled = True
+        except Exception as exc:
+            error = transport_error("WebSocket failure; response outcome unknown: %s" % exc)
         finally:
-            # A closed connection is not an error for the broker, only for the
-            # calls riding it: tell them so they fail instead of hanging, and
-            # let the next call reconnect.
-            for queue in list(self.lanes.values()):
-                await queue.put({"__closed__": True})
-            if self.ws is ws:
-                self.ws = None
+            self.retire(generation, error)
 
     async def handle(self, reader, writer):
+        relay = disconnected = None
+        admitted = self.clients < MAX_CLIENTS
+        if admitted:
+            self.clients += 1
         try:
-            raw = await reader.readline()
+            if not admitted:
+                await drain_line(writer, {"op": "error", "message": "broker_busy: local client limit reached"})
+                return
+            raw = await asyncio.wait_for(read_line(reader), IO_TIMEOUT)
             if not raw:
                 return
-            try:
-                message = json.loads(raw)
-            except ValueError:
-                await drain_line(writer, {"op": "error", "message": "malformed request"})
-                return
+            message = json.loads(raw)
+            if not isinstance(message, dict):
+                raise ValueError("malformed request: expected an object")
             op = message.get("op")
             if op == "stop":
                 await drain_line(writer, {"op": "stopped"})
@@ -477,51 +683,62 @@ class Broker:
             if op != "create":
                 await drain_line(writer, {"op": "error", "message": "unknown op %r" % op})
                 return
-            await self._relay(message.get("body") or {}, writer)
-        except (ConnectionResetError, BrokenPipeError):
-            pass
+            body = message.get("body")
+            if not isinstance(body, dict) or body.get("type") != "response.create":
+                raise ValueError("malformed response.create body")
+            relay = asyncio.create_task(self._relay(body, writer))
+            # EOF (or unexpected extra input) is abandonment, even while a
+            # request is queued for admission or upstream remains silent.
+            disconnected = asyncio.create_task(reader.read(1))
+            done, _ = await asyncio.wait((relay, disconnected), return_when=asyncio.FIRST_COMPLETED)
+            if relay in done:
+                await relay
+        except (OSError, ValueError, asyncio.TimeoutError) as exc:
+            with contextlib.suppress(OSError, asyncio.TimeoutError):
+                await drain_line(writer, {"op": "error", "message": str(exc) or "local I/O timeout"})
         finally:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
+            for task in (relay, disconnected):
+                if task is not None:
+                    task.cancel()
+            await asyncio.gather(*(t for t in (relay, disconnected) if t is not None), return_exceptions=True)
+            if admitted:
+                self.clients -= 1
+            await close_writer(writer)
 
     async def _relay(self, body, writer):
         self.last_activity = time.monotonic()
         await self.slots.acquire()
-        lane = None
-        queue = asyncio.Queue()
+        generation = state = lane = None
         try:
-            while not self.free_lanes:
-                await asyncio.sleep(0.01)
-            lane = self.free_lanes.pop(0)
-            self.lanes[lane] = queue
-            body = dict(body)
-            body["stream_id"] = lane
-            try:
-                ws = await self.ensure_connection()
-                await ws.send(json.dumps(body, separators=(",", ":")))
-            except Exception as exc:
-                await drain_line(writer, {"op": "error", "message": "connect failed: %s" % exc})
-                return
+            async with self.lock:
+                generation = await self.ensure_connection()
+                lane = generation.free_lanes.pop(0)
+                state = Lane()
+                generation.lanes[lane] = state
+                body = dict(body, stream_id=lane)
+                await generation.ws.send(encode_frame(body).decode("utf-8"))
             while True:
-                event = await queue.get()
-                if event.get("__closed__"):
-                    await drain_line(writer, {"op": "error", "message": "connection closed before a terminal event"})
-                    return
+                event, size = await state.queue.get()
+                state.queued_bytes -= size
                 await drain_line(writer, {"op": "event", "event": event})
                 if event.get("type") in TERMINAL_EVENTS or event.get("type") == "error":
                     return
+        except (OSError, ValueError, websockets.exceptions.WebSocketException) as exc:
+            await drain_line(writer, {"op": "event", "event": transport_error(str(exc))})
         finally:
-            if lane is not None:
-                self.lanes.pop(lane, None)
-                self.free_lanes.append(lane)
+            if state is not None:
+                if not state.settled:
+                    self.retire(generation, transport_error("caller abandoned or transport failed; response outcome unknown"))
+                if generation.lanes.get(lane) is state:
+                    del generation.lanes[lane]
+                    generation.free_lanes.append(lane)
             self.slots.release()
             self.last_activity = time.monotonic()
 
     async def watch_idle(self):
         while not self.stopping.is_set():
             await asyncio.sleep(1)
-            if self.lanes:
+            if self.connection and self.connection.lanes:
                 self.last_activity = time.monotonic()
                 continue
             if time.monotonic() - self.last_activity >= self.idle_seconds:
@@ -540,7 +757,7 @@ async def serve(path: str, idle_seconds: float, url: str) -> int:
     # chmod.
     previous_umask = os.umask(0o077)
     try:
-        server = await asyncio.start_unix_server(broker.handle, path=path)
+        server = await asyncio.start_unix_server(broker.handle, path=path, limit=MAX_FRAME + 1)
     finally:
         os.umask(previous_umask)
     with contextlib.suppress(OSError):
@@ -561,17 +778,17 @@ async def stop(path: str) -> int:
     if not socket_is_live(path):
         return 0
     try:
-        reader, writer = await asyncio.open_unix_connection(path)
+        reader, writer = await asyncio.open_unix_connection(path, limit=MAX_FRAME + 1)
     except OSError:
         return 0
     try:
         await drain_line(writer, {"op": "stop"})
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(reader.readline(), timeout=5)
+        raw = await asyncio.wait_for(read_line(reader), timeout=5)
+        if not raw or json.loads(raw).get("op") != "stopped":
+            sys.stderr.write("responses-ws: error: broker did not acknowledge stop\n")
+            return 1
     finally:
-        writer.close()
-        with contextlib.suppress(Exception):
-            await writer.wait_closed()
+        await close_writer(writer)
     return 0
 
 
@@ -587,8 +804,8 @@ def main(argv) -> int:
         if argv[0] == "serve":
             parser.add_argument("--idle", type=float, default=float(os.environ.get("RESPONSES_WS_IDLE", "10")))
         args = parser.parse_args(argv[1:])
-        url = os.environ.get("RESPONSES_WS_URL", "") or DEFAULT_URL
         if argv[0] == "serve":
+            url, _ = endpoint_config()
             return asyncio.run(serve(args.socket, max(args.idle, 0.1) * 60, url))
         return asyncio.run(stop(args.socket))
 
@@ -609,3 +826,5 @@ if __name__ == "__main__":
         raise SystemExit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         raise SystemExit(130)
+    except (OSError, ValueError, asyncio.TimeoutError) as exc:
+        die(str(exc) or "local I/O timeout")

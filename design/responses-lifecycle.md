@@ -8,6 +8,12 @@ have run for a while. Landed as fork PRs #2 (bin/responses), #3 (background),
 #4 (WebSocket), #5 (compaction) and #6 (Conversations) on the integration
 branch `feat/responses-lifecycle` (PR #1).
 
+The PR #1 hardening contracts below distinguish local recovery safeguards from
+server guarantees. The HTTP completion changes are specified under
+**Background responses**; the Conversation,
+compaction, lifecycle CLI, and WebSocket descriptions reflect the current
+implementation.
+
 ## Why a second surface
 
 `bin/llm` is the completion boundary: one request, one terminal object. The
@@ -64,13 +70,20 @@ developers.openai.com/api/docs/api-reference before pinning a test):
 | cancel | `POST /responses/{id}/cancel` (background responses only; idempotent) |
 | delete | `DELETE /responses/{id}` returns `{id, object:"response", deleted:true}` |
 | input-items | `GET /responses/{id}/input_items` with `after`, `limit` (1-100, default 20), `order` (default desc), `include[]`; list object with `data`, `first_id`, `last_id`, `has_more` |
-| compact | `POST /responses/compact` with `model`, `input` or `previous_response_id`, `instructions`; the reply's output window starts with a `compaction` item carrying `encrypted_content` |
+| compact | `POST /responses/compact` with `model`, `input` or `previous_response_id`, `instructions`; the reply's `output` is the canonical next window, preserved as-is |
 | conversations create | `POST /conversations` with `items` (max 20), `metadata` |
 | conversations get / update / delete | `GET`, `POST` (`metadata` only), `DELETE /conversations/{cid}` |
 | conversations items / add / item / remove | `GET`, `POST` (`items`, max 20), `GET`, `DELETE` under `/conversations/{cid}/items` |
 
 `--all` follows `has_more` with `after=<last id>` and prints one merged list
-object. `--stream` on `get` prints each SSE `data:` payload as one JSON line
+object only after verified exhaustion. Malformed pages, empty continuing pages,
+cursor cycles, duplicate item IDs, or continuing past 500 pages fail rather
+than claiming `has_more:false`. List transfers and the aggregate are bounded
+to 64 MiB. This is not a snapshot guarantee during concurrent server changes.
+Temporary auth, body, and response files live in one private command directory,
+removed on normal/error exit and handled signals after the owned curl child is
+stopped and reaped; SIGKILL or power loss cannot run that cleanup.
+`--stream` on `get` prints each SSE `data:` payload as one JSON line
 and exits 0 only after a terminal event (`response.completed`, `.incomplete`,
 `.failed`, `.cancelled`); this is the resume channel for background streams.
 
@@ -80,7 +93,9 @@ the error contract, and that keys never appear on argv. Runs under bash 3.2.
 
 ## Background responses (bin/llm)
 
-Status: implemented (`tests/test_llm_responses_background.sh`).
+Status: background support is implemented; the following HTTP hardening
+contract is being integrated and still needs verification against the final
+`bin/llm` changes (`tests/test_llm_responses_background.sh`).
 
 Opt in with `LLM_RESPONSES_BACKGROUND=1`, or `background: true` in the body
 file (no longer rejected); `0` forces foreground over the body file. `store`
@@ -93,17 +108,29 @@ The retrieve and cancel URLs are derived from the create URL by stripping its
   `sequence_number` of every event. If the stream drops before a terminal
   event (curl error, or EOF without one), llm does not re-create: it resumes
   with `GET /responses/{id}?stream=true&starting_after=N`, up to `LLM_RETRIES`
-  times, and nothing already emitted is emitted twice. Only a drop before any
-  id is known falls back to the ordinary retry.
+  times, and nothing already emitted is emitted twice. A drop before an ID is
+  known is an unknown create outcome, not permission to create again.
 - Non-streaming create: the reply is `queued` or `in_progress`; llm polls
   `GET /responses/{id}` every `LLM_RESPONSES_POLL_INTERVAL` seconds (default 2,
-  backing off to 10) until a terminal status or `LLM_MAX_TIME`, then treats the
-  object exactly like a buffered terminal reply (sidecar, usage, text).
+  backing off to 10) until a terminal status or the deadline, then treats the
+  object exactly like an immediate buffered or streamed terminal reply. All
+  three paths share terminal validation: failed/cancelled states, embedded
+  errors, malformed envelopes, and unknown statuses cannot become success.
+- Retry and deadline: Responses CREATE is not automatically retried after an
+  uncertain failure, even if nothing reached stdout. Unknown outcomes fail
+  with `error.code=outcome_unknown`; Chat Completions retry policy is unchanged.
+  One absolute `LLM_MAX_TIME` deadline starts before create and covers polling,
+  reconnects, network waits, and backoff; waits are clamped to remaining time
+  and late completion is not accepted as timely success.
 - Cancel: while a background response is in flight, SIGINT, SIGTERM, and the
-  `LLM_MAX_TIME` deadline POST `/responses/{id}/cancel` best effort (short
-  timeout) before exiting non-zero, so a killed run does not leave a billable
-  job behind. `cancelled` is a terminal status: no text, warning on stderr,
-  sidecar written, exit non-zero.
+  `LLM_MAX_TIME` deadline POST `/responses/{id}/cancel` best effort, with up to
+  five additional seconds beyond the operation budget. A cancellation request
+  does not guarantee the job stopped. Only a terminal response for the same
+  response ID confirms settlement; only its `cancelled` status confirms
+  cancellation (a concurrent completion may win). Otherwise the nonzero exit
+  retains an unknown-outcome sidecar and the known ID for reconciliation.
+  `cancelled` is terminal: warning on stderr, sidecar written, exit non-zero,
+  and no fresh generation. Text already streamed cannot be withdrawn.
 - shellm: `SHELLM_RESPONSES_BACKGROUND=1` passes through. Its continuation
   contract is unchanged because a terminal object still arrives.
 
@@ -126,11 +153,35 @@ empty; both at once is still an error, because the API rejects the pair.
 state instead of the process-local chain. `new` creates a conversation at run
 start (`responses conversations create`). The id is recorded in the
 `shellm-run` header row as `conversation`; unlike response ids, this is
-durable on purpose (Conversations never expire) and a `--resume` of that run
-reuses it. Each call sends only the new items with `conversation` set and
+durable on purpose (Conversations do not expire automatically). `--resume` or
+`--traj` reuses the latest header's ID when the setting is `new` or empty/unset;
+a different literal ID intentionally redirects the run. Each call sends only
+the new items with `conversation` set and
 never `previous_response_id`; the replay chain is not kept. A missing or
 rejected conversation fails closed with a clear error: the operator chose
 durable server state, so there is nothing safe to fall back to.
+
+Sent trajectory step IDs are checkpointed in
+`$SHELLM_TRAJ_DIR/.responses-conversations/<conv_id>.json` (under the effective
+trajectory directory). These versioned files are atomically replaced at mode
+0600 in a mode-0700 directory, bound to the trajectory path, Conversation,
+underlying provider, and endpoint. A local exclusive `mkdir` lock is held for
+the whole run. Before dispatch the checkpoint becomes `in_flight`; only a
+validated successful terminal response advances the sent-step acknowledgement
+and returns it to `ready`. Resume restores that acknowledgement, preserving
+genuinely unsent execution output rather than resending historical rows.
+
+An in-flight/invalid/mismatched checkpoint, missing acknowledgement for an
+already-recorded Conversation, or an existing lock fails closed. Locks are
+never automatically stolen, including stale locks after crashes. Reconcile
+server state and local ownership before reuse; deleting a lock alone does not
+resolve ambiguous delivery. This is local atomic replacement and exclusive
+ownership, not fsync-backed power-loss durability, distributed coordination,
+or an exactly-once server-delivery guarantee. A new/different Conversation
+without local history starts with an empty acknowledgement, not inferred server
+acknowledgements. Body-file Conversations are rejected by shellm before any
+request; use `SHELLM_RESPONSES_CONVERSATION`. Generated child calls and summaries
+do not inherit the parent's Conversation.
 
 Tests: llm rejects the pair and sends `conversation` alone; shellm creates on
 `new`, carries the id on every delta, records it in the header, reuses it on
@@ -140,21 +191,30 @@ resume, and dies cleanly on a rejected conversation.
 
 Status: implemented (`tests/test_llm_responses.sh`,
 `tests/test_shellm_responses_continuation.sh`). The compact reply's window is
-its `output` array, passed on as is; a failed compact call warns and keeps the
-chain, and the next crossing tries again.
+its `output` array, passed on as is. A failed or invalid standalone compact
+reply warns, keeps the chain, and disables standalone upkeep for that run.
 
 - `bin/llm`: `LLM_RESPONSES_COMPACT_THRESHOLD=N` adds
   `context_management: [{type: "compaction", compact_threshold: N}]` to the
   create body (owned when the variable is set, otherwise the body file's value
   stands). Server-side compaction then happens inside a normal turn.
-- `bin/shellm`: `SHELLM_RESPONSES_COMPACT_THRESHOLD=N` (tokens). In stateful
-  mode it passes through to llm. In replay mode (OpenRouter, ZDR, after a
-  continuation fallback) shellm compacts itself: after a terminal response
-  whose `usage.input_tokens` is at or above N, it runs `responses compact
-  --model $SHELLM_MODEL --input-file <replay chain>` and replaces the chain
-  with the returned window. In either mode, when a terminal `output` contains
-  a `compaction` item, the replay chain is truncated to start at that item,
-  which is what the API says to send next.
+- `bin/shellm`: `SHELLM_RESPONSES_COMPACT_THRESHOLD=N` (tokens) opts into upkeep;
+  it is a trigger, not a hard context-size limit. Choose
+  `SHELLM_RESPONSES_COMPACT_MODE=auto|server|standalone`. `auto` selects server
+  compaction for the native OpenAI provider at `api.openai.com` (or its default
+  URL), including input-array replay with `store=false`; other configurations
+  select standalone. Retention and continuation do not determine compaction
+  capability. Explicit `server` declares that the chosen endpoint supports
+  `context_management`; it passes the threshold through to llm even in replay.
+- `standalone` with a threshold forces replay. After a terminal response whose
+  `usage.input_tokens` reaches N, shellm calls `responses compact` with the
+  underlying provider (not the WebSocket adapter), model, current instructions,
+  and replay chain, then adopts the returned `output` array without pruning or
+  reordering it. Endpoint support is not guaranteed merely by selecting auto.
+  Conversation mode plus a threshold requires server compaction.
+- A server-produced compaction item prunes replay to the **newest** marker.
+  That turn does not also trigger standalone compaction from pre-compaction
+  usage. This pruning rule does not apply to standalone compact output.
 
 Tests: the threshold fires once per crossing, the replay file shrinks to the
 compacted window and later requests begin with the compaction item; llm adds
@@ -162,16 +222,19 @@ compacted window and later requests begin with the compaction item; llm adds
 
 ## WebSocket mode
 
-Status: implemented. Two notes where the build differs from the sketch below.
-The guide describes the mode against `/v1/responses` without spelling the
-scheme out, so the endpoint is `RESPONSES_WS_URL` with
-`wss://api.openai.com/v1/responses` as its default rather than a constant. And
-`store` is not a field the adapter owns: it passes through from
-`LLM_RESPONSES_BODY_FILE` untouched, exactly as it does on the HTTPS path, so
-the same body file produces the same request on either transport.
+Status: implemented. Endpoint and credentials follow the underlying provider:
+`openai` uses `OPENAI_API_KEY`, `openai-compatible` uses `LLM_API_KEY` and an
+explicit URL. HTTP(S) URLs become WS(S) without changing path or query. Shellm
+uses its resolved `SHELLM_API_URL` / `LLM_API_URL` for both lifecycle operations
+and completions and rejects `RESPONSES_WS_URL`; the standalone adapter permits
+that override. Native OpenAI defaults to `wss://api.openai.com/v1/responses`.
+Unsupported providers, OpenRouter routing/privacy settings, and background,
+`provider`, or `stream_options` body settings are rejected rather than silently
+discarded. `store` passes through unchanged; instructions, previous-response
+ID removal, and server-compaction thresholds follow the HTTP field ownership.
 
 An adapter, not core: `tools/responses-ws`, a Python script (`uv run`, PEP 723
-metadata, `websockets`), following the adapter contract in
+metadata, Python >=3.10 and `websockets==17.1`), following the adapter contract in
 design/providers.md plus the Responses environment (`LLM_RESPONSE_FILE`,
 `LLM_PREVIOUS_RESPONSE_ID`, `LLM_RESPONSES_BODY_FILE`). `bin/llm` allows
 `--provider adapter` with `LLM_API_FORMAT=responses` and adds `--api-format
@@ -181,24 +244,45 @@ text on stdout as it streams, reasoning summaries on stderr, the terminal
 object in the sidecar, usage in `LLM_USAGE_FILE`, exit non-zero on failure.
 
 Two roles in one file. `serve` holds one connection to
-`wss://api.openai.com/v1/responses` (60-minute lifetime, reconnects), listens
+the resolved endpoint (rotating idle connections older than 55 minutes), listens
 on a unix socket, multiplexes callers onto `stream_id` lanes (16 in flight, 32
 named per connection), and exits when idle for `RESPONSES_WS_IDLE` minutes or
 told `stop`. The default role is the per-call adapter: when
-`RESPONSES_WS_SOCKET` names a live broker it forwards through it, otherwise it
-opens a one-shot connection. shellm's `SHELLM_API_TRANSPORT=websocket` starts
+`RESPONSES_WS_SOCKET` is set it forwards through that broker; missing or failed
+brokers fail the call with no blind one-shot fallback. Only an unset socket
+selects one-shot mode. shellm's `SHELLM_API_TRANSPORT=websocket` starts
 the broker at run start (socket in rundir), points llm at the adapter, and
 stops it at cleanup. Continuation via `previous_response_id` works through the
-connection-local cache even with `store: false`; a
+connection-local cache even with `store: false` for direct adapter callers;
+shellm explicitly uses replay for `store:false`. A
 `previous_response_not_found` error takes the existing replay fallback.
+
+The broker owns lanes within a connection generation and checks response IDs.
+Abandoning an unsettled request retires the connection instead of recycling its
+lane while old events can still arrive. Other unsettled callers on that
+connection may fail with `error.code=outcome_unknown`; retirement does not
+confirm server cancellation. A later caller may open a new connection, but
+abandoned creates are not replayed. Connection-scoped errors are fanned out.
+Local JSON frames are bounded at 16 MiB of UTF-8 bytes (excluding the newline),
+including framing overhead; upstream messages are also bounded at 16 MiB.
+Per-lane queues allow at most 64 events / 16 MiB, local admission at most 32
+clients, and initial local request reads and writes are bounded at 30 seconds. Oversize frames
+and slow consumers fail rather than grow memory without bound. These are
+transport bounds, not the HTTP whole-operation deadline contract.
+
+The installer includes `responses-ws` in copy and symlink installs; uninstall
+removes it. Selecting WebSocket mode requires `uv`; HTTPS does not.
 
 Tests: a fake WebSocket server in the test itself (same library) checks the
 `response.create` payload, streamed text order, the sidecar, an error event,
-and broker multiplexing of two concurrent callers. If `uv` is absent the test
-prints one skip line and exits 0, like the Docker-gated tests.
+and broker multiplexing of two concurrent callers. The fault suite covers
+abandonment, cross-talk, large frames, bounded queues, connection retirement,
+and transport parity. Missing `uv` fails the test rather than silently leaving
+the transport untested.
 
 ## Line budget
 
-`cloc bin/ thinkers/` is capped by CI. These pieces added about 900 lines to
-bin/ (the tree stands near 11,560), so the cap on this fork is 12,000 and the
-README quotes that number. Upstream's cap of 11,000 is untouched by PR #101.
+`cloc bin/ thinkers/` is capped by CI. The hardened fork stands near 11,900
+code lines, under the unchanged fork cap of 12,000. Upstream's cap of 11,000
+is untouched by PR #101. Python transport, tests and documentation are outside
+that core count, not free complexity; they have their own verification.

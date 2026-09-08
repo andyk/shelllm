@@ -327,14 +327,24 @@ because the caller still gets one terminal object per call. Set
 `LLM_RESPONSES_BACKGROUND=1` (or `background: true` in the body file; the
 variable wins when set). With `--no-stream`, llm polls the response by id every
 `LLM_RESPONSES_POLL_INTERVAL` seconds (default 2, doubling to 10) until it is
-terminal, within `LLM_MAX_TIME` overall. When streaming, a stream that drops
+terminal. When streaming, a stream that drops
 after the response id is known is resumed from its last `sequence_number`
 instead of being recreated, up to `LLM_RETRIES` times, and text already
-printed is never printed twice. A killed llm (SIGINT, SIGTERM), an expired
-`LLM_MAX_TIME`, exhausted resumes, and a `--stop-after-code-block` cut all
-cancel the job on the way out, so nothing keeps generating for nobody.
-`cancelled` is terminal: the sidecar is written, nothing is printed, and llm
-exits non-zero. Under shellm, `SHELLM_RESPONSES_BACKGROUND=1` passes through.
+printed is never printed twice. Under shellm,
+`SHELLM_RESPONSES_BACKGROUND=1` passes through.
+
+**HTTP hardening contract (pending integration verification):** no automatic
+Responses CREATE retry after uncertain dispatch, even before the first token;
+unknown results fail with `error.code=outcome_unknown`. Chat retry policy is
+unchanged. Immediate, polled, and streamed replies share terminal validation.
+One absolute `LLM_MAX_TIME` deadline covers create, polling, reconnects, and
+backoff, with up to five additional seconds for best-effort cancellation.
+Cancellation on interruption or timeout is not a guarantee that generation
+stopped: only a terminal reply for the same response ID confirms settlement,
+and only `cancelled` confirms cancellation. Otherwise retain the unknown-outcome
+sidecar and known ID for reconciliation. Failed/cancelled terminal results exit
+nonzero without recreating the request; text already streamed cannot be
+withdrawn. See the [lifecycle contract](../design/responses-lifecycle.md#background-responses-binllm).
 
 ### Lifecycle operations
 
@@ -343,6 +353,10 @@ provider resolution, keys, `LLM_API_URL` (its `/responses` suffix is stripped
 to find the API base), and net guards. Stdout is the API object and nothing
 else, one JSON document per command; a non-2xx prints
 `responses: error: <message>` on stderr and exits 1, and a usage error exits 2.
+Temporary request/auth files are private and cleaned up on exit and handled
+signals. `--all` fails on malformed or non-progressing pagination, duplicate
+IDs, or continuing past 500 pages / 64 MiB, rather than returning an incomplete
+list as exhausted. It does not promise a snapshot during concurrent changes.
 
 ```bash
 responses get resp_123 --include reasoning.encrypted_content
@@ -393,27 +407,49 @@ once with that chain and stays stateless for the rest of the run. OpenRouter's
 documented stateless Responses endpoint uses exact replay from the first turn.
 Remote response IDs and replay items are removed when the shellm process exits.
 
-`SHELLM_RESPONSES_COMPACT_THRESHOLD=N` bounds how large that window gets. On a
-stateful run the number rides through to `llm` as the Responses
-`context_management` field and the server compacts inside the turn. On a
-replaying run (OpenRouter, a ZDR endpoint, or after a continuation fallback)
-nobody is compacting on shellm's behalf, so once a terminal response reports at
-least N input tokens shellm calls `responses compact` itself and swaps the
-replay chain for the window that comes back. Either way, a compaction item in a
-terminal output cuts the chain back to that item, which is where the API says
-the next window begins. A failed compact call is a warning, not an error: the
-chain stands and the next crossing tries again.
+`SHELLM_RESPONSES_COMPACT_THRESHOLD=N` opts into compaction at an input-token
+threshold, not a hard window-size limit. Select the method with
+`SHELLM_RESPONSES_COMPACT_MODE=auto|server|standalone`:
+
+- `auto` (default): the native OpenAI provider at its default URL or
+  `api.openai.com` uses server compaction, including replay with `store:false`.
+  Other configurations use standalone compact; endpoint support may vary.
+- `server`: explicitly declares endpoint support for `context_management`.
+  The threshold passes to llm independently of continuation or retention.
+- `standalone`: with a threshold, forces replay and calls `responses compact`
+  when a terminal response reports at least N input tokens. The underlying
+  provider, endpoint, and current instructions are retained even with WebSocket
+  transport. The returned `output` array replaces the chain **as-is**.
+
+Server-produced compaction prunes replay to the **newest** marker and skips a
+second standalone compact on that turn. A failed/invalid standalone compact
+warns, preserves the chain, and disables standalone upkeep for the run.
+Conversation mode with a threshold requires server compaction.
 
 `SHELLM_RESPONSES_CONVERSATION` moves that state to the server instead.
 `new` creates a Conversation at run start through `responses conversations
 create`, a `conv_...` id joins an existing one, and either way every call sends
 only the new rows with that conversation set and no `previous_response_id`. The
 id is recorded in the run's `shellm-run` header row, which is deliberate:
-Conversations do not expire, so `--resume` of that run with `new` picks the
-same one back up, while a literal id given on the resume wins over it. There is
+Conversations do not expire automatically, so `--resume` or `--traj` with `new`
+or an empty/unset setting picks the same one back up. A different literal ID
+redirects the run. There is
 no replay chain and no fallback here. A conversation the provider refuses ends
 the run with its message, because durable server state is what the operator
 asked for and nothing local is a safe substitute.
+
+Shellm persists sent-step acknowledgements under the effective trajectory
+directory (`$SHELLM_TRAJ_DIR/.responses-conversations/`), using atomic mode-0600
+checkpoints and a local exclusive lock held for the whole run. Resume restores
+acknowledged step IDs, not text matching, so unsent execution output is still
+sent. Dispatch marks the checkpoint `in_flight`; successful terminal validation
+advances it to `ready`. Ambiguous/missing/mismatched checkpoints and stale locks
+fail closed and require reconciliation; locks are never automatically stolen.
+This is not fsync/power-loss durability, distributed coordination, or an
+exactly-once delivery guarantee. Do not remove a lock and assume delivery is
+resolved. A fresh/different Conversation starts without local acknowledgements.
+Use the dedicated setting: shellm rejects `conversation` in its body file.
+Generated child calls and summaries do not inherit the parent's Conversation.
 
 ### WebSocket mode
 
@@ -431,15 +467,17 @@ shellm "audit this repo"
 
 shellm starts `tools/responses-ws` as a broker at run start, with its unix
 socket inside the run's private directory, and stops it at cleanup. The broker
-holds the connection, reconnects when the server closes it (connections last up
-to 60 minutes), and multiplexes callers onto `stream_id` lanes within the
+holds the connection, opens a new connection for later calls after retirement,
+rotates idle connections older than 55 minutes, and multiplexes callers within
+the
 documented limits of 16 in flight and 32 named lanes. `llm` reaches it through
 the adapter seam (`LLM_PROVIDER=adapter`), so nothing in the completion path
 gains a Python dependency.
 
 `tools/responses-ws` is a `uv` PEP 723 script whose only dependency is
-`websockets`; a machine without `uv` loses this transport and nothing else. It
-can also be used on its own:
+`websockets==17.1` (Python >=3.10). Copy and symlink installs include
+`responses-ws`; a machine without `uv` loses this transport and nothing else.
+It can also be used on its own:
 
 ```bash
 # One-shot: no broker, one connection for one completion.
@@ -456,14 +494,33 @@ tools/responses-ws stop --socket /tmp/ws.sock
 
 | Variable | Meaning |
 |---|---|
-| `RESPONSES_WS_URL` | Endpoint, default `wss://api.openai.com/v1/responses` |
-| `RESPONSES_WS_SOCKET` | Broker socket; without a live one the adapter opens a one-shot connection |
+| `RESPONSES_WS_PROVIDER` | Underlying `openai` or `openai-compatible` provider; shellm resolves it before selecting the adapter |
+| `LLM_API_URL` | Exact endpoint; HTTP(S) becomes WS(S), retaining path and query. Shellm uses its resolved `SHELLM_API_URL` / `LLM_API_URL` for lifecycle and completion alike |
+| `RESPONSES_WS_URL` | Direct-adapter endpoint override; rejected by shellm to prevent destination drift. Native OpenAI defaults to `wss://api.openai.com/v1/responses` |
+| `RESPONSES_WS_SOCKET` | Authoritative broker socket when set; unavailable or failed brokers fail the call. Only an unset value selects one-shot mode |
 | `RESPONSES_WS_IDLE` | Broker idle minutes before it exits (default 10, `--idle` overrides) |
 
-The transport does not change any contract: text still streams to stdout,
+Native OpenAI uses `OPENAI_API_KEY`; compatible endpoints use `LLM_API_KEY` and
+require an explicit URL. Direct adapter use with a configured `LLM_API_URL`
+and no underlying provider defaults to `openai-compatible`. Unsupported
+providers, OpenRouter routing/privacy settings, background execution, and
+`provider` / `stream_options` body settings fail before dispatch instead of
+being silently dropped. `store` passes through, while instructions,
+previous-response ID removal, and compaction thresholds follow HTTP ownership.
+
+JSON frames are bounded at 16 MiB of UTF-8 bytes (local framing overhead counts);
+per-lane queues at 64 events / 16 MiB; local clients at 32. Initial local request
+reads and writes have 30-second limits. Oversize frames and slow consumers fail.
+If a caller abandons an unsettled request, the broker retires that connection
+rather than reusing its lane. Other unsettled callers can also fail with
+`error.code=outcome_unknown`; closing the connection does not confirm server
+cancellation. There is no blind replay or fallback to a fresh one-shot create.
+
+Text still streams to stdout,
 reasoning summaries to stderr, and the terminal object to `LLM_RESPONSE_FILE`.
 Continuation still rides `previous_response_id`, and a rejection still lands in
-the sidecar so shellm falls back to its replay chain. Nothing WebSocket-specific
+the sidecar so shellm falls back to its replay chain; shellm uses replay from
+the outset with `store:false`. Nothing WebSocket-specific
 is forwarded into the Docker sandbox, because a container cannot reach a socket
 on the host: nested `llm` and `shellm` calls inside the sandbox take the
 ordinary HTTPS Responses path.

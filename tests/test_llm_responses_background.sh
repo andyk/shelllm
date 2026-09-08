@@ -40,12 +40,33 @@ done
 url="${*: -1}"
 if [[ "$url" == */cancel ]]; then
     printf 'cancelled\n' >> "$CURL_DIR/cancels"
+    if [[ "${CANCEL_FAIL:-0}" == 1 ]]; then
+        printf '%s' '{"error":{"message":"cancel unavailable"}}' > "$out_file"
+        printf '500'
+        exit 0
+    fi
+    printf '%s' '{"id":"resp_bg","status":"cancelled","output":[]}' > "$out_file"
     printf '200'
     exit 0
 fi
 
 completed='{"id":"resp_bg","object":"response","status":"completed","output":[{"id":"msg_bg","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":11,"output_tokens":2}}'
+[[ "${CURL_DELAY:-0}" == 0 ]] || sleep "$CURL_DELAY"
 case "$mode" in
+    poll-error)
+        printf '%s' '{"error":{"message":"backend failed"}}' > "$out_file"
+        printf '200'
+        ;;
+    poll-invalid)
+        printf '%s' '{"id":"resp_bg","status":"unexpected","output":[]}' > "$out_file"
+        printf '200'
+        ;;
+    create-lost)
+        exit 28
+        ;;
+    stream-cancelled)
+        printf 'data: %s\n\n' '{"type":"response.cancelled","sequence_number":4,"response":{"id":"resp_bg","status":"cancelled","output":[]}}'
+        ;;
     create-queued)
         printf '%s' '{"id":"resp_bg","object":"response","status":"queued","output":[]}' > "$out_file"
         printf '200'
@@ -205,15 +226,15 @@ else
     bad "a resume that brings only the terminal event repeats no text" "rc=$rc calls=$(calls) out=$(cat "$WORK/stdout") stderr=$(cat "$WORK/stderr")"
 fi
 
-# A drop before any id is known has nothing to resume: the create is retried.
+# A lost acknowledgement is not evidence that the create was never accepted.
 reset $'stream-empty\nstream-complete'
 LLM_RETRIES=2 LLM_RESPONSES_BACKGROUND=1 run_bg "bg" >"$WORK/stdout" 2>"$WORK/stderr"
 rc=$?
-if [[ "$rc" -eq 0 && "$(cat "$WORK/stdout")" == "ok" && "$(calls)" -eq 2 ]] \
-   && has_arg 2 "-d" && [[ "$(url_of 2)" == "https://api.openai.com/v1/responses" ]]; then
-    ok "a drop before the response id is known retries the create"
+if [[ "$rc" -ne 0 && "$(calls)" -eq 1 ]] \
+   && jq -e '.error.code == "outcome_unknown"' "$WORK/response.json" >/dev/null; then
+    ok "a drop before the response id is known never recreates"
 else
-    bad "a drop before the response id is known retries the create" "rc=$rc calls=$(calls) out=$(cat "$WORK/stdout") u2=$(url_of 2) stderr=$(cat "$WORK/stderr")"
+    bad "a drop before the response id is known never recreates" "rc=$rc calls=$(calls) stderr=$(cat "$WORK/stderr")"
 fi
 
 # Resumes are bounded by LLM_RETRIES; when they run out the job is cancelled.
@@ -251,7 +272,7 @@ wait "$pid"
 rc=$?
 if [[ "$rc" -ne 0 && "$(cancels)" -eq 1 ]] \
    && [[ "$(cancel_url)" == "https://api.openai.com/v1/responses/resp_bg/cancel" ]] \
-   && grep -q 'cancelled background response resp_bg' "$WORK/stderr"; then
+   && grep -q 'background response resp_bg confirmed cancelled' "$WORK/stderr"; then
     ok "SIGTERM while polling cancels the background response"
 else
     bad "SIGTERM while polling cancels the background response" "rc=$rc calls=$(calls) cancels=$(cancels) stderr=$(cat "$WORK/stderr")"
@@ -310,6 +331,70 @@ if [[ "$rc" -eq 0 && "$(cat "$WORK/stdout")" == "ok" ]] \
 else
     bad "chat mode ignores the background flag with a note" "rc=$rc out=$(cat "$WORK/stdout") stderr=$(cat "$WORK/stderr")"
 fi
+
+# Fault boundaries must never turn terminal failure or an ambiguous create
+# into another POST, even when retry budget remains.
+for mode in create-lost poll-cancelled stream-cancelled; do
+    reset "$mode"
+    args=(--no-stream)
+    [[ "$mode" != stream-* ]] || args=()
+    LLM_RETRIES=3 LLM_RESPONSES_BACKGROUND=1 run_bg "${args[@]+"${args[@]}"}" bg >"$WORK/stdout" 2>"$WORK/stderr"
+    rc=$?
+    if [[ "$rc" -ne 0 && "$(calls)" -eq 1 ]]; then ok "$mode fails without recreating"
+    else bad "$mode fails without recreating" "rc=$rc calls=$(calls)"; fi
+done
+
+for mode in poll-error poll-invalid; do
+    reset "$(printf 'create-queued\n%s' "$mode")"
+    LLM_RESPONSES_BACKGROUND=1 run_bg --no-stream bg >"$WORK/stdout" 2>"$WORK/stderr"
+    rc=$?
+    if [[ "$rc" -ne 0 && ! -s "$WORK/stdout" ]]; then ok "$mode cannot become a successful completion"
+    else bad "$mode cannot become a successful completion" "rc=$rc"; fi
+done
+
+reset $'stream-created-drop\nstream-cancelled'
+LLM_RETRIES=3 LLM_RESPONSES_BACKGROUND=1 run_bg bg >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && "$(calls)" -eq 2 && "$(cancels)" -eq 0 ]] \
+    && jq -e '.status == "cancelled"' "$WORK/response.json" >/dev/null; then
+    ok "external cancellation during resume is terminal, not another cancel or create"
+else bad "external cancellation during resume is terminal, not another cancel or create" "rc=$rc calls=$(calls)"; fi
+
+reset stream-created-drop
+CANCEL_FAIL=1 LLM_RETRIES=0 LLM_RESPONSES_BACKGROUND=1 run_bg bg >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 ]] && grep -q 'cancellation not confirmed' "$WORK/stderr" \
+    && jq -e '.id == "resp_bg" and .error.code == "outcome_unknown" and .cancellation.http_code == "500"' "$WORK/response.json" >/dev/null; then
+    ok "failed cancellation preserves recovery handle without claiming success"
+else bad "failed cancellation preserves recovery handle without claiming success"; fi
+
+reset $'create-queued\npoll-completed'
+start=$SECONDS
+LLM_MAX_TIME=1 LLM_RESPONSES_POLL_INTERVAL=30 LLM_RESPONSES_BACKGROUND=1 run_bg --no-stream bg >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && "$((SECONDS-start))" -lt 5 && "$(calls)" -eq 2 && "$(cancels)" -eq 1 ]]; then
+    ok "long poll sleep is clamped; no GET starts after the deadline"
+else bad "long poll sleep is clamped; no GET starts after the deadline" "rc=$rc calls=$(calls)"; fi
+
+for mode in create-queued stream-created-drop; do
+    reset "$mode"
+    args=(--no-stream)
+    [[ "$mode" != stream-* ]] || args=()
+    CURL_DELAY=2 LLM_MAX_TIME=1 LLM_RETRIES=3 LLM_RESPONSES_BACKGROUND=1 \
+        run_bg "${args[@]+"${args[@]}"}" bg >"$WORK/stdout" 2>"$WORK/stderr"
+    rc=$?
+    if [[ "$rc" -ne 0 && "$(calls)" -eq 2 && "$(cancels)" -eq 1 ]] && grep -q 'LLM_MAX_TIME' "$WORK/stderr"; then
+        ok "slow $mode spends the original deadline, not a new poll/resume budget"
+    else bad "slow $mode spends the original deadline, not a new poll/resume budget" "rc=$rc calls=$(calls)"; fi
+done
+
+reset stream-created-drop
+start=$SECONDS
+LLM_MAX_TIME=1 LLM_RETRY_BACKOFF=30 LLM_RETRIES=3 LLM_RESPONSES_BACKGROUND=1 run_bg bg >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && "$((SECONDS-start))" -lt 5 && "$(calls)" -eq 2 && "$(cancels)" -eq 1 ]]; then
+    ok "resume backoff is clamped to the original deadline"
+else bad "resume backoff is clamped to the original deadline" "rc=$rc calls=$(calls)"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

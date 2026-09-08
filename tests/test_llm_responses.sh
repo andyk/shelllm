@@ -374,7 +374,8 @@ reset
 export CURL_MODE=stream-no-terminal
 LLM_RETRIES=2 run_openai "truncated stream" >"$WORK/stdout" 2>"$WORK/stderr"
 rc=$?
-if [[ "$rc" -ne 0 && "$(cat "$CURL_CALLS")" -eq 1 && ! -e "$WORK/response.json" ]] \
+if [[ "$rc" -ne 0 && "$(cat "$CURL_CALLS")" -eq 1 ]] \
+   && jq -e '.error.code == "outcome_unknown"' "$WORK/response.json" >/dev/null \
    && grep -q 'without a terminal response' "$WORK/stderr"; then
     ok "Responses SSE with output but no terminal event fails without retry"
 else

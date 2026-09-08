@@ -110,9 +110,9 @@ LLM_RESPONSES_COMPACT_THRESHOLD="${LLM_RESPONSES_COMPACT_THRESHOLD:-}"
 # caller. Best-effort: fields the provider doesn't report are omitted, and no
 # failure here can break the call.
 LLM_USAGE_FILE="${LLM_USAGE_FILE:-}"
-# Transient-failure retries (provider errors, 429/5xx, network). Retries
-# only happen when NOTHING has been emitted yet — a retry after partial
-# streamed output would duplicate text. LLM_RETRIES=0 disables.
+# Chat retries only before output; Responses never retries a create because
+# silence does not prove non-dispatch. In background Responses this budget
+# instead bounds retrieval retries and stream resumes. 0 disables retries.
 LLM_RETRIES="${LLM_RETRIES:-2}"
 LLM_RETRY_BACKOFF="${LLM_RETRY_BACKOFF:-1}"   # seconds; grows linearly per attempt
 
@@ -396,13 +396,14 @@ Environment:
                            precedence, and a value that disagrees with the
                            name warns on stderr
   LLM_MAX_TOKENS           Override the per-model default output cap (same as -t)
-  LLM_RETRIES              Retries for transient API failures (default: 2;
-                           0 disables). Never retries after partial output.
+  LLM_RETRIES              Chat retries before output; Responses retrieve/resume
+                           retries only, never create (default: 2; 0 disables)
   LLM_RETRY_BACKOFF        Backoff base seconds between retries (default: 1)
   LLM_CONNECT_TIMEOUT      Seconds to establish the connection (default: 10;
                            0 disables)
-  LLM_MAX_TIME             Hard ceiling on one HTTP attempt, seconds
-                           (default: 600; 0 disables)
+  LLM_MAX_TIME             Seconds per chat attempt or whole Responses operation
+                           (default: 600; 0 disables). Background cancellation
+                           gets up to 5 additional seconds; it is best effort
   LLM_SPEED_LIMIT          Abort a transfer slower than this many bytes/s...
   LLM_SPEED_TIME           ...for this many consecutive seconds (defaults:
                            100 bytes/s over 60s; 0 on either disables)
@@ -1175,8 +1176,28 @@ check_response_responses() {
     jq -r '
         if .error != null then .error.message // "unknown error"
         elif .status == "failed" then .error.message // "response failed"
+        elif .status == "cancelled" then "response cancelled"
         else empty end
     ' 2>/dev/null
+}
+
+# Only a valid terminal object is a successful Responses completion. An empty
+# text field can be legitimate (tools, refusals), but an empty/error envelope
+# cannot. Keep this contract identical for SSE and buffered responses.
+valid_response_terminal() {
+    jq -e 'type == "object" and .error == null
+        and (.id | type == "string" and length > 0)
+        and (.output | type == "array")
+        and (.status == "completed" or .status == "incomplete")' >/dev/null 2>&1
+}
+
+responses_outcome_unknown() {
+    local reason="$1" id="${2:-}"
+    jq -nc --arg message "$reason" --arg id "$id" \
+        '{error:{code:"outcome_unknown",message:$message}}
+         + (if $id == "" then {} else {id:$id} end)' | write_response_file
+    _llm_note error "" "outcome_unknown: $reason"
+    die "Responses outcome_unknown: $reason${id:+ (response $id)}; do not automatically recreate"
 }
 
 check_response_gemini() {
@@ -1484,9 +1505,22 @@ stream_responses() {
             [[ "$json" == "[DONE]" ]] && continue
             _event=""; _seq=""; _rid=""
             IFS=$'\t' read -r _event _seq _rid < <(printf '%s' "$json" \
-                | jq -r '[(.type // ""), ((.sequence_number // "") | tostring), (.response.id // "")] | @tsv' 2>/dev/null) || true
+                | jq -r '[(.type // "-"), ((.sequence_number // "-") | tostring), (.response.id // "-")] | @tsv' 2>/dev/null) || true
+            [[ "$_rid" == - ]] && _rid=""
+            [[ "$_seq" == - ]] && _seq=""
+            if [[ -n "$_rid" ]]; then
+                [[ "$_rid" =~ ^[A-Za-z0-9_-]+$ ]] \
+                    || responses_outcome_unknown "invalid stream response identity" "$_bg_id"
+                [[ -z "$_bg_id" || "$_bg_id" == "$_rid" ]] \
+                    || responses_outcome_unknown "stream changed response identity" "$_bg_id"
+                _bg_id="$_rid"
+            fi
             if [[ -n "${LLM_BG_STATE:-}" ]]; then
-                [[ -z "$_bg_id" && -n "$_rid" ]] && _bg_id="$_rid"
+                [[ -z "$_seq" || "$_seq" =~ ^[0-9]+$ ]] \
+                    || responses_outcome_unknown "invalid stream sequence number" "$_bg_id"
+                if [[ -n "$_seq" && -n "${LLM_BG_RESUME_SEQ:-}" && "$_seq" -le "$LLM_BG_RESUME_SEQ" ]]; then
+                    continue
+                fi
                 [[ -n "$_seq" ]] && _bg_seq="$_seq"
             fi
             case "$_event" in
@@ -1516,6 +1550,8 @@ stream_responses() {
                     ;;
                 response.completed|response.incomplete)
                     _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
+                    printf '%s' "$_response" | valid_response_terminal \
+                        || responses_outcome_unknown "invalid terminal response" "$_bg_id"
                     if [[ -n "$_response" ]] \
                         && printf '%s' "$_response" | jq -e --arg status "${_event#response.}" \
                             '.status == $status' >/dev/null 2>&1; then
@@ -1553,8 +1589,11 @@ stream_responses() {
                                 warn_incomplete_response "$_reason"
                             fi
                         fi
+                    else
+                        responses_outcome_unknown "terminal event and response status disagree" "$_bg_id"
                     fi
                     mark_emitted
+                    return 0
                     ;;
                 response.cancelled)
                     # Someone else cancelled the background job (or a previous
@@ -1562,18 +1601,14 @@ stream_responses() {
                     _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
                     [[ -n "$_response" ]] && printf '%s' "$_response" | write_response_file
                     echo "llm: warning: response cancelled" >&2
-                    die "API stream error: response cancelled"
+                    die_permanent "API stream error: response cancelled"
                     ;;
                 response.failed)
                     _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
                     [[ -n "$_response" ]] && printf '%s' "$_response" | write_response_file
                     local _failed_msg=""
                     _failed_msg=$(printf '%s' "$json" | jq -r '.response.error.message // .error.message // "response failed"' 2>/dev/null) || _failed_msg="response failed"
-                    if [[ -e "$LLM_DATA_MARKER" ]]; then
-                        die "API stream error: $_failed_msg"
-                    else
-                        die_retryable "API stream error: $_failed_msg"
-                    fi
+                    die_permanent "API stream error: $_failed_msg"
                     ;;
                 error)
                     printf '%s' "$json" | write_response_file
@@ -1613,10 +1648,7 @@ stream_responses() {
                 > "$LLM_BG_STATE" 2>/dev/null || true
             exit 77
         fi
-        if [[ -e "$LLM_DATA_MARKER" ]]; then
-            die "API stream error: Responses stream ended without a terminal response"
-        fi
-        die_retryable "API stream error: Responses stream ended without a terminal response"
+        responses_outcome_unknown "Responses stream ended without a terminal response" "$_bg_id"
     fi
 }
 
@@ -1680,7 +1712,8 @@ stream_opencode() { stream_anthropic; }
 # carries the whole prompt, and `-d "$payload"` dies with "Argument list too
 # long" on a large one (Linux caps a single argument at 128 KiB, macOS caps
 # total argv at 1 MiB). The file is reused across retries and removed on exit.
-payload_file=$(mktemp "${TMPDIR:-/tmp}/llm-payload.XXXXXX")
+_llm_work=$(mktemp -d "${TMPDIR:-/tmp}/llm-call.XXXXXX")
+payload_file="$_llm_work/payload"
 # No caller-provided usage file: a private one stands in (the ledger still
 # gets the record) and goes away with the payload file.
 _llm_usage_own=0
@@ -1689,7 +1722,7 @@ if [[ -z "$LLM_USAGE_FILE" ]]; then
     _llm_usage_own=1
 fi
 _llm_cleanup() {
-    rm -f "$payload_file"
+    rm -rf "$_llm_work"
     if [[ -n "${LLM_BG_STATE:-}" ]]; then rm -f "$LLM_BG_STATE"; fi
     if [[ -n "${_llm_auth_file:-}" ]]; then rm -f "$_llm_auth_file"; fi
     if [[ -n "${_adapter_dir:-}" ]]; then rm -rf "$_adapter_dir"; fi
@@ -1842,22 +1875,86 @@ _responses_base_url() {
 # killed or timed-out call does not leave a billable job running with no one
 # to read it. The id comes from the polling loop or the stream state file.
 _llm_bg_cancel() {
-    local why="$1" id="${_bg_id:-}"
+    local why="$1" id="${_bg_id:-}" code status
     if [[ -z "$id" && -n "${LLM_BG_STATE:-}" && -s "$LLM_BG_STATE" ]]; then
         IFS=$'\t' read -r id _ < "$LLM_BG_STATE" || true
     fi
-    [[ -n "$id" ]] || return 0
-    # Nothing of this reaches the caller's stdout: it is not model output.
-    curl -sS -X POST --max-time 5 "${headers[@]}" -o /dev/null \
-        "$(_responses_base_url)/responses/$id/cancel" >/dev/null 2>&1 || true
-    echo "llm: cancelled background response $id ($why)" >&2
+    if [[ ! "$id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        jq -nc --arg message "$why; no response handle available for cancellation" \
+            '{error:{code:"outcome_unknown",message:$message}}' | write_response_file
+        echo "llm: background outcome unknown; no safe response handle to cancel ($why)" >&2
+        return 0
+    fi
+    code=$(curl -sS --globoff -X POST --connect-timeout 5 --max-time 5 "${headers[@]}" \
+        -o "$_llm_work/cancel" -w '%{http_code}' \
+        "$(_responses_base_url)/responses/$id/cancel" 2>/dev/null) || code=000
+    status=$(jq -r --arg id "$id" 'select(.id == $id) | .status // empty' "$_llm_work/cancel" 2>/dev/null || true)
+    if [[ "$code" =~ ^2[0-9][0-9]$ && "$status" =~ ^(cancelled|completed|incomplete|failed)$ ]]; then
+        write_response_file < "$_llm_work/cancel"
+        echo "llm: background response $id confirmed $status ($why)" >&2
+    else
+        jq -nc --arg id "$id" --arg code "$code" --arg why "$why" \
+            '{id:$id,error:{code:"outcome_unknown",message:"cancellation not confirmed"},
+              cancellation:{requested:true,http_code:$code,reason:$why}}' | write_response_file
+        echo "llm: cancellation not confirmed for background response $id (HTTP $code; $why); reconcile with responses get $id" >&2
+    fi
 }
 _llm_bg_signal() {
-    trap - INT TERM
-    if [[ -n "${_bg_job:-}" ]]; then kill "$_bg_job" 2>/dev/null || true; fi
-    _llm_bg_cancel "SIG$1"
-    _llm_note error "" "cancelled on SIG$1"
+    trap '' INT TERM
+    local p
+    for p in "${_bg_job:-}" "${_llm_curl_pid:-}"; do
+        [[ -n "$p" ]] || continue
+        kill "$p" 2>/dev/null || true
+        wait "$p" 2>/dev/null || true
+    done
+    [[ "$_bg_active" -eq 1 ]] && _llm_bg_cancel "SIG$1"
+    _llm_note error "" "interrupted on SIG$1; provider outcome may be unknown"
     exit 1
+}
+
+# One elapsed-time budget begins before create; never refresh it for a poll,
+# reconnect, or backoff. Cancellation gets a separate, bounded 5s grace.
+_llm_deadline=0
+if [[ "$LLM_API_FORMAT" == responses && "$LLM_MAX_TIME" =~ ^[0-9]+$ && "$LLM_MAX_TIME" -gt 0 ]]; then
+    _llm_deadline=$(( SECONDS + LLM_MAX_TIME ))
+fi
+_llm_check_deadline() {
+    if [[ "$_llm_deadline" -gt 0 && "$SECONDS" -ge "$_llm_deadline" ]]; then
+        [[ "$_bg_active" -eq 1 ]] && _llm_bg_cancel "LLM_MAX_TIME=${LLM_MAX_TIME}s reached"
+        _llm_note error "" "LLM_MAX_TIME deadline exceeded"
+        die "LLM_MAX_TIME=${LLM_MAX_TIME}s exceeded; completion was not accepted within the deadline"
+    fi
+}
+_llm_pause() {
+    local duration="$1" remaining
+    _llm_check_deadline
+    if [[ "$_llm_deadline" -gt 0 ]]; then
+        remaining=$(( _llm_deadline - SECONDS ))
+        [[ "$duration" -le "$remaining" ]] || duration="$remaining"
+    fi
+    sleep "$duration" &
+    _bg_job=$!
+    wait "$_bg_job" || true
+    _bg_job=""
+    _llm_check_deadline
+}
+_llm_transfer_budget() {
+    _llm_check_deadline
+    _transfer_args=("${_net_args[@]+"${_net_args[@]}"}")
+    if [[ "$_llm_deadline" -gt 0 ]]; then
+        _transfer_args+=(--max-time "$(( _llm_deadline - SECONDS ))")
+    fi
+}
+# Track curl in the parent, including buffered polling: a signal must not
+# leave a credential-bearing child running after command cleanup.
+_llm_fetch() {
+    _llm_transfer_budget
+    curl -sS --globoff "${_transfer_args[@]+"${_transfer_args[@]}"}" "${headers[@]}" \
+        -w '%{http_code}' "$@" > "$_llm_work/http-code" 2>/dev/null &
+    _llm_curl_pid=$!
+    http_code=000
+    if wait "$_llm_curl_pid"; then http_code=$(cat "$_llm_work/http-code"); fi
+    _llm_curl_pid=""
 }
 # Poll a background response until it reaches a terminal status, leaving the
 # final object in local_resp for the ordinary buffered handling. LLM_MAX_TIME
@@ -1865,29 +1962,18 @@ _llm_bg_signal() {
 # errors get LLM_RETRIES consecutive tries before the job is cancelled.
 _llm_bg_poll() {
     _bg_id=$(jq -r '.id // empty' "$local_resp" 2>/dev/null)
-    [[ -n "$_bg_id" ]] || die "background response has no id to poll"
-    local interval="$LLM_RESPONSES_POLL_INTERVAL" deadline=0 now code failures=0 status
-    [[ "$LLM_MAX_TIME" =~ ^[0-9]+$ && "$LLM_MAX_TIME" -gt 0 ]] \
-        && deadline=$(( $(date +%s) + LLM_MAX_TIME ))
+    [[ "$_bg_id" =~ ^[A-Za-z0-9_-]+$ ]] || responses_outcome_unknown "background response has no safe id to poll"
+    write_response_file < "$local_resp"
+    local interval="$LLM_RESPONSES_POLL_INTERVAL" code failures=0 status
     while :; do
-        now=$(date +%s)
-        if [[ "$deadline" -gt 0 && "$now" -ge "$deadline" ]]; then
-            _llm_bg_cancel "LLM_MAX_TIME=${LLM_MAX_TIME}s reached"
-            _llm_note error "" "background response timed out"
-            die "background response $_bg_id did not finish within LLM_MAX_TIME=${LLM_MAX_TIME}s; cancelled"
-        fi
-        # Sleep as a job and wait for it, so a signal reaches the cancel trap
-        # at once rather than when the sleep ends.
-        sleep "$interval" &
-        _bg_job=$!
-        wait "$_bg_job" || true
-        _bg_job=""
+        _llm_pause "$interval"
         if [[ "$interval" -lt 10 ]]; then
             interval=$(( interval * 2 ))
             [[ "$interval" -gt 10 ]] && interval=10
         fi
-        code=$(curl -sS -o "$local_resp" -w '%{http_code}' ${_net_args[@]+"${_net_args[@]}"} \
-            "${headers[@]}" "$(_responses_base_url)/responses/$_bg_id" 2>/dev/null) || code="000"
+        _llm_fetch -o "$local_resp" "$(_responses_base_url)/responses/$_bg_id"
+        code="$http_code"
+        _llm_check_deadline
         if [[ "$code" =~ ^(000|408|429|5[0-9][0-9])$ ]]; then
             failures=$(( failures + 1 ))
             if [[ "$failures" -gt "$LLM_RETRIES" ]]; then
@@ -1900,11 +1986,15 @@ _llm_bg_poll() {
         failures=0
         if [[ "$code" -ge 400 ]]; then
             error_msg=$(jq -r '.error.message // .message // empty' "$local_resp" 2>/dev/null || true)
-            write_response_file < "$local_resp"
+            _llm_bg_cancel "polling failed with HTTP $code"
             _llm_note error "$code" "${error_msg:-HTTP $code}"
             die "API error (HTTP $code) while polling background response $_bg_id: ${error_msg:-HTTP $code}"
         fi
         status=$(jq -r '.status // empty' "$local_resp" 2>/dev/null || true)
+        jq -e --arg id "$_bg_id" '.id == $id and (.error == null or .status == "failed")' "$local_resp" >/dev/null 2>&1 || {
+            _llm_bg_cancel "invalid poll response"
+            die "invalid poll response for $_bg_id"
+        }
         case "$status" in
             queued|in_progress) continue ;;
             *) break ;;
@@ -1913,13 +2003,15 @@ _llm_bg_poll() {
 }
 _bg_active=0
 _bg_job=""
+if [[ "$LLM_API_FORMAT" == responses ]]; then
+    trap '_llm_bg_signal INT' INT
+    trap '_llm_bg_signal TERM' TERM
+fi
 if [[ "$LLM_API_FORMAT" == responses ]] \
    && jq -e '.background == true' "$payload_file" >/dev/null 2>&1; then
     _bg_active=1
-    LLM_BG_STATE=$(mktemp)
+    LLM_BG_STATE="$_llm_work/background"
     export LLM_BG_STATE
-    trap '_llm_bg_signal INT' INT
-    trap '_llm_bg_signal TERM' TERM
 fi
 
 # Network guard flags for curl (see the LLM_CONNECT_TIMEOUT block above).
@@ -1945,8 +2037,8 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
     while :; do
         _attempt=$(( _attempt + 1 ))
         _block=""
-        _curl_err=$(mktemp)
-        LLM_RETRY_ERR=$(mktemp)
+        _curl_err="$_llm_work/curl-error"
+        LLM_RETRY_ERR="$_llm_work/retry-error"
         LLM_DATA_MARKER="${LLM_RETRY_ERR}.emitted"
         LLM_STOP_MARKER="${LLM_RETRY_ERR}.stopped"
         _rc=0
@@ -1955,7 +2047,8 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
         # The create posts the payload. A resume of a dropped background
         # stream GETs the same response from its last sequence number instead,
         # carrying what the dropped stream had already emitted.
-        _stream_curl=(curl -sS -N ${_net_args[@]+"${_net_args[@]}"} "${headers[@]}")
+        _llm_transfer_budget
+        _stream_curl=(curl -sS --globoff -N "${_transfer_args[@]+"${_transfer_args[@]}"}" "${headers[@]}")
         if [[ "$_bg_resume" -eq 1 ]]; then
             IFS=$'\t' read -r LLM_BG_RESUME_ID LLM_BG_RESUME_SEQ LLM_BG_RESUME_TEXT LLM_BG_RESUME_REASONING \
                 < "$LLM_BG_STATE" || true
@@ -1964,21 +2057,22 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
         else
             _stream_curl+=(-d @"$payload_file" "$url")
         fi
-        if [[ "$_bg_active" -eq 1 ]]; then
-            # As a job, so a signal reaches the cancel trap at once instead of
-            # after the stream ends. The `|| exit` keeps the handler in the
-            # same errexit-ignored context the foreground form below gives it:
-            # a bare `( ... ) &` would run it with set -e live, and one
-            # transiently failing write (stderr to a busy pipe, say) would end
-            # the stream with a silent exit 1 instead of the handler's own
-            # verdict.
-            ( "$_stream_handler" < <("${_stream_curl[@]}" 2>"$_curl_err") || exit "$?" ) &
+        if [[ "$LLM_API_FORMAT" == responses ]]; then
+            mkfifo "$_llm_work/stream"
+            "${_stream_curl[@]}" > "$_llm_work/stream" 2>"$_curl_err" &
+            _llm_curl_pid=$!
+            ( "$_stream_handler" < "$_llm_work/stream" || exit "$?" ) &
             _bg_job=$!
             wait "$_bg_job" || _rc=$?
             _bg_job=""
+            kill "$_llm_curl_pid" 2>/dev/null || true
+            wait "$_llm_curl_pid" 2>/dev/null || true
+            _llm_curl_pid=""
+            rm -f "$_llm_work/stream"
         else
             ( "$_stream_handler" < <("${_stream_curl[@]}" 2>"$_curl_err") ) || _rc=$?
         fi
+        _llm_check_deadline
 
         _emitted=0
         [[ -e "$LLM_DATA_MARKER" ]] && _emitted=1
@@ -2001,7 +2095,7 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
                 _bg_resumes=$(( _bg_resumes + 1 ))
                 IFS=$'\t' read -r _bg_id_now _bg_seq_now _ < "$LLM_BG_STATE" || true
                 echo "llm: background stream dropped (resume $_bg_resumes/$LLM_RETRIES): resuming $_bg_id_now after sequence ${_bg_seq_now:-0}${_ce:+ ($_ce)}" >&2
-                sleep $(( LLM_RETRY_BACKOFF * _bg_resumes ))
+                _llm_pause $(( LLM_RETRY_BACKOFF * _bg_resumes ))
                 _bg_resume=1
                 continue
             fi
@@ -2030,7 +2124,7 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
             _retry_msg="empty response: stream ended without emitting anything"
             _rc=1
         fi
-        if [[ "$_bg_resume" -eq 1 ]]; then
+        if [[ "$_bg_resume" -eq 1 && "$_rc" -ne 76 ]]; then
             # A failed resume is final: the response exists server-side, so
             # re-creating it would run the model twice.
             _llm_bg_cancel "resume failed"
@@ -2042,7 +2136,7 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
         # Anthropic overloaded_error arrives as an in-stream error event and
         # exits 1, not 75), with one exception: a handler that exited 76
         # (die_permanent) saw an error a replay cannot fix.
-        if [[ "$_emitted" -eq 0 && "$_rc" -ne 76 \
+        if [[ "$LLM_API_FORMAT" != responses && "$_emitted" -eq 0 && "$_rc" -ne 76 \
             && "$_attempt" -lt "$_max_attempts" ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): ${_retry_msg:-${_ce:-exit $_rc}} — retrying" >&2
             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
@@ -2059,13 +2153,15 @@ else
     _attempt=0
     while :; do
         _attempt=$(( _attempt + 1 ))
-        local_resp=$(mktemp)
-        http_code=$(curl -sS -o "$local_resp" -w '%{http_code}' \
-            ${_net_args[@]+"${_net_args[@]}"} \
-            "${headers[@]}" -d @"$payload_file" "$url" 2>/dev/null) || http_code="000"
+        local_resp="$_llm_work/response"
+        _llm_fetch -o "$local_resp" -d @"$payload_file" "$url"
+        if [[ "$_bg_active" -eq 1 ]]; then
+            _bg_id=$(jq -r '.id // empty' "$local_resp" 2>/dev/null || true)
+        fi
+        _llm_check_deadline
 
         # Transient: network failure, timeout, rate limit, server error
-        if [[ "$http_code" =~ ^(000|408|429|5[0-9][0-9])$ && "$_attempt" -lt "$_max_attempts" ]]; then
+        if [[ "$LLM_API_FORMAT" != responses && "$http_code" =~ ^(000|408|429|5[0-9][0-9])$ && "$_attempt" -lt "$_max_attempts" ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): HTTP $http_code — retrying" >&2
             rm -f "$local_resp"
             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
@@ -2077,7 +2173,7 @@ else
         if [[ "$http_code" != "000" && "$http_code" -lt 400 ]]; then
             if grep -q '[^[:space:]]' "$local_resp"; then
                 if [[ "$LLM_API_FORMAT" == responses ]]; then
-                    embedded_err=$(check_response_responses < "$local_resp")
+                    embedded_err=$(check_response_responses < "$local_resp" || true)
                 else
                     embedded_err=$("check_response_${LLM_PROVIDER}" < "$local_resp")
                 fi
@@ -2087,12 +2183,14 @@ else
                 # parse-fail to empty on it, which used to read as success
                 # with no output.
                 embedded_err="whitespace-only response body"
+                [[ "$LLM_API_FORMAT" != responses ]] \
+                    || responses_outcome_unknown "$embedded_err"
             fi
             if [[ -n "$embedded_err" ]]; then
-                if [[ "$LLM_API_FORMAT" == responses ]] \
-                    && jq -e '.status == "failed"' "$local_resp" >/dev/null 2>&1; then
+                if [[ "$LLM_API_FORMAT" == responses ]]; then
                     write_response_file < "$local_resp"
                     rm -f "$local_resp"
+                    _llm_note error "" "$embedded_err"
                     die "API error: $embedded_err"
                 fi
                 if [[ "$_attempt" -lt "$_max_attempts" ]]; then
@@ -2111,9 +2209,18 @@ else
         break
     done
 
+    _response_id=""
+    if [[ "$LLM_API_FORMAT" == responses ]]; then
+        _response_id=$(jq -r '.id? | strings' "$local_resp" 2>/dev/null || true)
+    fi
     if [[ "$http_code" -ge 400 || "$http_code" == "000" ]]; then
         error_msg=$(jq -r '.error.message // .message // empty' "$local_resp" 2>/dev/null || true)
         if [[ "$LLM_API_FORMAT" == responses ]]; then
+            if [[ "$http_code" =~ ^(000|408|5[0-9][0-9])$ ]]; then
+                rm -f "$local_resp"
+                _llm_note error "$http_code" "create outcome unknown"
+                responses_outcome_unknown "create failed with HTTP $http_code; provider acceptance is unknown" "$_response_id"
+            fi
             if [[ -s "$local_resp" ]] && jq -e . "$local_resp" >/dev/null 2>&1; then
                 write_response_file < "$local_resp"
             else
@@ -2137,23 +2244,16 @@ else
     if [[ "$_bg_active" -eq 1 ]] \
        && jq -e '.status == "queued" or .status == "in_progress"' "$local_resp" >/dev/null 2>&1; then
         _llm_bg_poll
-        _final_status=$(jq -r '.status // empty' "$local_resp" 2>/dev/null || true)
-        case "$_final_status" in
-            failed)
-                write_response_file < "$local_resp"
-                _final_err=$(check_response_responses < "$local_resp")
-                rm -f "$local_resp"
-                _llm_note error "" "${_final_err:-response failed}"
-                die "API error: ${_final_err:-response failed}"
-                ;;
-            cancelled)
-                write_response_file < "$local_resp"
-                rm -f "$local_resp"
-                _llm_note error "" "response cancelled"
-                echo "llm: warning: response cancelled" >&2
-                die "API error: response cancelled"
-                ;;
-        esac
+    fi
+    if [[ "$LLM_API_FORMAT" == responses ]]; then
+        _final_err=$(check_response_responses < "$local_resp" || true)
+        if [[ -n "$_final_err" ]]; then
+            write_response_file < "$local_resp"
+            _llm_note error "" "$_final_err"
+            die "API error: $_final_err"
+        fi
+        valid_response_terminal < "$local_resp" \
+            || responses_outcome_unknown "invalid or nonterminal response body" "${_bg_id:-$_response_id}"
     fi
     _llm_note ok
 

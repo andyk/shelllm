@@ -40,6 +40,10 @@ for arg in "$@"; do
 done
 case "${1:-}" in
     serve)
+        printf '%s\n' "${RESPONSES_WS_PROVIDER:-}" > "$WS_STUB_DIR/broker-provider"
+        printf '%s\n' "${LLM_PROVIDER:-}" > "$WS_STUB_DIR/broker-llm-provider"
+        printf '%s\n' "${LLM_API_URL:-}" > "$WS_STUB_DIR/broker-api-url"
+        [[ "${WS_STUB_REJECT:-0}" != 1 ]] || exit 2
         printf '%s' "$sock" > "$WS_STUB_DIR/socket"
         : > "$sock"
         trap 'rm -f "$sock"; exit 0' TERM INT
@@ -58,6 +62,7 @@ chmod +x "$WORK/tools/responses-ws"
 # a final block so the run ends after one iteration.
 cat > "$WORK/toolbin/llm" <<'STUB'
 #!/usr/bin/env bash
+printf 'called\n' >> "$WS_STUB_DIR/model-calls"
 main_loop=0
 for arg in "$@"; do
     [[ "$arg" == --thinking ]] && main_loop=1
@@ -70,11 +75,13 @@ fi
     printf 'LLM_PROVIDER=%s\n' "${LLM_PROVIDER:-}"
     printf 'LLM_ADAPTER=%s\n' "${LLM_ADAPTER:-}"
     printf 'RESPONSES_WS_SOCKET=%s\n' "${RESPONSES_WS_SOCKET:-}"
+    printf 'RESPONSES_WS_PROVIDER=%s\n' "${RESPONSES_WS_PROVIDER:-}"
     printf 'LLM_API_FORMAT=%s\n' "${LLM_API_FORMAT:-}"
 } > "$WS_STUB_DIR/llm-env"
 if [[ -n "${LLM_RESPONSE_FILE:-}" ]]; then
     ( umask 077; jq -nc '{
         id: "resp_1", object: "response", status: "completed",
+        usage: {input_tokens:9000, output_tokens:1},
         output: [{id:"msg_1", type:"message", role:"assistant", status:"completed",
                   content:[{type:"output_text", text:"done"}]}]
     }' > "$LLM_RESPONSE_FILE" )
@@ -82,6 +89,26 @@ fi
 printf '%s\n' '```bash' 'FINAL=done' '```'
 STUB
 chmod +x "$WORK/toolbin/llm"
+
+# Lifecycle requests must never inherit the transport's adapter as provider.
+cat > "$WORK/toolbin/responses" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$WS_STUB_DIR/lifecycle-args"
+provider=""
+previous=""
+for arg in "$@"; do
+    [[ "$previous" == --provider ]] && provider="$arg"
+    previous="$arg"
+done
+printf '%s\n' "$provider" > "$WS_STUB_DIR/lifecycle-provider"
+[[ "$provider" == openai || "$provider" == openai-compatible ]] || exit 2
+case "$1" in
+    conversations) printf '%s\n' '{"id":"conv_ws"}' ;;
+    compact) printf '%s\n' '{"output":[{"type":"compaction","encrypted_content":"opaque"}]}' ;;
+    *) exit 2 ;;
+esac
+STUB
+chmod +x "$WORK/toolbin/responses"
 
 export PATH="$WORK/toolbin:$PATH"
 export HOME="$WORK/home"
@@ -164,6 +191,101 @@ if [[ -n "$sock" && ! -e "$sock" ]]; then
     ok "the socket is gone when the run is"
 else
     bad "the socket is gone when the run is" "socket=$sock"
+fi
+
+if [[ "$(cat "$WS_STUB_DIR/broker-provider")" == openai \
+    && "$(cat "$WS_STUB_DIR/broker-llm-provider")" != adapter ]] \
+    && grep -qx 'RESPONSES_WS_PROVIDER=openai' "$WS_STUB_DIR/llm-env"; then
+    ok "underlying provider is exported before the adapter override and reaches llm"
+else
+    bad "underlying provider is exported before the adapter override and reaches llm"
+fi
+
+LLM_PROVIDER=openai-compatible LLM_API_URL=https://compatible.example/v1/responses \
+    SHELLM_RESPONSES_CONVERSATION=new run_shellm responses websocket
+if [[ "$?" == 0 && "$(cat "$WS_STUB_DIR/broker-provider")" == openai-compatible \
+    && "$(cat "$WS_STUB_DIR/broker-api-url")" == https://compatible.example/v1/responses \
+    && "$(cat "$WS_STUB_DIR/lifecycle-provider")" == openai-compatible ]] \
+    && grep -qx 'RESPONSES_WS_PROVIDER=openai-compatible' "$WS_STUB_DIR/llm-env"; then
+    ok "compatible transport preserves the endpoint and original Conversation lifecycle provider"
+else
+    bad "compatible transport preserves the endpoint and original Conversation lifecycle provider" "$(tail -3 "$WORK/err")"
+fi
+
+LLM_PROVIDER=openai-compatible SHELLM_API_URL=https://compatible.example/v1/responses \
+    SHELLM_RESPONSES_COMPACT_THRESHOLD=1000 SHELLM_RESPONSES_COMPACT_MODE=standalone \
+    run_shellm responses websocket
+if [[ "$?" == 0 && "$(cat "$WS_STUB_DIR/lifecycle-provider")" == openai-compatible ]] \
+    && grep -qx 'compact' "$WS_STUB_DIR/lifecycle-args" \
+    && grep -qx -- '--instructions' "$WS_STUB_DIR/lifecycle-args"; then
+    ok "standalone compaction uses the original provider even after WebSocket adapter selection"
+else
+    bad "standalone compaction uses the original provider even after WebSocket adapter selection" "$(tail -3 "$WORK/err")"
+fi
+
+no_dispatch() { [[ ! -e "$WS_STUB_DIR/model-calls" && ! -e "$WS_STUB_DIR/lifecycle-args" ]]; }
+for provider in anthropic openrouter adapter; do
+    LLM_PROVIDER="$provider" SHELLM_RESPONSES_CONVERSATION=new run_shellm responses websocket
+    if [[ "$?" != 0 ]] && no_dispatch; then
+        ok "unsupported WebSocket provider $provider fails before Conversation creation or any model"
+    else
+        bad "unsupported WebSocket provider $provider fails before Conversation creation or any model"
+    fi
+done
+
+SHELLM_RESPONSES_BACKGROUND=1 SHELLM_RESPONSES_CONVERSATION=new run_shellm responses websocket
+if [[ "$?" != 0 ]] && no_dispatch && grep -q background "$WORK/err"; then
+    ok "WebSocket background env fails preflight before any dispatch"
+else
+    bad "WebSocket background env fails preflight before any dispatch"
+fi
+
+printf '%s\n' '{"background":true}' > "$WORK/body.json"
+SHELLM_RESPONSES_BODY_FILE="$WORK/body.json" SHELLM_RESPONSES_CONVERSATION=new \
+    run_shellm responses websocket
+if [[ "$?" != 0 ]] && no_dispatch && grep -q background "$WORK/err"; then
+    ok "effective body-file background fails preflight before any dispatch"
+else
+    bad "effective body-file background fails preflight before any dispatch"
+fi
+SHELLM_RESPONSES_BODY_FILE="$WORK/body.json" SHELLM_RESPONSES_BACKGROUND=0 run_shellm responses websocket
+if [[ "$?" == 0 ]] && ! no_dispatch; then
+    ok "explicit foreground override matches HTTP body precedence"
+else
+    bad "explicit foreground override matches HTTP body precedence"
+fi
+
+for body in '{"provider":{"zdr":true}}' '{"stream_options":{}}'; do
+    printf '%s\n' "$body" > "$WORK/body.json"
+    SHELLM_RESPONSES_BODY_FILE="$WORK/body.json" SHELLM_RESPONSES_CONVERSATION=new \
+        run_shellm responses websocket
+    if [[ "$?" != 0 ]] && no_dispatch; then
+        ok "unsupported body policy fails before lifecycle or model dispatch: $body"
+    else
+        bad "unsupported body policy fails before lifecycle or model dispatch: $body"
+    fi
+done
+
+RESPONSES_WS_URL=wss://different.example/v1/responses SHELLM_RESPONSES_CONVERSATION=new \
+    run_shellm responses websocket
+if [[ "$?" != 0 ]] && no_dispatch; then
+    ok "a transport-only endpoint override cannot split lifecycle and completion destinations"
+else
+    bad "a transport-only endpoint override cannot split lifecycle and completion destinations"
+fi
+
+LLM_OR_ZDR=1 SHELLM_RESPONSES_CONVERSATION=new run_shellm responses websocket
+if [[ "$?" != 0 ]] && no_dispatch; then
+    ok "unsupported routing/privacy policy fails before any dispatch"
+else
+    bad "unsupported routing/privacy policy fails before any dispatch"
+fi
+
+WS_STUB_REJECT=1 SHELLM_RESPONSES_CONVERSATION=new run_shellm responses websocket
+if [[ "$?" != 0 ]] && no_dispatch; then
+    ok "broker startup validation failure cannot create a Conversation or execute a model"
+else
+    bad "broker startup validation failure cannot create a Conversation or execute a model"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

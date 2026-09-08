@@ -9,7 +9,7 @@
 [![CI](https://github.com/laude-institute/headlong/actions/workflows/ci.yml/badge.svg)](https://github.com/laude-institute/headlong/actions/workflows/ci.yml)
 
 **Headlong** is an open source agent microharness, a complete agent harness
-with a core of about 11K lines of Bash.
+with a core of about 12K lines of Bash.
 
 [Launch post](https://www.laude.org/updates/headlong-a-microharness-for-persistent-agents) |
 [Announcement](https://x.com/andykonwinski/status/2091990178638496195)
@@ -158,7 +158,7 @@ Headlong also gives an agent a few convenience tools, such as a way to
 distill and codify its experience (`mem`) and a way to save and reuse
 procedures for specialized tasks (`skills`). The core is the tools the
 running mind executes, the executables in `bin/` plus the thought
-processes in `thinkers/`, and it comes to about 11.5K lines by cloc's count (capped at 12K). A
+processes in `thinkers/`, and it comes to about 11.9K lines by cloc's count (capped at 12K). A
 harness this small can be read end to end, and it is easy to modify and
 experiment with.
 
@@ -287,6 +287,13 @@ in [design/providers.md](design/providers.md).
 
 ## Learn more
 
+- [Operating Headlong](docs/operating-headlong.md) — choose a runtime and
+  operate identities, thinkers, chat, memory, trajectories, and skills safely
+- [Using Responses](docs/responses-guide.md) — completion workers, background
+  recovery, resumable sessions, WebSocket transport, compaction, and examples
+- [Agent operating skills](skills/README.md) — procedural guidance for core
+  Headlong and Responses, installed with the framework and discoverable by
+  coding agents in this checkout
 - [philosophy.md](philosophy.md) — the case for applying Ken Thompson's
   philosophy to agent microharnesses, and the full design story
 - [docs/shellm.md](docs/shellm.md) — the shellm engine reference: the

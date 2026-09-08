@@ -42,7 +42,7 @@ section() { printf '\n--- %s\n' "$1"; }
 # The tool list is install.sh's source of truth; pull the two arrays out of it.
 eval "$(grep -E '^(BIN|AUX)_TOOLS=' "$REPO/install.sh")"
 TOOLS=("${BIN_TOOLS[@]}" "${AUX_TOOLS[@]}")
-PY_TOOLS=(headlong-web headlong-slack-bridge headlong-telegram-bridge)
+PY_TOOLS=(headlong-web headlong-slack-bridge headlong-telegram-bridge responses-ws)
 
 is_py_tool() { local t; for t in "${PY_TOOLS[@]}"; do [[ "$t" == "$1" ]] && return 0; done; return 1; }
 

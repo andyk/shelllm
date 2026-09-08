@@ -9,6 +9,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+REAL_CURL=$(command -v curl)
 
 pass=0
 fail=0
@@ -37,9 +38,56 @@ done
 printf '%s %s\n' "$method" "$url" >> "$CURL_LOG"
 [[ -n "$payload_file" ]] && cp "$payload_file" "$CURL_PAYLOAD"
 [[ -n "$auth_file" ]] && cp "$auth_file" "$CURL_AUTH"
+if [[ "${CURL_CHECK_PERMS:-0}" == 1 ]]; then
+    find "$TMPDIR" -type f ! -perm 600 -print >> "$CURL_BAD_MODES"
+    find "$TMPDIR" -mindepth 1 -type d ! -perm 700 -print >> "$CURL_BAD_MODES"
+fi
 emit() { if [[ -n "$out_file" ]]; then printf '%s' "$1" > "$out_file"; else printf '%s' "$1"; fi; }
 
 case "$CURL_MODE" in
+    hang)
+        printf '%s\n' "$$" > "$CURL_PID"
+        exec sleep 60
+        ;;
+    network-error) exit 28 ;;
+    oversize)
+        # Sparse file: exercise the aggregate byte guard without a large
+        # allocation, even if a transport fails to enforce max-filesize.
+        python3 - "$out_file" <<'PY'
+import sys
+with open(sys.argv[1], 'wb') as f:
+    f.truncate(67108865)
+PY
+        printf '200'
+        ;;
+    late-malformed)
+        if [[ "$n" -eq 1 ]]; then
+            emit '{"data":[{"id":"itm_1"}],"has_more":true}'
+        else
+            emit 'not JSON'
+        fi
+        printf '200'
+        ;;
+    fixture)
+        emit "$CURL_FIXTURE"
+        printf '200'
+        ;;
+    cycle)
+        emit "{\"data\":[{\"id\":\"itm_$(( (n - 1) % 2 ))\"}],\"has_more\":true}"
+        printf '200'
+        ;;
+    boundary|cap)
+        more=true
+        [[ "$CURL_MODE" == boundary && "$n" -eq 500 ]] && more=false
+        emit "{\"data\":[{\"id\":\"itm_$n\"}],\"has_more\":$more}"
+        printf '200'
+        ;;
+    duplicate)
+        more=true
+        [[ "$n" -eq 2 ]] && more=false
+        emit "{\"data\":[{\"id\":\"shared\"},{\"id\":\"itm_$n\"}],\"has_more\":$more}"
+        printf '200'
+        ;;
     response)
         emit '{"id":"resp_1","object":"response","status":"completed","output":[]}'
         printf '200'
@@ -53,7 +101,7 @@ case "$CURL_MODE" in
         printf '200'
         ;;
     compacted)
-        emit '{"id":"resp_c","object":"response.compaction","output":[{"id":"cmp_1","type":"compaction","encrypted_content":"opaque"}]}'
+        emit '{"id":"resp_c","object":"response.compaction","output":[{"id":"cmp_1","type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":100,"output_tokens":12}}'
         printf '200'
         ;;
     pages)
@@ -338,6 +386,14 @@ else
     bad "compact merges --body-file first and lets CLI-owned fields win" "$(cat "$CURL_PAYLOAD")"
 fi
 
+if jq -e 'select(.operation == "responses.compact") | .model == "gpt-5.4-mini"
+    and .provider == "openai" and .in_tok == 100 and .out_tok == 12' \
+    "$HEADLONG_HOME/usage/llm.jsonl" >/dev/null; then
+    ok "standalone compaction usage enters the shared inference ledger"
+else
+    bad "standalone compaction usage enters the shared inference ledger"
+fi
+
 reset
 run compact --model gpt-5.4-mini --previous-response-id resp_1
 jq -e '.previous_response_id == "resp_1" and (has("input") | not)' "$CURL_PAYLOAD" >/dev/null \
@@ -430,6 +486,198 @@ usage_case "an items file that is not a JSON array" conversations add conv_1 \
     --items-file "$WORK/notarray.json"
 usage_case "an items file that does not exist" conversations add conv_1 \
     --items-file "$WORK/missing.json"
+
+# Path ids must never change the target of a destructive operation.
+for id in '' '.' '..' '../resp_other' 'resp_1?other=1' 'resp_1#fragment' 'resp_%2fother' 'resp_[1-2]' 'resp_1/'; do
+    usage_case "unsafe response id: $id" delete "$id"
+done
+usage_case "unsafe conversation id" conversations delete '../conv_other'
+usage_case "unsafe item id" conversations remove conv_1 'itm_1?other=1'
+usage_case "invalid cursor" input-items resp_1 --after '../item'
+usage_case "invalid page limit" input-items resp_1 --limit -1
+usage_case "invalid order" input-items resp_1 --order sideways
+usage_case "invalid stream sequence" get resp_1 --stream --starting-after nope
+
+# --all must not turn malformed data or a safety bound into exhaustion.
+export TMPDIR="$WORK/tmp with spaces"
+mkdir -p "$TMPDIR"
+for fixture in \
+    'not JSON' '{}' '[]' \
+    '{"data":[],"has_more":null}' \
+    '{"data":[],"has_more":"false"}' \
+    '{"data":[],"has_more":0}' \
+    '{"data":[],"has_more":true}' \
+    '{"data":[{}],"has_more":false}' \
+    '{"data":[{"id":""}],"has_more":true}' \
+    '{"data":[{"id":123}],"has_more":false}' \
+    '{"data":[{"id":"../item"}],"has_more":true}' \
+    '{"data":[{"id":"a"}],"last_id":"b","has_more":false}' \
+    '{"data":{},"has_more":false}' \
+    '{"data":[],"has_more":false} {"data":[],"has_more":false}'; do
+    reset
+    CURL_MODE=fixture CURL_FIXTURE="$fixture" run input-items resp_1 --all
+    rc=$?
+    if [[ "$rc" -eq 1 && ! -s "$WORK/stdout" && -s "$WORK/stderr" && "$(cat "$CURL_CALLS")" == 1 ]]; then
+        ok "--all rejects malformed page: $fixture"
+    else
+        bad "--all rejects malformed page: $fixture" "rc=$rc"
+    fi
+done
+for mode in fixture cycle duplicate cap late-malformed oversize; do
+    reset
+    CURL_MODE="$mode" CURL_FIXTURE='{"data":[{"id":"same"}],"has_more":true}' \
+        run conversations items conv_1 --all
+    rc=$?
+    calls=$(cat "$CURL_CALLS")
+    expected=2
+    [[ "$mode" == cycle ]] && expected=3
+    [[ "$mode" == cap ]] && expected=500
+    [[ "$mode" == oversize ]] && expected=1
+    if [[ "$rc" -eq 1 && ! -s "$WORK/stdout" && "$calls" -eq "$expected" && -s "$WORK/stderr" ]]; then
+        ok "--all fails closed on $mode ($expected requests)"
+    else
+        bad "--all fails closed on $mode" "rc=$rc calls=$calls"
+    fi
+done
+reset
+CURL_MODE=boundary run input-items resp_1 --all
+if [[ $? -eq 0 && "$(cat "$CURL_CALLS")" == 500 ]] \
+    && jq -e '.has_more == false and (.data | length) == 500' "$WORK/stdout" >/dev/null; then
+    ok "actual exhaustion at page 500 succeeds"
+else
+    bad "actual exhaustion at page 500 succeeds"
+fi
+reset
+CURL_MODE=fixture CURL_FIXTURE='{"data":[],"has_more":false}' run input-items resp_1 --all
+if [[ $? -eq 0 ]] && jq -e '.data == [] and .has_more == false and .last_id == null' "$WORK/stdout" >/dev/null; then
+    ok "an explicitly exhausted empty list succeeds"
+else
+    bad "an explicitly exhausted empty list succeeds"
+fi
+
+# Every file, not just auth, is private and removed on success and failure.
+export CURL_BAD_MODES="$WORK/bad-modes" CURL_CHECK_PERMS=1
+for mode in response not-found network-error stream-terminal stream-truncated pages; do
+    reset
+    : > "$CURL_BAD_MODES"
+    case "$mode" in
+        stream-*) CURL_MODE="$mode" run get resp_1 --stream ;;
+        pages) CURL_MODE="$mode" run input-items resp_1 --all ;;
+        *) CURL_MODE="$mode" run conversations update conv_1 --metadata '{"private":"body"}' ;;
+    esac
+    if [[ -z "$(ls -A "$TMPDIR")" && ! -s "$CURL_BAD_MODES" ]]; then
+        ok "$mode cleans private temporary files with spaces in TMPDIR"
+    else
+        bad "$mode cleans private temporary files with spaces in TMPDIR"
+    fi
+done
+unset CURL_CHECK_PERMS
+
+# Reset SIGINT before exec (the test runner may itself inherit it ignored).
+# The stub execs sleep, so its recorded PID is the actual network child.
+export CURL_PID="$WORK/curl.pid"
+if python3 - "$R" "$WORK" <<'PY'
+import os, pathlib, signal, subprocess, sys, time
+r, work = sys.argv[1:]
+env = dict(os.environ, CURL_MODE="hang")
+pidfile = pathlib.Path(env["CURL_PID"])
+def reset_signals():
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_DFL)
+for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    for args in (["get", "resp_1"], ["get", "resp_1", "--stream"],
+                 ["conversations", "update", "conv_1", "--metadata", '{"private":"body"}']):
+        pidfile.unlink(missing_ok=True)
+        with open(work + "/signal.out", "wb") as out:
+            p = subprocess.Popen([r, *args], env=env, stdout=out, stderr=out,
+                                 preexec_fn=reset_signals)
+            child = None
+            try:
+                deadline = time.monotonic() + 5
+                while not pidfile.exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                child = int(pidfile.read_text())
+                p.send_signal(sig)
+                assert p.wait(timeout=3) == 128 + sig
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise AssertionError("network child survived")
+                assert not list(pathlib.Path(env["TMPDIR"]).iterdir()), "temporary files survived"
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+                if child:
+                    try:
+                        os.kill(child, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+PY
+then ok "HUP/INT/TERM reap network children and clean files (9 cases)"
+else bad "HUP/INT/TERM reap network children and clean files"
+fi
+
+# Real curl against an in-process loopback fixture, never a provider. Empty
+# include[] is accepted by curl even without globoff; globoff also ensures
+# configured base paths containing curl metacharacters are sent literally.
+if python3 - "$R" "$REAL_CURL" "$WORK" <<'PY'
+import http.server, json, os, pathlib, subprocess, sys, threading
+r, curl, work = sys.argv[1:]
+paths = []
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        paths.append(self.path)
+        if self.path.startswith('/oversize/'):
+            self.send_response(200)
+            self.send_header('Content-Length', '67108865')
+            self.end_headers()
+            return
+        data = (b'data: {"type":"response.completed"}\n\n' if 'stream=true' in self.path
+                else b'{"id":"resp_1"}')
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+realbin = pathlib.Path(work) / 'realbin'
+realbin.mkdir()
+(realbin / 'curl').symlink_to(curl)
+base = 'http://127.0.0.1:' + str(server.server_port)
+env = dict(os.environ, PATH=str(realbin) + ':' + os.environ['PATH'],
+           LLM_PROVIDER='openai-compatible', LLM_API_URL=base + '/v{1,2}',
+           LLM_API_KEY='fixture-key', NO_PROXY='127.0.0.1', no_proxy='127.0.0.1')
+try:
+    subprocess.run([curl, '-fsS', base + '/plain?include[]=reasoning.encrypted_content'],
+                   check=True, capture_output=True, env=env, timeout=5)
+    assert paths.pop() == '/plain?include[]=reasoning.encrypted_content'
+    for stream in (False, True):
+        args = [r, 'get', 'resp_1', '--include', 'reasoning.encrypted_content',
+                '--include', 'message.output_text.logprobs'] + (['--stream'] if stream else [])
+        result = subprocess.run(args, check=True, capture_output=True, env=env, timeout=5)
+        json.loads(result.stdout)
+        query = ('stream=true&' if stream else '') + 'include[]=reasoning.encrypted_content&include[]=message.output_text.logprobs'
+        assert paths == ['/v{1,2}/responses/resp_1?' + query], paths
+        paths.clear()
+    env['LLM_API_URL'] = base + '/oversize'
+    result = subprocess.run([r, 'input-items', 'resp_1', '--all'],
+                            capture_output=True, env=env, timeout=5)
+    assert result.returncode == 1 and not result.stdout and result.stderr
+    assert not list(pathlib.Path(env['TMPDIR']).iterdir())
+finally:
+    server.shutdown()
+    server.server_close()
+    thread.join()
+PY
+then ok "real curl preserves includes and literal URL targets (buffered and streamed)"
+else bad "real curl preserves includes and literal URL targets"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

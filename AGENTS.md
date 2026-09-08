@@ -116,8 +116,24 @@ Replies take 15 to 45 seconds while the monolith thinker wakes.
 - Responses mode (`SHELLM_API_FORMAT=responses`) keeps its continuation
   state per process: response ids and the replay chain live in the run's
   temp dir and vanish with it, and a `--resume` starts a fresh chain from
-  the trajectory. Only `SHELLM_RESPONSES_CONVERSATION` is durable across
-  runs (the id is written to the `shellm-run` header row). The knobs and
-  their interplay are in the Responses sections of
-  [docs/shellm.md](docs/shellm.md); the contracts are
-  design/responses-api.md and design/responses-lifecycle.md.
+  the trajectory. Conversation mode instead persists its id in the run
+  header and private sent-step acknowledgements under the trajectory
+  directory's `.responses-conversations/`. A whole-run local lock prevents
+  competing writers; ambiguous, missing, mismatched checkpoints or stale
+  locks fail closed. Do not delete a lock and blindly retry. Responses
+  CREATE is never automatically retried; preserve `outcome_unknown` and
+  recovery handles rather than assuming nothing happened.
+
+## Operating guides and skills
+
+- [Operating Headlong](docs/operating-headlong.md): core identity, thinker,
+  chat, memory, trajectory, context, and skill workflows and safety boundaries.
+- [Using Responses](docs/responses-guide.md): choosing a completion worker,
+  background recovery, sessions, transport, compaction, and executable examples.
+- [shellm reference](docs/shellm.md): the execution loop and its configuration.
+- Agent skills: `operating-headlong` and `operating-headlong-responses` in
+  `skills/`, also discoverable through `.agents/skills/` symlinks. The legacy
+  `shellm` skill now routes to the correct engine/framework documentation.
+- Protocol contracts: `design/responses-api.md` and
+  `design/responses-lifecycle.md`. Synthetic protocol tests do not certify
+  live-provider behavior; paid verification requires an approved spend scope.

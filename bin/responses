@@ -34,9 +34,24 @@ PRETTY=0
 CONNECT_TIMEOUT="${LLM_CONNECT_TIMEOUT:-10}"
 MAX_TIME="${LLM_MAX_TIME:-600}"
 
-_tmp_files=""
-_cleanup() { [[ -n "$_tmp_files" ]] && rm -rf $_tmp_files; return 0; }
+_tmp_dir=""
+_curl_pid=""
+_cleanup() {
+    # curl is a direct, owned child, including while streaming. Stop and reap
+    # it before removing files it may still be reading or writing.
+    if [[ -n "$_curl_pid" ]]; then
+        kill -TERM "$_curl_pid" 2>/dev/null || true
+        kill -KILL "$_curl_pid" 2>/dev/null || true
+        wait "$_curl_pid" 2>/dev/null || true
+        _curl_pid=""
+    fi
+    [[ -z "$_tmp_dir" ]] || rm -rf -- "$_tmp_dir"
+    return 0
+}
 trap _cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 die() { printf 'responses: error: %s\n' "$*" >&2; exit 1; }
 usage_error() {
@@ -44,11 +59,15 @@ usage_error() {
     printf "Try 'responses --help'.\n" >&2
     exit 2
 }
+init_tmp() {
+    [[ -z "$_tmp_dir" ]] || return 0
+    umask 077
+    _tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/responses.XXXXXX") \
+        || die "cannot create a temporary directory"
+}
 mktmp() {
-    local f
-    f=$(mktemp "${TMPDIR:-/tmp}/responses.XXXXXX") || die "cannot create a temporary file"
-    _tmp_files="$_tmp_files $f"
-    printf '%s' "$f"
+    # Allocation may run in a subshell; ownership stays with the parent dir.
+    mktemp "$_tmp_dir/file.XXXXXX" || die "cannot create a temporary file"
 }
 
 usage() {
@@ -147,7 +166,13 @@ shift_pos() {
 
 want_pos() {  # want_pos <count> <what>
     [[ "${#POS[@]}" -eq "$1" ]] || usage_error "$COMMAND takes $2"
+    local id
+    for id in ${POS[@]+"${POS[@]}"}; do
+        valid_id "$id" || usage_error "ids must contain only letters, digits, underscores, or hyphens"
+    done
 }
+
+valid_id() { [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]; }
 
 # ---------------------------------------------------------------------------
 # Provider, base URL, auth
@@ -186,6 +211,7 @@ add_auth_header() {
 BASE=""
 HEADERS=()
 resolve_provider() {
+    init_tmp
     [[ -n "$PROVIDER" ]] || PROVIDER="openai"
     HEADERS=(-H "Content-Type: application/json")
     case "$PROVIDER" in
@@ -251,18 +277,26 @@ BODY=""
 # do_request <method> <path>. Reads QUERY and BODY, leaves the reply in
 # $RESP_FILE, and dies on a non-2xx with the API's own message.
 RESP_FILE=""
+REQUEST_MAX_BYTES=0
 do_request() {
-    local method="$1" url="$BASE$2" code body_file=""
+    local method="$1" url="$BASE$2" code code_file body_file="" rc=0
     [[ -n "$QUERY" ]] && url="$url?$QUERY"
     RESP_FILE=$(mktmp)
-    local args=(-sS -o "$RESP_FILE" -w '%{http_code}')
+    code_file=$(mktmp)
+    local args=(--globoff -sS -o "$RESP_FILE" -w '%{http_code}')
     args+=(${NET[@]+"${NET[@]}"} "${HEADERS[@]}" -X "$method")
+    [[ "$REQUEST_MAX_BYTES" -eq 0 ]] || args+=(--max-filesize "$REQUEST_MAX_BYTES")
     if [[ -n "$BODY" ]]; then
         body_file=$(mktmp)
         printf '%s' "$BODY" > "$body_file"
         args+=(-d @"$body_file")
     fi
-    code=$(curl "${args[@]}" "$url" 2>/dev/null) || code="000"
+    curl "${args[@]}" "$url" > "$code_file" 2>/dev/null &
+    _curl_pid=$!
+    wait "$_curl_pid" || rc=$?
+    _curl_pid=""
+    code=$(cat "$code_file")
+    [[ "$rc" -eq 0 ]] || code="000"
     [[ "$code" =~ ^2[0-9][0-9]$ ]] && return 0
     local msg=""
     msg=$(jq -r '(.error.message // .message // empty)' < "$RESP_FILE" 2>/dev/null) || msg=""
@@ -280,8 +314,11 @@ emit() {
 # the ids bracket the whole set.
 run_list() {
     local path="$1" after="$OPT_AFTER" n=0 has_more last pages merged
-    pages=$(mktemp -d "${TMPDIR:-/tmp}/responses-pages.XXXXXX") || die "cannot create a temporary directory"
-    _tmp_files="$_tmp_files $pages"
+    local seen="|$OPT_AFTER|" bytes=0 size
+    pages="$_tmp_dir/pages"
+    mkdir "$pages"
+    # Bound both each transfer and the aggregate before slurping it into jq.
+    REQUEST_MAX_BYTES=67108864
     while :; do
         n=$(( n + 1 ))
         QUERY=""
@@ -291,14 +328,30 @@ run_list() {
         qadd_includes
         do_request GET "$path"
         if [[ "$OPT_ALL" -ne 1 ]]; then emit "$RESP_FILE"; return 0; fi
+        size=$(wc -c < "$RESP_FILE")
+        bytes=$((bytes + size))
+        [[ "$bytes" -le "$REQUEST_MAX_BYTES" ]] || die "paginated reply exceeds 64 MiB; list is incomplete"
+        jq -se 'length == 1 and (.[0] |
+            type == "object" and (.data | type == "array") and
+            (.has_more | type == "boolean") and
+            all(.data[]; type == "object" and (.id | type == "string") and
+                (.id | test("^[A-Za-z0-9_-]+$"))) and
+            ((has("last_id") | not) or .last_id == (.data[-1].id // null)))' \
+            < "$RESP_FILE" >/dev/null 2>&1 || die "malformed list page $n; list is incomplete"
         cp "$RESP_FILE" "$pages/$(printf '%05d' "$n").json"
-        has_more=$(jq -r '.has_more // false' < "$RESP_FILE" 2>/dev/null) || has_more="false"
-        last=$(jq -r '(.data // []) | if length > 0 then (.[-1].id // "") else "" end' < "$RESP_FILE" 2>/dev/null) || last=""
-        [[ "$has_more" == "true" && -n "$last" && "$last" != "$after" && "$n" -lt 500 ]] || break
+        has_more=$(jq -r '.has_more' < "$RESP_FILE")
+        [[ "$has_more" == "true" ]] || break
+        last=$(jq -r '.data[-1].id // empty' < "$RESP_FILE")
+        [[ -n "$last" ]] || die "empty continuing page $n; list is incomplete"
+        case "$seen" in *"|$last|"*) die "pagination cursor did not progress (page $n); list is incomplete" ;; esac
+        [[ "$n" -lt 500 ]] || die "pagination reached the 500-page limit; list is incomplete"
+        seen="$seen$last|"
         after="$last"
     done
     merged=$(mktmp)
-    jq -s '(map((.data // [])[])) as $d
+    jq -s '(map(.data[])) as $d
+           | if ($d | map(.id) | unique | length) != ($d | length)
+             then error("duplicate item ids; list is incomplete") else . end
            | {object: (.[0].object // "list"),
               data: $d,
               first_id: (if ($d | length) > 0 then $d[0].id else null end),
@@ -315,9 +368,13 @@ run_list() {
 # server sent that was not an SSE data line is kept so an HTTP error body can
 # still be reported as the reason.
 stream_get() {
-    local url="$BASE$1" line payload etype terminal=0 other msg
+    local url="$BASE$1" line payload etype terminal=0 other msg rc=0
     [[ -n "$QUERY" ]] && url="$url?$QUERY"
     other=$(mktmp)
+    mkfifo "$_tmp_dir/stream"
+    curl --globoff -sS -N ${NET[@]+"${NET[@]}"} "${HEADERS[@]}" "$url" \
+        > "$_tmp_dir/stream" 2>/dev/null &
+    _curl_pid=$!
     while IFS= read -r line; do
         case "$line" in
             data:*) ;;
@@ -332,8 +389,10 @@ stream_get() {
             response.completed|response.incomplete|response.failed|response.cancelled)
                 terminal=1 ;;
         esac
-    done < <(curl -sS -N ${NET[@]+"${NET[@]}"} "${HEADERS[@]}" "$url" 2>/dev/null)
-    [[ "$terminal" -eq 1 ]] && return 0
+    done < "$_tmp_dir/stream"
+    wait "$_curl_pid" || rc=$?
+    _curl_pid=""
+    [[ "$terminal" -eq 1 && "$rc" -eq 0 ]] && return 0
     msg=$(jq -r '(.error.message // .message // empty)' < "$other" 2>/dev/null) || msg=""
     [[ -n "$msg" ]] || msg="the stream ended without a terminal response event"
     die "$msg"
@@ -380,6 +439,11 @@ build_items_body() {  # build_items_body <file>
 
 parse_opts "$@"
 [[ "${#POS[@]}" -gt 0 ]] || usage_error "no command given"
+[[ -z "$OPT_AFTER" ]] || valid_id "$OPT_AFTER" || usage_error "invalid --after id"
+[[ -z "$OPT_PREV" ]] || valid_id "$OPT_PREV" || usage_error "invalid --previous-response-id"
+[[ -z "$OPT_LIMIT" || "$OPT_LIMIT" =~ ^[1-9][0-9]*$ ]] || usage_error "--limit must be a positive integer"
+[[ -z "$OPT_ORDER" || "$OPT_ORDER" == asc || "$OPT_ORDER" == desc ]] || usage_error "--order must be asc or desc"
+[[ -z "$OPT_STARTING_AFTER" || "$OPT_STARTING_AFTER" =~ ^[0-9]+$ ]] || usage_error "--starting-after must be a nonnegative integer"
 COMMAND="${POS[0]}"
 shift_pos
 NET=()
@@ -453,6 +517,26 @@ case "$COMMAND" in
         resolve_provider; net_args
         QUERY=""
         do_request POST "/responses/compact"
+        # Compaction is billable inference too. Use the completion ledger's
+        # units/schema without overwriting the parent completion usage file.
+        _ledger_home="${IDENTITY_DIR:-${HEADLONG_HOME:-${SHELLM_HOME:-$HOME/.headlong}}}"
+        _ledger="${LLM_USAGE_LEDGER:-$_ledger_home/usage/llm.jsonl}"
+        _identity="${IDENTITY_NAME:-}"
+        [[ -n "$_identity" || -z "${IDENTITY_DIR:-}" ]] || _identity=$(basename "$IDENTITY_DIR")
+        if [[ "$_ledger" != /dev/null ]] && mkdir -p "$(dirname "$_ledger")" 2>/dev/null; then
+            jq -c --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg provider "$PROVIDER" \
+                --arg model "$OPT_MODEL" --arg identity "$_identity" \
+                --arg run_id "${LLM_RUN_ID:-${SHELLM_RUN_STEP_ID:-}}" '
+                select(.usage | type == "object") | .usage as $u
+                | {ts:$ts,provider:$provider,model:$model,operation:"responses.compact"}
+                + (if ($u.input_tokens | type) == "number" then {in_tok:$u.input_tokens} else {} end)
+                + (if ($u.output_tokens | type) == "number" then {out_tok:$u.output_tokens} else {} end)
+                + (if ($u.input_tokens_details.cached_tokens | type) == "number" then {cache_tok:$u.input_tokens_details.cached_tokens} else {} end)
+                + (if ($u.output_tokens_details.reasoning_tokens | type) == "number" then {think_tok:$u.output_tokens_details.reasoning_tokens} else {} end)
+                + (if $identity == "" then {} else {identity:$identity} end)
+                + (if $run_id == "" then {} else {run_id:$run_id} end)' \
+                "$RESP_FILE" >> "$_ledger" 2>/dev/null || true
+        fi
         emit "$RESP_FILE"
         ;;
     conversations)

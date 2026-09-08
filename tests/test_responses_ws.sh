@@ -18,9 +18,8 @@
 #   - the broker: two concurrent callers through one unix socket get their own
 #     stream_id lanes and both complete, and stop shuts it down
 #
-# The adapter needs uv (it is a PEP 723 script). Without uv, or without a way
-# to prepare its one dependency, the test prints one skip line and exits 0,
-# like the Docker-gated tests.
+# The adapter needs uv (it is a PEP 723 script). A missing runtime or dependency
+# is a test failure, never an unnoticed skip.
 
 set -uo pipefail
 
@@ -41,8 +40,8 @@ ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 
 if ! command -v uv >/dev/null 2>&1; then
-    echo "ok   skipped: uv is not installed (tools/responses-ws is a uv PEP 723 script)"
-    exit 0
+    echo "FAIL uv is required to exercise tools/responses-ws"
+    exit 1
 fi
 
 # --- the fake OpenAI WebSocket endpoint --------------------------------------
@@ -53,7 +52,7 @@ fi
 cat > "$WORK/fake_server.py" <<'PYEOF'
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["websockets>=13"]
+# dependencies = ["websockets==17.1"]
 # ///
 import asyncio
 import json
@@ -157,19 +156,18 @@ async def main():
 asyncio.run(main())
 PYEOF
 
-# Preparing the dependency is the same work the adapter itself does, so if it
-# cannot be done (no network and no cache) the adapter cannot run either and
-# there is nothing here to test.
+# Preparing the exact dependency is part of the executable contract.
 cat > "$WORK/probe.py" <<'PYEOF'
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["websockets>=13"]
+# dependencies = ["websockets==17.1"]
 # ///
-import websockets  # noqa: F401
+import websockets
+assert websockets.__version__ == "17.1"
 PYEOF
 if ! uv run --quiet --script "$WORK/probe.py" >/dev/null 2>&1; then
-    echo "ok   skipped: uv cannot prepare the websockets dependency (no network, no cache)"
-    exit 0
+    echo "FAIL uv cannot prepare the pinned websockets==17.1 dependency"
+    exit 1
 fi
 
 ADAPTER="$REPO/tools/responses-ws"
@@ -224,7 +222,10 @@ export HEADLONG_HOME="$WORK/home"
 mkdir -p "$HEADLONG_HOME"
 unset ANTHROPIC_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY OPENCODE_API_KEY \
       LLM_API_KEY LLM_API_URL LLM_MODEL LLM_MAX_TOKENS SHELLM_MODEL \
-      SHELLM_API_URL RESPONSES_WS_SOCKET
+      SHELLM_API_URL RESPONSES_WS_SOCKET LLM_PROVIDER RESPONSES_WS_PROVIDER \
+      LLM_OR_ONLY LLM_OR_DATA_COLLECTION LLM_OR_ZDR LLM_STOP_AFTER_CODE_BLOCK \
+      LLM_RESPONSES_BACKGROUND LLM_RESPONSES_BODY_FILE LLM_PREVIOUS_RESPONSE_ID \
+      LLM_RESPONSES_CONVERSATION LLM_RESPONSES_COMPACT_THRESHOLD
 export OPENAI_API_KEY="test-key"
 export LLM_RETRIES=0
 export LLM_USAGE_LEDGER=/dev/null
@@ -453,6 +454,12 @@ EOF
     stop_server
 else
     bad "fake WebSocket server starts (broker)" "$(head -5 "$WORK/server.log" 2>/dev/null)"
+fi
+
+if uv run --quiet --script "$HERE/test_responses_ws_faults.py"; then
+    ok "WebSocket conformance and broker fault regressions (Python unittest)"
+else
+    bad "WebSocket conformance and broker fault regressions (Python unittest)"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
