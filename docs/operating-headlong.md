@@ -138,22 +138,24 @@ Use `chat --help` for bridge metadata, threaded history, files, and follow-ups.
 
 ## Memory, trajectory, context, and skills
 
-Run these inside `ada shell` (or another correctly activated environment):
+Run these inside `ada shell` (or another correctly activated environment).
+Replace `MEMORY_ID`, `STEP_OR_TRAJECTORY_ID`, and `SKILL_NAME` with values
+returned by the corresponding inspection commands:
 
 ```bash
 mem add --type fact "The deployment window is Tuesday."
 mem list --type fact -s
-mem show <id>
+mem show MEMORY_ID
 mem search "deployment window"     # model-assisted; costs a call
 
 traj tail -n 20
 traj search "deployment" -i
-traj show <step-or-trajectory-id>
+traj show STEP_OR_TRAJECTORY_ID
 traj check                         # read-only validation
 
 context --head 1 --tail 30         # JSON model-message view
 skills list
-skills show <name>
+skills show SKILL_NAME
 ```
 
 Use `mem edit <id> ...` to correct and `mem forget <id>` to delete only after

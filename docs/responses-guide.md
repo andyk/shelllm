@@ -171,7 +171,8 @@ Conversation mode is for a persistent session with one owner:
 SHELLM_API_FORMAT=responses SHELLM_MODEL=gpt-5.4-mini \
 SHELLM_RESPONSES_CONVERSATION=new shellm "Investigate the test failure in this sandbox"
 # In the same trajectory context, after the first run has stopped:
-SHELLM_API_FORMAT=responses shellm --resume "Continue with the next test"
+SHELLM_API_FORMAT=responses SHELLM_MODEL=gpt-5.4-mini \
+  shellm --resume "Continue with the next test"
 ```
 
 These commands execute model-generated Bash: do not run them unsandboxed on
@@ -236,7 +237,8 @@ Standalone upkeep only receives the completion's remaining time budget; its
 reported usage enters the shared ledger as `operation:"responses.compact"`.
 
 ```bash
-SHELLM_API_FORMAT=responses SHELLM_RESPONSES_COMPACT_MODE=server \
+SHELLM_API_FORMAT=responses SHELLM_MODEL=gpt-5.4-mini \
+SHELLM_RESPONSES_COMPACT_MODE=server \
 SHELLM_RESPONSES_COMPACT_THRESHOLD=20000 \
   shellm "Analyze these synthetic logs in the sandbox"
 ```
