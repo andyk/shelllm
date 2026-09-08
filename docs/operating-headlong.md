@@ -16,8 +16,10 @@ Use `llm` for extraction, classification, rewriting, or a single answer. Use
 `shellm` for standalone exploration, repository analysis, or data work where
 the model needs a shell. Use an identity for a user-facing assistant or a
 subordinate worker whose ongoing tasks, permissions, and lifecycle are owned by
-the application around it. Persistence does not replace authorization, job
-state, idempotency, approval, or retry logic in that application.
+the application around it. For application-owned actions, use the exclusive
+[durable identity jobs](durable-jobs.md) dispatcher for admission, model attempt
+dedupe, child execution and recovery. The application retains authorization,
+canonical effects and publication approval.
 
 The complete installation choices are in [Installing Headlong](install.md).
 The engine, sandbox, run explorer, and direct `llm` interface are documented in
