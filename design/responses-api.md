@@ -58,19 +58,24 @@ terminal response from `response.completed`, `response.incomplete`, or
 Incomplete responses warn with their reason. Failed responses and `error`
 events fail the call.
 
-Retries remain legal only before protocol output is emitted. A terminal output
-item counts as output even when it is a function call with no visible text.
-After a text, reasoning, or output-item event, a truncated or failed stream is
-never replayed automatically.
+Responses CREATE is never automatically retried by llm, including before the
+first token. No emitted output does not prove that generation or hosted tools
+never began. Lost acknowledgements, missing terminal events, and malformed
+success bodies fail with `error.code=outcome_unknown` in the sidecar (with a
+response ID when known). Reconcile before deciding whether to create again.
+Request tracing IDs are not an idempotency guarantee. Chat retry policy stays
+unchanged.
 
-The shared stream retry loop keeps its pre-existing rule for every protocol:
-any failure before output is retried, whatever the handler's exit status (an
-Anthropic overloaded error arrives as an in-stream event and exits 1). The one
-exception is a rejected `previous_response_id`, which is deterministic. The
-Responses handler reports it through a private exit code (`die_permanent`) so
-the loop stops at once and `shellm` can fall back to its replay chain without
-waiting through retries. That decision is made on the error body alone and
-does not depend on `LLM_RESPONSE_FILE` being set.
+Buffered and streamed completion require a terminal object with a nonempty
+ID, an output array, completed/incomplete status, and no embedded error. Failed
+or cancelled Responses fail without recreating; incomplete Responses still
+deliver partial output with a warning. Stream identity and terminal event/status
+must agree. A function-only result remains a valid protocol success.
+
+A deterministic rejection of `previous_response_id` still allows shellm's
+explicit replay fallback. A known response, terminal failure, or typed unknown
+outcome cannot enter that fallback merely because its diagnostic mentions a
+previous response. This decision does not depend on visible text alone.
 
 `LLM_STOP_AFTER_CODE_BLOCK` keeps its contract in Responses mode: the stream
 is cut when the first fenced block closes and the cut is a clean finish. The

@@ -1783,7 +1783,11 @@ call_llm() {
         if [[ "$api_format" == "responses" && -n "$previous_response_id" \
             && "$fallback_used" -eq 0 && -n "$response_file" && -s "$response_file" \
             && ! -s "$text_file" ]] \
-            && jq -e '[.error.param?,.error.code?,.error.message?,.param?,.code?,.message?,.detail?]
+            && jq -e 'select(.id == null and .status == null
+                         and .error.code != "outcome_unknown" and .code != "outcome_unknown")
+                      | (.error // .) as $e
+                      | select($e.type == "invalid_request_error" or $e.code == "previous_response_not_found")
+                      | [.error.param?,.error.code?,.error.message?,.param?,.code?,.message?,.detail?]
                       | map(select(. != null) | tostring | ascii_downcase) | join(" ")
                       | test("previous[ _]response[ _]id|previous response")' \
                 "$response_file" >/dev/null 2>&1; then

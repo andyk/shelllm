@@ -94,9 +94,8 @@ LLM_RESPONSE_FILE="${LLM_RESPONSE_FILE:-}"
 # caller. Best-effort: fields the provider doesn't report are omitted, and no
 # failure here can break the call.
 LLM_USAGE_FILE="${LLM_USAGE_FILE:-}"
-# Transient-failure retries (provider errors, 429/5xx, network). Retries
-# only happen when NOTHING has been emitted yet — a retry after partial
-# streamed output would duplicate text. LLM_RETRIES=0 disables.
+# Chat retries only before output; Responses never retries a create because
+# silence does not prove non-dispatch. LLM_RETRIES=0 disables chat retries.
 LLM_RETRIES="${LLM_RETRIES:-2}"
 LLM_RETRY_BACKOFF="${LLM_RETRY_BACKOFF:-1}"   # seconds; grows linearly per attempt
 
@@ -361,8 +360,8 @@ Environment:
                            precedence, and a value that disagrees with the
                            name warns on stderr
   LLM_MAX_TOKENS           Override the per-model default output cap (same as -t)
-  LLM_RETRIES              Retries for transient API failures (default: 2;
-                           0 disables). Never retries after partial output.
+  LLM_RETRIES              Chat retries before output (default: 2; 0 disables).
+                           Responses CREATE is never automatically retried
   LLM_RETRY_BACKOFF        Backoff base seconds between retries (default: 1)
   LLM_CONNECT_TIMEOUT      Seconds to establish the connection (default: 10;
                            0 disables)
@@ -1106,8 +1105,28 @@ check_response_responses() {
     jq -r '
         if .error != null then .error.message // "unknown error"
         elif .status == "failed" then .error.message // "response failed"
+        elif .status == "cancelled" then "response cancelled"
         else empty end
     ' 2>/dev/null
+}
+
+# Only a valid terminal object is a successful Responses completion. An empty
+# text field can be legitimate (tools, refusals), but an empty/error envelope
+# cannot. Keep this contract identical for SSE and buffered responses.
+valid_response_terminal() {
+    jq -e 'type == "object" and .error == null
+        and (.id | type == "string" and length > 0)
+        and (.output | type == "array")
+        and (.status == "completed" or .status == "incomplete")' >/dev/null 2>&1
+}
+
+responses_outcome_unknown() {
+    local reason="$1" id="${2:-}"
+    jq -nc --arg message "$reason" --arg id "$id" \
+        '{error:{code:"outcome_unknown",message:$message}}
+         + (if $id == "" then {} else {id:$id} end)' | write_response_file
+    _llm_note error "" "outcome_unknown: $reason"
+    die "Responses outcome_unknown: $reason${id:+ (response $id)}; do not automatically recreate"
 }
 
 check_response_gemini() {
@@ -1399,7 +1418,7 @@ stream_openai() {
 }
 
 stream_responses() {
-    local _saw_data=0 _err_buf="" _chunk="" _event="" _response=""
+    local _saw_data=0 _err_buf="" _chunk="" _event="" _response="" _bg_id="" _rid=""
     local _text_emitted=0 _reasoning_emitted=0 _terminal=0
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
         local line="${raw_line%$'\r'}"
@@ -1408,6 +1427,14 @@ stream_responses() {
             local json="${line#data: }"
             [[ "$json" == "[DONE]" ]] && continue
             _event=$(printf '%s' "$json" | jq -r '.type // empty' 2>/dev/null) || _event=""
+            _rid=$(printf '%s' "$json" | jq -r '.response.id // empty' 2>/dev/null) || _rid=""
+            if [[ -n "$_rid" ]]; then
+                [[ "$_rid" =~ ^[A-Za-z0-9_-]+$ ]] \
+                    || responses_outcome_unknown "invalid stream response identity" "$_bg_id"
+                [[ -z "$_bg_id" || "$_bg_id" == "$_rid" ]] \
+                    || responses_outcome_unknown "stream changed response identity" "$_bg_id"
+                _bg_id="$_rid"
+            fi
             case "$_event" in
                 response.output_text.delta|response.refusal.delta)
                     # Preserve newline-only deltas; see stream_openai.
@@ -1435,6 +1462,8 @@ stream_responses() {
                     ;;
                 response.completed|response.incomplete)
                     _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
+                    printf '%s' "$_response" | valid_response_terminal \
+                        || responses_outcome_unknown "invalid terminal response" "$_bg_id"
                     if [[ -n "$_response" ]] \
                         && printf '%s' "$_response" | jq -e --arg status "${_event#response.}" \
                             '.status == $status' >/dev/null 2>&1; then
@@ -1472,19 +1501,22 @@ stream_responses() {
                                 warn_incomplete_response "$_reason"
                             fi
                         fi
+                    else
+                        responses_outcome_unknown "terminal event and response status disagree" "$_bg_id"
                     fi
                     mark_emitted
+                    ;;
+                response.cancelled)
+                    _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
+                    [[ -n "$_response" ]] && printf '%s' "$_response" | write_response_file
+                    die_permanent "API stream error: response cancelled"
                     ;;
                 response.failed)
                     _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
                     [[ -n "$_response" ]] && printf '%s' "$_response" | write_response_file
                     local _failed_msg=""
                     _failed_msg=$(printf '%s' "$json" | jq -r '.response.error.message // .error.message // "response failed"' 2>/dev/null) || _failed_msg="response failed"
-                    if [[ -e "$LLM_DATA_MARKER" ]]; then
-                        die "API stream error: $_failed_msg"
-                    else
-                        die_retryable "API stream error: $_failed_msg"
-                    fi
+                    die_permanent "API stream error: $_failed_msg"
                     ;;
                 error)
                     printf '%s' "$json" | write_response_file
@@ -1510,10 +1542,7 @@ stream_responses() {
     # event never arrives, so there is no sidecar and usage is estimated.
     [[ -n "${LLM_STOP_MARKER:-}" && -e "$LLM_STOP_MARKER" ]] && return 0
     if [[ "$_terminal" -ne 1 ]]; then
-        if [[ -e "$LLM_DATA_MARKER" ]]; then
-            die "API stream error: Responses stream ended without a terminal response"
-        fi
-        die_retryable "API stream error: Responses stream ended without a terminal response"
+        responses_outcome_unknown "Responses stream ended without a terminal response" "$_bg_id"
     fi
 }
 
@@ -1780,7 +1809,7 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
         # Anthropic overloaded_error arrives as an in-stream error event and
         # exits 1, not 75), with one exception: a handler that exited 76
         # (die_permanent) saw an error a replay cannot fix.
-        if [[ "$_emitted" -eq 0 && "$_rc" -ne 76 \
+        if [[ "$LLM_API_FORMAT" != responses && "$_emitted" -eq 0 && "$_rc" -ne 76 \
             && "$_attempt" -lt "$_max_attempts" ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): ${_retry_msg:-${_ce:-exit $_rc}} — retrying" >&2
             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
@@ -1803,7 +1832,7 @@ else
             "${headers[@]}" -d @"$payload_file" "$url" 2>/dev/null) || http_code="000"
 
         # Transient: network failure, timeout, rate limit, server error
-        if [[ "$http_code" =~ ^(000|408|429|5[0-9][0-9])$ && "$_attempt" -lt "$_max_attempts" ]]; then
+        if [[ "$LLM_API_FORMAT" != responses && "$http_code" =~ ^(000|408|429|5[0-9][0-9])$ && "$_attempt" -lt "$_max_attempts" ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): HTTP $http_code — retrying" >&2
             rm -f "$local_resp"
             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
@@ -1815,7 +1844,7 @@ else
         if [[ "$http_code" != "000" && "$http_code" -lt 400 ]]; then
             if grep -q '[^[:space:]]' "$local_resp"; then
                 if [[ "$LLM_API_FORMAT" == responses ]]; then
-                    embedded_err=$(check_response_responses < "$local_resp")
+                    embedded_err=$(check_response_responses < "$local_resp" || true)
                 else
                     embedded_err=$("check_response_${LLM_PROVIDER}" < "$local_resp")
                 fi
@@ -1825,12 +1854,14 @@ else
                 # parse-fail to empty on it, which used to read as success
                 # with no output.
                 embedded_err="whitespace-only response body"
+                [[ "$LLM_API_FORMAT" != responses ]] \
+                    || responses_outcome_unknown "$embedded_err"
             fi
             if [[ -n "$embedded_err" ]]; then
-                if [[ "$LLM_API_FORMAT" == responses ]] \
-                    && jq -e '.status == "failed"' "$local_resp" >/dev/null 2>&1; then
+                if [[ "$LLM_API_FORMAT" == responses ]]; then
                     write_response_file < "$local_resp"
                     rm -f "$local_resp"
+                    _llm_note error "" "$embedded_err"
                     die "API error: $embedded_err"
                 fi
                 if [[ "$_attempt" -lt "$_max_attempts" ]]; then
@@ -1849,9 +1880,18 @@ else
         break
     done
 
+    _response_id=""
+    if [[ "$LLM_API_FORMAT" == responses ]]; then
+        _response_id=$(jq -r '.id? | strings' "$local_resp" 2>/dev/null || true)
+    fi
     if [[ "$http_code" -ge 400 || "$http_code" == "000" ]]; then
         error_msg=$(jq -r '.error.message // .message // empty' "$local_resp" 2>/dev/null || true)
         if [[ "$LLM_API_FORMAT" == responses ]]; then
+            if [[ "$http_code" =~ ^(000|408|5[0-9][0-9])$ ]]; then
+                rm -f "$local_resp"
+                _llm_note error "$http_code" "create outcome unknown"
+                responses_outcome_unknown "create failed with HTTP $http_code; provider acceptance is unknown" "$_response_id"
+            fi
             if [[ -s "$local_resp" ]] && jq -e . "$local_resp" >/dev/null 2>&1; then
                 write_response_file < "$local_resp"
             else
@@ -1867,6 +1907,12 @@ else
             die "API error (HTTP $http_code): $error_msg"
         fi
         die "API error (HTTP $http_code)"
+    fi
+    if [[ "$LLM_API_FORMAT" == responses ]]; then
+        if ! valid_response_terminal < "$local_resp"; then
+            rm -f "$local_resp"
+            responses_outcome_unknown "invalid or nonterminal response body" "$_response_id"
+        fi
     fi
     _llm_note ok
 

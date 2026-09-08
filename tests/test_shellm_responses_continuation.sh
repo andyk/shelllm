@@ -67,7 +67,7 @@ write_response() {
 }
 
 case "$LLM_STUB_MODE:$n" in
-    continue:1|fallback:1|stateless:1)
+    continue:1|fallback:1|stateless:1|unknown:1)
         write_response resp_1
         printf '%s\n' '```bash' 'printf "first output\n"' '```'
         ;;
@@ -78,6 +78,10 @@ case "$LLM_STUB_MODE:$n" in
     fallback:2)
         ( umask 077; printf '%s' '{"error":{"message":"previous response is unavailable","param":"previous_response_id","code":"previous_response_not_found"}}' > "$LLM_RESPONSE_FILE" )
         printf '%s\n' 'llm: error: API error (HTTP 400): previous response is unavailable' >&2
+        exit 1
+        ;;
+    unknown:2)
+        ( umask 077; printf '%s' '{"error":{"message":"transport lost while continuing previous response","code":"outcome_unknown"}}' > "$LLM_RESPONSE_FILE" )
         exit 1
         ;;
     partial:1)
@@ -316,6 +320,17 @@ if ! grep -q 'step_ids' "$WORK/stub"/messages-*.json; then
     ok "row ids never reach the provider"
 else
     bad "row ids never reach the provider" "$(grep -l 'step_ids' "$WORK/stub"/messages-*.json | tr '\n' ' ')"
+fi
+
+# Mentioning a previous response in an unknown-outcome diagnostic is not
+# evidence of a pre-generation rejection.
+run_shellm unknown responses
+rc=$?
+if [[ "$rc" -ne 0 && "$(main_calls)" -eq 2 ]] \
+   && ! grep -q 'retrying once with exact replay' "$WORK/err"; then
+    ok "unknown continuation outcome never falls back to a new create"
+else
+    bad "unknown continuation outcome never falls back to a new create" "rc=$rc calls=$(main_calls)"
 fi
 
 # A rejection can only precede generation. An error naming
