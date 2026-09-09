@@ -1794,7 +1794,17 @@ if [[ "$LLM_PROVIDER" == "adapter" ]]; then
             LLM_RESPONSES_BODY_FILE LLM_RESPONSES_CONVERSATION
     fi
     _adapter_rc=0
-    if [[ "$LLM_MAX_TIME" =~ ^[0-9]+$ && "$LLM_MAX_TIME" -gt 0 ]]; then
+    if [[ -n "${HEADLONG_JOB_EXECUTION_ID:-}" ]]; then
+        [[ -n "${HEADLONG_JOB_ID:-}" && -n "${HEADLONG_JOB_ATTEMPT_ID:-}" && -x "${HEADLONG_JOB_CONTROL_TOOL:-}" ]] \
+            || die "Job adapters must run through the admitted Headlong attempt wrapper"
+        _adapter_deadline=0
+        [[ "$LLM_MAX_TIME" =~ ^[0-9]+$ ]] && _adapter_deadline="$LLM_MAX_TIME"
+        # The attempt controller reserves and records this exact subgroup.
+        # Its deadline is phase-local; its guardian also sweeps on job death.
+        "$HEADLONG_JOB_CONTROL_TOOL" adapter-run --deadline "$_adapter_deadline" -- \
+            "$LLM_ADAPTER" "${_adapter_args[@]}" < "$payload_file" || _adapter_rc=$?
+        if [[ "$_adapter_rc" -eq 124 ]]; then : > "$_adapter_dir/deadline"; fi
+    elif [[ "$LLM_MAX_TIME" =~ ^[0-9]+$ && "$LLM_MAX_TIME" -gt 0 ]]; then
         # The adapter runs in its own process group (set -m) so the
         # deadline can kill its whole tree: a shell adapter's provider
         # child would otherwise survive a PID-targeted kill and hold the

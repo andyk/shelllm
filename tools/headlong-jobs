@@ -1,0 +1,928 @@
+#!/usr/bin/env python3
+"""Local durable custody for an identity's exclusive application-job dispatcher.
+
+SQLite is the admission/attempt fence; a trajectory is an evidence projection.
+Only this dispatcher launches jobs. Applications retain all resource authority.
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+
+SELF = str(Path(__file__).resolve())
+TERMINAL = {"completed", "cancelled", "unknown"}
+LIMIT = 8 * 1024 * 1024
+
+
+def encode(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def read_json(stream):
+    raw = stream.read(LIMIT + 1)
+    if len(raw) > LIMIT:
+        raise ValueError("JSON exceeds admission limit")
+    return json.loads(raw)
+
+
+def sync_dir(path):
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_json(path, value):
+    temp = path.with_name(path.name + "." + uuid.uuid4().hex)
+    with temp.open("x") as out:
+        out.write(encode(value) + "\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temp, path)
+    sync_dir(path.parent)
+
+
+def nonempty(value, name):
+    if not isinstance(value, str) or not value or len(value) > 512 or "\0" in value:
+        raise ValueError("invalid " + name)
+    return value
+
+
+class Store:
+    def __init__(self):
+        identity = os.environ.get("IDENTITY_DIR")
+        if not identity or not Path(identity).is_dir():
+            raise ValueError("IDENTITY_DIR must name an existing identity")
+        self.identity = Path(identity).resolve()
+        self.root = self.identity / "jobs"
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        self.work = self.root / "work"
+        self.work.mkdir(mode=0o700, exist_ok=True)
+        self.db = sqlite3.connect(self.root / "ledger.sqlite3", timeout=30, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.executescript("""
+          CREATE TABLE IF NOT EXISTS handlers(name TEXT PRIMARY KEY, spec TEXT NOT NULL, hash TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS jobs(
+            job_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, envelope_hash TEXT NOT NULL,
+            handler TEXT NOT NULL, handler_hash TEXT NOT NULL, parent TEXT,
+            state TEXT NOT NULL, created REAL NOT NULL, execution TEXT, token TEXT,
+            worker_pid INTEGER, pgid INTEGER, cancel_requested INTEGER NOT NULL DEFAULT 0,
+            result TEXT, recovery TEXT);
+          CREATE TABLE IF NOT EXISTS attempts(
+            job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+            state TEXT NOT NULL, result TEXT, PRIMARY KEY(job_id,attempt_id));
+          CREATE TABLE IF NOT EXISTS events(
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, type TEXT NOT NULL,
+            payload TEXT NOT NULL, created REAL NOT NULL);
+        """)
+        with self.transaction():
+            columns = {row["name"] for row in self.db.execute("PRAGMA table_info(attempts)")}
+            for name, kind in (("adapter_state", "TEXT"), ("adapter_pgid", "INTEGER"), ("adapter_owner", "INTEGER")):
+                if name not in columns:
+                    self.db.execute("ALTER TABLE attempts ADD COLUMN " + name + " " + kind)
+            if "waiting_on" not in {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN waiting_on TEXT")
+        # Pre-upgrade identities never wrote a durable legacy ledger. Its
+        # absence cannot prove quiescence after run/ was lost or cleared.
+        if ((self.identity / "thinkers").exists() or (self.identity / "info.txt").exists()) and not (self.root / "mode.json").exists():
+            self.db.execute("""INSERT OR IGNORE INTO control(key,value)
+                SELECT 'legacy_execution',? WHERE NOT EXISTS(SELECT 1 FROM control WHERE key='legacy_retired')""",
+                ("untracked-" + uuid.uuid4().hex,))
+        sync_dir(self.root)
+        sync_dir(self.identity)
+
+    @contextlib.contextmanager
+    def transaction(self):
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def event(self, job_id, kind, payload):
+        self.db.execute("INSERT INTO events(job_id,type,payload,created) VALUES(?,?,?,?)",
+                        (job_id, kind, encode(payload), time.time()))
+
+    def job(self, job_id):
+        row = self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown job_id")
+        return row
+
+    def directory(self, job_id):
+        path = self.work / digest(job_id)
+        path.mkdir(mode=0o700, exist_ok=True)
+        return path
+
+    def receipt(self, row):
+        return {"version": 1, "job_id": row["job_id"], "custody": "durable",
+                "state": row["state"], "envelope_hash": row["envelope_hash"],
+                "handler_hash": row["handler_hash"], "execution_id": row["execution"],
+                "cancel_requested": bool(row["cancel_requested"]),
+                "result": json.loads(row["result"]) if row["result"] else None}
+
+    def finish(self, job_id, execution, result):
+        with self.transaction():
+            row = self.job(job_id)
+            if row["execution"] != execution or row["state"] in TERMINAL:
+                return
+            unsettled = self.db.execute("SELECT count(*) FROM attempts WHERE job_id=? AND state NOT IN ('completed','cancelled')", (job_id,)).fetchone()[0]
+            if unsettled and result["outcome"] != "unknown":
+                result = {"outcome": "unknown", "reason": "unsettled_model_attempts", "evidence": result}
+            if row["cancel_requested"] and result["outcome"] == "completed":
+                result = {"outcome": "unknown", "reason": "completion_after_cancel_fence", "evidence": result}
+            self.db.execute("UPDATE jobs SET state=?,result=? WHERE job_id=?",
+                            (result["outcome"], encode(result), job_id))
+            self.event(job_id, "job-terminal", result)
+
+
+def register(store, name, spec):
+    nonempty(name, "handler name")
+    if not isinstance(spec, dict) or set(spec) != {"version", "argv"}:
+        raise ValueError("handler spec requires exactly version and argv")
+    nonempty(spec["version"], "handler version")
+    argv = spec["argv"]
+    if not isinstance(argv, list) or not argv or any(not isinstance(x, str) or "\0" in x for x in argv):
+        raise ValueError("handler argv must be strings")
+    executable = Path(argv[0])
+    if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValueError("handler executable must be an absolute executable file")
+    # Pin the executable bytes as well as argv/version. Script dependencies are
+    # the operator's deployment unit and must be named by the version.
+    pinned = dict(spec, executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest())
+    raw = encode(pinned)
+    with store.transaction():
+        store.db.execute("INSERT OR REPLACE INTO handlers VALUES(?,?,?)", (name, raw, digest(raw)))
+    return {"handler": name, "handler_hash": digest(raw)}
+
+
+def admit(store, envelope):
+    required = {"version", "job_id", "trigger_step", "kind", "handler", "handler_hash", "admitted"}
+    if not isinstance(envelope, dict) or not required <= set(envelope):
+        raise ValueError("missing required admission fields")
+    if set(envelope) - required - {"parent_job_id"} or type(envelope["version"]) is not int or envelope["version"] != 1:
+        raise ValueError("unsupported admission fields/version")
+    for field in ("job_id", "trigger_step", "kind", "handler", "handler_hash"):
+        nonempty(envelope[field], field)
+    if not isinstance(envelope["admitted"], dict):
+        raise ValueError("admitted must be an opaque object of references/context")
+    parent = envelope.get("parent_job_id")
+    if parent is not None:
+        nonempty(parent, "parent_job_id")
+    raw, job_id = encode(envelope), envelope["job_id"]
+    with store.transaction():
+        old = store.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if old is not None:
+            if old["envelope"] != raw:
+                raise ValueError("job_id already admitted with a different envelope")
+            return store.receipt(old)
+        handler = store.db.execute("SELECT * FROM handlers WHERE name=?", (envelope["handler"],)).fetchone()
+        if handler is None or handler["hash"] != envelope["handler_hash"]:
+            raise ValueError("handler registration hash mismatch")
+        if parent is not None:
+            parent_row = store.job(parent)
+            if parent_row["cancel_requested"] or parent_row["state"] in {"cancelled", "unknown"}:
+                raise ValueError("parent no longer accepts child admissions")
+        store.db.execute("""INSERT INTO jobs(job_id,envelope,envelope_hash,handler,handler_hash,parent,state,created)
+                          VALUES(?,?,?,?,?,?,?,?)""",
+                         (job_id, raw, digest(raw), handler["spec"], handler["hash"], parent, "queued", time.time()))
+        store.event(job_id, "job-admitted", {"envelope_hash": digest(raw), "trigger_step": envelope["trigger_step"],
+                                           "kind": envelope["kind"], "parent_job_id": parent})
+    return store.receipt(store.job(job_id))
+
+
+def cancel(store, job_id):
+    with store.transaction():
+        store.job(job_id)
+        rows = store.db.execute("""WITH RECURSIVE family(id) AS (
+           SELECT job_id FROM jobs WHERE job_id=? UNION ALL
+           SELECT jobs.job_id FROM jobs JOIN family ON jobs.parent=family.id)
+           SELECT jobs.* FROM jobs JOIN family ON jobs.job_id=family.id""", (job_id,)).fetchall()
+        for row in rows:
+            if row["cancel_requested"]:
+                continue
+            state = "cancelled" if row["state"] == "queued" else row["state"]
+            result = encode({"outcome": "cancelled", "reason": "cancelled_before_start"}) if state == "cancelled" else row["result"]
+            store.db.execute("UPDATE jobs SET cancel_requested=1,state=?,result=? WHERE job_id=?",
+                             (state, result, row["job_id"]))
+            store.event(row["job_id"], "job-cancel-requested", {"root_job_id": job_id})
+            if state == "cancelled" and row["state"] == "queued":
+                store.event(row["job_id"], "job-terminal", json.loads(result))
+    # Workers poll the durable cancellation fence. No PID supplied by a client
+    # is ever signalled, and cancelling still works while the dispatcher is down.
+    for row in rows:
+        wake_parent(store, row["job_id"])
+    return store.receipt(store.job(job_id))
+
+
+def wake_parent(store, job_id):
+    try:
+        fd = os.open(store.directory(job_id) / "dependency.fifo", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(fd, b"wake\n")
+        finally:
+            os.close(fd)
+    except (FileNotFoundError, BlockingIOError, OSError):
+        pass
+
+
+def resume_dependencies(store, capacity):
+    ready = store.db.execute("""SELECT parent.job_id FROM jobs parent JOIN jobs child ON parent.waiting_on=child.job_id
+        WHERE parent.state='waiting' AND parent.cancel_requested=0 AND child.state IN ('completed','cancelled','unknown')
+        ORDER BY parent.created,parent.job_id""").fetchall()
+    for row in ready:
+        with store.transaction():
+            active = store.db.execute("SELECT count(*) FROM jobs WHERE state IN ('starting','running')").fetchone()[0]
+            if active >= capacity:
+                break
+            changed = store.db.execute("UPDATE jobs SET state='running' WHERE job_id=? AND state='waiting' AND cancel_requested=0", (row["job_id"],)).rowcount
+            if changed:
+                store.event(row["job_id"], "job-resumed", {"dependency": store.job(row["job_id"])["waiting_on"]})
+        if changed:
+            wake_parent(store, row["job_id"])
+
+
+def wait_child(store, job_id, child_id):
+    directory = store.directory(job_id)
+    with lock(directory / "dependency.lock"):
+        fifo = directory / "dependency.fifo"
+        if not fifo.exists():
+            os.mkfifo(fifo, 0o600)
+        fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            with store.transaction():
+                authorize_attempt(store, job_id)
+                child = store.job(child_id)
+                if child["parent"] != job_id:
+                    raise ValueError("wait-child requires the exact admitted parent/child relationship")
+                if (store.db.execute("SELECT count(*) FROM attempts WHERE job_id=? AND state='started'", (job_id,)).fetchone()[0]
+                    or adapter_custody_alive(store, job_id)):
+                    raise ValueError("finish in-flight model attempts before yielding job capacity")
+                waiting = store.db.execute("SELECT count(*) FROM jobs WHERE state='waiting'").fetchone()[0]
+                if waiting >= int(os.environ.get("HEADLONG_JOBS_MAX_WAITING", "32")):
+                    raise ValueError("dependency wait capacity exhausted")
+                store.db.execute("UPDATE jobs SET state='waiting',waiting_on=? WHERE job_id=?", (child_id, job_id))
+                store.event(job_id, "job-waiting", {"child_job_id": child_id})
+            # The dispatcher alone reacquires execution capacity. The FIFO is
+            # a notification, while the ledger is truth; the bounded timeout
+            # recovers a lost notification without a CPU polling loop.
+            while True:
+                parent = store.job(job_id)
+                if parent["cancel_requested"] or parent["state"] in TERMINAL:
+                    raise ValueError("parent custody ended during dependency wait")
+                if parent["state"] == "running":
+                    child = store.job(child_id)
+                    if child["state"] not in TERMINAL or parent["waiting_on"] != child_id:
+                        raise ValueError("dependency resumed without a terminal child receipt")
+                    with store.transaction():
+                        store.db.execute("UPDATE jobs SET waiting_on=NULL WHERE job_id=? AND waiting_on=?", (job_id, child_id))
+                    return store.receipt(child)
+                if select.select([fd], [], [], 10)[0]:
+                    os.read(fd, 4096)
+        finally:
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def lock(path, blocking=False):
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        yield handle
+    finally:
+        handle.close()
+
+
+def alive_worker(store, row):
+    try:
+        with lock(store.directory(row["job_id"]) / "worker.lock"):
+            return False
+    except BlockingIOError:
+        return True
+
+
+def terminal_result(path):
+    try:
+        with path.open() as stream:
+            value = read_json(stream)
+        if isinstance(value, dict) and isinstance(value.get("outcome"), str) and value["outcome"] in TERMINAL:
+            # A result file is evidence only after it has reached durable storage.
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+            return value
+    except (OSError, ValueError):
+        pass
+    return {"outcome": "unknown", "reason": "missing_or_invalid_handler_result"}
+
+
+def reconcile(store):
+    for row in store.db.execute("SELECT * FROM jobs WHERE state IN ('starting','running','waiting')").fetchall():
+        if alive_worker(store, row):
+            continue
+        if adapter_custody_alive(store, row["job_id"]):
+            continue
+        reconcile_attempts(store, row["job_id"])
+        # Only the supervisor's receipt proves that the whole owned group was
+        # stopped. A handler file alone can race unfinished children/effects.
+        receipt = store.directory(row["job_id"]) / "execution-receipt.json"
+        result = terminal_result(receipt)
+        if result.get("execution_id") != row["execution"]:
+            result = {"outcome": "unknown", "reason": "execution_custody_lost"}
+        store.finish(row["job_id"], row["execution"], result)
+
+
+def project_events(store):
+    # A regenerable projection, not an admission acknowledgement. Dedicated
+    # job events never feed the legacy responder/monolith subscription path.
+    path = store.root / "trajectory.jsonl"
+    with lock(store.root / "projection.lock"):
+        temp = store.root / "trajectory.next"
+        with temp.open("w") as stream:
+            for event in store.db.execute("SELECT * FROM events ORDER BY seq"):
+                stream.write(encode({"step_id": "job-event-" + str(event["seq"]),
+                    "type": event["type"], "source": "dispatcher", "job_id": event["job_id"],
+                    "timestamp": event["created"], "content": json.loads(event["payload"])}) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+        sync_dir(store.root)
+
+
+def dispatch(store, ready_fd=None):
+    if not (store.root / "mode.json").exists():
+        raise ValueError("select jobs-only mode through thinkers start --jobs-only")
+    with lock(store.root / "dispatcher.lock"):
+        # The lock is outside run/, which is intentionally disposable.
+        stop = [False]
+        signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__(0, True))
+        signal.signal(signal.SIGINT, lambda *_: stop.__setitem__(0, True))
+        generation = uuid.uuid4().hex
+        store.db.execute("INSERT OR REPLACE INTO control VALUES('dispatcher',?)", (generation,))
+        run = store.identity / "run"
+        run.mkdir(exist_ok=True)
+        (run / "dispatcher.pid").write_text(str(os.getpid()))
+        if ready_fd is not None:
+            os.write(ready_fd, b"ready\n")
+            os.close(ready_fd)
+        children = []
+        last_projection = -1
+        try:
+            while not stop[0]:
+                if store.db.execute("SELECT value FROM control WHERE key='dispatcher'").fetchone()[0] != generation:
+                    break
+                reconcile(store)
+                limit = int(os.environ.get("HEADLONG_JOBS_MAX_CONCURRENT", "4"))
+                resume_dependencies(store, limit)
+                running = store.db.execute("SELECT count(*) FROM jobs WHERE state IN ('starting','running')").fetchone()[0]
+                capacity = max(0, limit - running)
+                queued = store.db.execute("""SELECT queued.job_id FROM jobs queued WHERE queued.state='queued'
+                    ORDER BY EXISTS(SELECT 1 FROM jobs parent WHERE parent.state='waiting' AND parent.waiting_on=queued.job_id) DESC,
+                    queued.created,queued.job_id LIMIT ?""", (capacity,)).fetchall()
+                for entry in queued:
+                    job_id, execution, token = entry["job_id"], uuid.uuid4().hex, uuid.uuid4().hex
+                    with lock(store.directory(job_id) / "worker.lock") as ownership:
+                        with store.transaction():
+                            changed = store.db.execute("UPDATE jobs SET state='starting',execution=?,token=? WHERE job_id=? AND state='queued' AND cancel_requested=0",
+                                                       (execution, token, job_id)).rowcount
+                            if changed:
+                                store.event(job_id, "job-starting", {"execution_id": execution})
+                        if changed:
+                            log = (store.directory(job_id) / "supervisor.log").open("ab")
+                            try:
+                                children.append(subprocess.Popen([sys.executable, SELF, "_worker", job_id, execution, str(ownership.fileno())],
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                                    pass_fds=(ownership.fileno(),)))
+                            except OSError:
+                                store.finish(job_id, execution, {"outcome": "unknown", "reason": "worker_spawn_failed"})
+                            finally:
+                                log.close()
+                children = [child for child in children if child.poll() is None]
+                version = store.db.execute("SELECT coalesce(max(seq),0) FROM events").fetchone()[0]
+                if version != last_projection:
+                    project_events(store)
+                    last_projection = version
+                time.sleep(0.1)
+        finally:
+            # Stop pauses admission dispatch, preserving queued jobs and letting
+            # supervised work finish. Exact job cancellation is a separate fence.
+            pid_path = run / "dispatcher.pid"
+            if pid_path.exists() and pid_path.read_text() == str(os.getpid()):
+                pid_path.unlink()
+
+
+def start(store):
+    # Persist the identity's exclusive mode before starting. Legacy start fails
+    # closed for this identity even after run/ is removed by a restart wrapper.
+    with lock(store.root / "start.lock"):
+        legacy = store.db.execute("SELECT value FROM control WHERE key='legacy_execution'").fetchone()
+        if legacy is not None:
+            raise ValueError("legacy execution has not been reconciled; retire-legacy requires verified quiescence evidence")
+        pid_path = store.identity / "run" / "dispatcher.pid"
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), 0)
+                raise ValueError("identity dispatcher already running")
+            except ProcessLookupError:
+                pass
+        write_json(store.root / "mode.json", {"mode": "jobs-only", "version": 1})
+        read_fd, write_fd = os.pipe()
+        log = (store.root / "dispatcher.log").open("ab")
+        child = subprocess.Popen([sys.executable, SELF, "_dispatch", str(write_fd)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, pass_fds=(write_fd,))
+        log.close()
+        os.close(write_fd)
+        try:
+            if not select.select([read_fd], [], [], 10)[0] or os.read(read_fd, 64) != b"ready\n":
+                raise ValueError("job dispatcher did not acquire custody; inspect jobs/dispatcher.log")
+        finally:
+            os.close(read_fd)
+        return {"mode": "jobs-only", "dispatcher_pid": child.pid}
+
+
+def execute(store, job_id, execution):
+    # This process is the unreaped group leader. It stays alive after the
+    # handler exits until its supervisor kills the entire group and then waits.
+    # That ordering reserves the PGID, preventing PID reuse cancellation races.
+    signal.signal(signal.SIGTERM, lambda *_: None)
+    signal.signal(signal.SIGINT, lambda *_: None)
+    if sys.stdin.readline() != "go\n":
+        return
+    row = store.job(job_id)
+    if os.getpid() != os.getpgrp() or row["pgid"] != os.getpid() or row["worker_pid"] != os.getppid():
+        raise ValueError("execution requires the admitted supervisor's owned group")
+    if row["execution"] != execution or row["state"] != "running" or row["cancel_requested"]:
+        print("done", flush=True)
+    else:
+        spec, directory = json.loads(row["handler"]), store.directory(job_id)
+        if hashlib.sha256(Path(spec["argv"][0]).read_bytes()).hexdigest() != spec["executable_sha256"]:
+            write_json(directory / "result.json", {"outcome": "unknown", "reason": "registered_handler_bytes_changed"})
+        else:
+            env = dict(os.environ, HEADLONG_JOB_ID=job_id, HEADLONG_JOB_EXECUTION_ID=execution,
+                HEADLONG_JOB_EXECUTION_TOKEN=row["token"], HEADLONG_JOB_DIR=str(directory),
+                HEADLONG_JOB_RESULT_FILE=str(directory / "result.json"))
+            with (directory / "stdout").open("wb") as out, (directory / "stderr").open("wb") as err:
+                child = subprocess.Popen(spec["argv"], stdin=subprocess.PIPE, stdout=out, stderr=err, env=env)
+                # Stream input without blocking supervision on a handler that
+                # never reads stdin. The control pipe closes on worker death.
+                pending = memoryview((row["envelope"] + "\n").encode())
+                os.set_blocking(child.stdin.fileno(), False)
+                while child.poll() is None:
+                    readable, writable, _ = select.select([sys.stdin], [child.stdin] if pending else [], [], 0.05)
+                    if readable and not os.read(sys.stdin.fileno(), 64):
+                        os.killpg(os.getpgrp(), signal.SIGKILL)
+                    if writable:
+                        try:
+                            pending = pending[os.write(child.stdin.fileno(), pending):]
+                        except BrokenPipeError:
+                            pending = memoryview(b"")
+                        if not pending:
+                            child.stdin.close()
+                if not child.stdin.closed:
+                    child.stdin.close()
+                write_json(directory / "exit.json", {"returncode": child.returncode})
+        print("done", flush=True)
+    # No descendants can outlive the owned process group. Never exit before
+    # the supervisor's killpg, even if the handler forks and exits immediately.
+    while True:
+        if select.select([sys.stdin], [], [], 1)[0] and not os.read(sys.stdin.fileno(), 64):
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+
+
+def worker(store, job_id, execution, lock_fd):
+    directory = store.directory(job_id)
+    with os.fdopen(lock_fd, "a+"):
+        with store.transaction():
+            row = store.job(job_id)
+            if row["execution"] != execution or row["state"] != "starting":
+                return
+            if row["cancel_requested"]:
+                result = {"outcome": "cancelled", "reason": "cancelled_before_start"}
+                store.db.execute("UPDATE jobs SET state='cancelled',result=? WHERE job_id=?",
+                                 (encode(result), job_id))
+                store.event(job_id, "job-terminal", result)
+                return
+            store.db.execute("UPDATE jobs SET state='running',worker_pid=? WHERE job_id=?", (os.getpid(), job_id))
+        cancel_at, done = None, False
+        grace = float(os.environ.get("HEADLONG_JOB_CANCEL_GRACE", "6"))
+        if not 0 <= grace <= 60:
+            raise ValueError("HEADLONG_JOB_CANCEL_GRACE must be between 0 and 60 seconds")
+        group = subprocess.Popen([sys.executable, SELF, "_execute", job_id, execution],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+        stopping = [False]
+        signal.signal(signal.SIGTERM, lambda *_: stopping.__setitem__(0, True))
+        signal.signal(signal.SIGINT, lambda *_: stopping.__setitem__(0, True))
+        try:
+            with store.transaction():
+                store.db.execute("UPDATE jobs SET pgid=? WHERE job_id=?", (group.pid, job_id))
+                store.event(job_id, "job-running", {"execution_id": execution, "pgid": group.pid})
+            group.stdin.write(b"go\n")
+            group.stdin.flush()
+            while True:
+                row = store.job(job_id)
+                if (row["cancel_requested"] or stopping[0]) and cancel_at is None:
+                    cancel_at = time.monotonic()
+                    os.killpg(group.pid, signal.SIGTERM)
+                if not done and select.select([group.stdout], [], [], 0.05)[0]:
+                    done = bool(os.read(group.stdout.fileno(), 64) in (b"done\n", b""))
+                if done and cancel_at is None:
+                    break
+                if cancel_at is not None and time.monotonic() - cancel_at >= grace:
+                    break
+                if done:
+                    time.sleep(0.05)
+        finally:
+            # Do not call poll()/wait() before killpg: keeping the child
+            # unreaped pins the group ID even when the group leader crashed.
+            try:
+                os.killpg(group.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            group.wait()
+            group.stdin.close()
+            group.stdout.close()
+        # Attempt subgroups have their own pipe guardians. Root-group death
+        # closes those pipes, but custody is not terminal until those guardians
+        # have swept their own groups and released their inherited locks.
+        while adapter_custody_alive(store, job_id):
+            time.sleep(0.05)
+        reconcile_attempts(store, job_id)
+        result = terminal_result(directory / "result.json")
+        if result["outcome"] == "completed":
+            try:
+                exit_code = json.loads((directory / "exit.json").read_text())["returncode"]
+            except (OSError, ValueError, KeyError):
+                exit_code = None
+            if exit_code != 0:
+                result = {"outcome": "unknown", "reason": "handler_did_not_exit_successfully", "evidence": result}
+        if not done:
+            result = {"outcome": "unknown", "reason": "cancelled_without_terminal_handler_receipt"}
+        result["execution_id"] = execution
+        write_json(directory / "execution-receipt.json", result)
+        store.finish(job_id, execution, result)
+
+
+def authorize_attempt(store, job_id):
+    row = store.job(job_id)
+    if (os.environ.get("HEADLONG_JOB_ID") != job_id or row["state"] != "running"
+        or row["execution"] != os.environ.get("HEADLONG_JOB_EXECUTION_ID")
+        or row["token"] != os.environ.get("HEADLONG_JOB_EXECUTION_TOKEN")
+        or os.getpgrp() != row["pgid"] or row["cancel_requested"]):
+        raise ValueError("attempt requires the live admitted job's owned process group")
+
+
+def adapter_custody_alive(store, job_id):
+    for row in store.db.execute("SELECT attempt_id FROM attempts WHERE job_id=? AND adapter_state IS NOT NULL", (job_id,)):
+        directory = store.directory(job_id) / ("attempt-" + digest(row["attempt_id"]))
+        try:
+            with lock(directory / "adapter.lock"):
+                pass
+        except BlockingIOError:
+            return True
+    return False
+
+
+def adapter_guard(store, job_id, attempt_id, out_fd, err_fd, lock_fd):
+    with os.fdopen(lock_fd, "a+"):
+        signal.signal(signal.SIGTERM, lambda *_: None)
+        signal.signal(signal.SIGINT, lambda *_: None)
+        if sys.stdin.readline() != "go\n":
+            return
+        row = store.db.execute("SELECT * FROM attempts WHERE job_id=? AND attempt_id=?", (job_id, attempt_id)).fetchone()
+        if row is None or row["adapter_pgid"] != os.getpid() or row["adapter_owner"] != os.getppid() or os.getpgrp() != os.getpid():
+            raise ValueError("adapter requires its admitted attempt guardian")
+        directory = store.directory(job_id) / ("attempt-" + digest(attempt_id))
+        spec = json.loads((directory / "adapter-spec.json").read_text())
+        with (directory / "adapter-input").open("rb") as payload:
+            child = subprocess.Popen(spec["argv"], stdin=payload, stdout=out_fd, stderr=err_fd)
+        while child.poll() is None:
+            if select.select([sys.stdin], [], [], 0.05)[0] and not os.read(sys.stdin.fileno(), 64):
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+        print(str(child.returncode), flush=True)
+        # Keep the group leader unreaped and reserved until its controller
+        # kills the whole group; EOF also handles controller/root-job death.
+        while True:
+            if select.select([sys.stdin], [], [], 1)[0] and not os.read(sys.stdin.fileno(), 64):
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+
+
+def run_adapter(store, argv, deadline):
+    job_id = nonempty(os.environ.get("HEADLONG_JOB_ID"), "HEADLONG_JOB_ID")
+    attempt_id = nonempty(os.environ.get("HEADLONG_JOB_ATTEMPT_ID"), "HEADLONG_JOB_ATTEMPT_ID")
+    if not argv or deadline < 0:
+        raise ValueError("adapter argv and nonnegative deadline required")
+    payload = sys.stdin.buffer.read(LIMIT + 1)
+    if len(payload) > LIMIT:
+        raise ValueError("adapter input too large")
+    directory = store.directory(job_id) / ("attempt-" + digest(attempt_id))
+    with lock(directory / "adapter.lock") as ownership:
+        with store.transaction():
+            authorize_attempt(store, job_id)
+            row = store.db.execute("SELECT * FROM attempts WHERE job_id=? AND attempt_id=?", (job_id, attempt_id)).fetchone()
+            if row is None or row["state"] != "started" or row["adapter_state"] is not None:
+                raise ValueError("adapter execution requires an unused admitted attempt")
+            store.db.execute("UPDATE attempts SET adapter_state='starting' WHERE job_id=? AND attempt_id=?", (job_id, attempt_id))
+            store.event(job_id, "attempt-group-starting", {"attempt_id": attempt_id})
+        write_json(directory / "adapter-spec.json", {"argv": argv, "deadline": deadline})
+        with (directory / "adapter-input").open("wb") as incoming:
+            incoming.write(payload)
+            incoming.flush()
+            os.fsync(incoming.fileno())
+        out_fd, err_fd = os.dup(sys.stdout.fileno()), os.dup(sys.stderr.fileno())
+        group = subprocess.Popen([sys.executable, SELF, "_adapter-guard", job_id, attempt_id,
+            str(out_fd), str(err_fd), str(ownership.fileno())], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            start_new_session=True, pass_fds=(out_fd, err_fd, ownership.fileno()))
+        os.close(out_fd)
+        os.close(err_fd)
+        stopping, signalled, timed_out, result = [False], None, False, None
+        signal.signal(signal.SIGTERM, lambda *_: stopping.__setitem__(0, True))
+        signal.signal(signal.SIGINT, lambda *_: stopping.__setitem__(0, True))
+        begun = time.monotonic()
+        buffer = b""
+        try:
+            with store.transaction():
+                store.db.execute("UPDATE attempts SET adapter_state='running',adapter_pgid=?,adapter_owner=? WHERE job_id=? AND attempt_id=?",
+                                 (group.pid, os.getpid(), job_id, attempt_id))
+            group.stdin.write(b"go\n")
+            group.stdin.flush()
+            while True:
+                elapsed = time.monotonic() - begun
+                if signalled is None and (stopping[0] or (deadline > 0 and elapsed >= deadline)):
+                    timed_out = not stopping[0]
+                    signalled = time.monotonic()
+                    os.killpg(group.pid, signal.SIGTERM)
+                if select.select([group.stdout], [], [], 0.05)[0]:
+                    chunk = os.read(group.stdout.fileno(), 64)
+                    buffer += chunk
+                    if b"\n" in buffer:
+                        result = int(buffer.split(b"\n", 1)[0])
+                        break
+                    if not chunk:
+                        break
+                if signalled is not None and time.monotonic() - signalled >= 5:
+                    break
+        finally:
+            try:
+                os.killpg(group.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            group.wait()
+            group.stdin.close()
+            group.stdout.close()
+        code = 124 if timed_out else (result if result is not None and result >= 0 else 75)
+        write_json(directory / "adapter-exit.json", {"returncode": code, "timed_out": timed_out, "pgid": group.pid})
+        store.db.execute("UPDATE attempts SET adapter_state='stopped' WHERE job_id=? AND attempt_id=?", (job_id, attempt_id))
+        return code
+
+
+def response_evidence(directory):
+    try:
+        with (directory / "response.json").open() as stream:
+            response = read_json(stream)
+        status = response.get("status")
+        if (not isinstance(response.get("id"), str) or not response["id"] or response.get("error")
+            or not isinstance(response.get("output"), list)):
+            status = "unknown"
+    except (OSError, ValueError, AttributeError):
+        status, response = "unknown", None
+    return status if isinstance(status, str) and status in {"completed", "cancelled"} else "unknown", response
+
+
+def reconcile_attempts(store, job_id):
+    for attempt_row in store.db.execute("SELECT * FROM attempts WHERE job_id=? AND state='started'", (job_id,)).fetchall():
+        directory = store.directory(job_id) / ("attempt-" + digest(attempt_row["attempt_id"]))
+        outcome, response = response_evidence(directory)
+        result = {"outcome": outcome, "response": response, "replayable": False,
+                  "reason": "reconciled_from_sidecar" if outcome != "unknown" else "attempt_custody_lost"}
+        with store.transaction():
+            store.db.execute("UPDATE attempts SET state=?,result=? WHERE job_id=? AND attempt_id=? AND state='started'",
+                             (outcome, encode(result), job_id, attempt_row["attempt_id"]))
+            store.event(job_id, "attempt-reconciled", {"attempt_id": attempt_row["attempt_id"], "outcome": outcome})
+
+
+def attempt(store, job_id, attempt_id, argv):
+    nonempty(attempt_id, "attempt_id")
+    if not argv:
+        raise ValueError("attempt requires an executable argv")
+    payload = sys.stdin.buffer.read(LIMIT + 1)
+    if len(payload) > LIMIT:
+        raise ValueError("attempt input too large")
+    controls = {key: value for key, value in os.environ.items()
+                if key.startswith(("LLM_", "SHELLM_")) and key != "LLM_RESPONSE_FILE"}
+    body_path = controls.get("LLM_RESPONSES_BODY_FILE")
+    body_bytes = Path(body_path).read_bytes() if body_path else None
+    request_hash = digest(encode({"argv": argv, "stdin_sha256": hashlib.sha256(payload).hexdigest(),
+        "controls": controls, "context": os.environ.get("HEADLONG_JOB_ATTEMPT_CONTEXT"),
+        "body_sha256": hashlib.sha256(body_bytes).hexdigest() if body_bytes is not None else None}))
+    directory = store.directory(job_id) / ("attempt-" + digest(attempt_id))
+    directory.mkdir(mode=0o700, exist_ok=True)
+    with store.transaction():
+        authorize_attempt(store, job_id)
+        old = store.db.execute("SELECT * FROM attempts WHERE job_id=? AND attempt_id=?", (job_id, attempt_id)).fetchone()
+        if old:
+            if old["request_hash"] != request_hash:
+                raise ValueError("attempt_id reused with different input/argv")
+        else:
+            store.db.execute("INSERT INTO attempts(job_id,attempt_id,request_hash,state,result) VALUES(?,?,?,'started',NULL)", (job_id, attempt_id, request_hash))
+            store.event(job_id, "attempt-started", {"attempt_id": attempt_id, "request_hash": request_hash})
+    if old:
+        if old["state"] == "completed" and json.loads(old["result"]).get("replayable"):
+            sys.stdout.buffer.write((directory / "stdout").read_bytes())
+            return 0
+        print(encode({"outcome": "unknown", "reason": "attempt_already_started", "attempt_id": attempt_id}), file=sys.stderr)
+        return 75
+    env = dict(os.environ, HEADLONG_JOB_ATTEMPT_ID=attempt_id, HEADLONG_JOB_CONTROL_TOOL=SELF,
+               LLM_RESPONSE_FILE=str(directory / "response.json"))
+    if body_bytes is not None:
+        snapshot = directory / "body.json"
+        with snapshot.open("wb") as body:
+            body.write(body_bytes)
+            body.flush()
+            os.fsync(body.fileno())
+        sync_dir(directory)
+        env["LLM_RESPONSES_BODY_FILE"] = str(snapshot)
+    with (directory / "stdout").open("wb") as out, (directory / "stderr").open("wb") as err:
+        child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, env=env)
+        child.communicate(payload)
+        out.flush()
+        os.fsync(out.fileno())
+        err.flush()
+        os.fsync(err.fileno())
+    sync_dir(directory)
+    sync_dir(directory.parent)
+    # PR1's typed sidecar, not stdout/exit status, proves a model terminal.
+    outcome, response = response_evidence(directory)
+    if child.returncode != 0 and outcome == "completed":
+        outcome = "unknown"
+    result = {"outcome": outcome, "returncode": child.returncode, "response": response, "replayable": outcome == "completed"}
+    with store.transaction():
+        store.db.execute("UPDATE attempts SET state=?,result=? WHERE job_id=? AND attempt_id=?",
+                         (outcome, encode(result), job_id, attempt_id))
+        store.event(job_id, "attempt-terminal", {"attempt_id": attempt_id, "outcome": outcome})
+    sys.stdout.buffer.write((directory / "stdout").read_bytes())
+    return 0 if outcome == "completed" else 75
+
+
+def recovery_reference(evidence):
+    if not isinstance(evidence, dict):
+        raise ValueError("recovery evidence must be an object")
+    nonempty(evidence.get("receipt_ref"), "receipt_ref")
+    receipt_hash = nonempty(evidence.get("receipt_sha256"), "receipt_sha256")
+    if len(receipt_hash) != 64 or any(c not in "0123456789abcdef" for c in receipt_hash):
+        raise ValueError("receipt_sha256 must be a lowercase SHA-256 digest")
+
+
+def retire_legacy(store, evidence):
+    recovery_reference(evidence)
+    if evidence.get("quiescent") is not True:
+        raise ValueError("retiring legacy execution requires explicit verified quiescence")
+    with lock(store.root / "start.lock"):
+        pid_path = store.identity / "run" / "dispatcher.pid"
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), 0)
+                raise ValueError("stop the existing dispatcher before retiring legacy execution")
+            except ProcessLookupError:
+                pass
+        with store.transaction():
+            epoch = store.db.execute("SELECT value FROM control WHERE key='legacy_execution'").fetchone()
+            if epoch is None or evidence.get("legacy_execution") != epoch["value"]:
+                raise ValueError("quiescence evidence must bind the current legacy_execution epoch")
+            store.db.execute("INSERT OR REPLACE INTO control VALUES('legacy_retired',?)", (encode(evidence),))
+            store.db.execute("DELETE FROM control WHERE key='legacy_execution'")
+    return {"legacy_execution": "retired", "evidence": evidence}
+
+
+def recover(store, job_id, evidence):
+    # Recovery is an explicit operator adjudication. It never executes a
+    # handler or a CREATE, and never clears the immutable cancellation fence.
+    if (not isinstance(evidence, dict) or not isinstance(evidence.get("outcome"), str)
+        or evidence["outcome"] not in {"completed", "cancelled"}):
+        raise ValueError("recovery requires a completed/cancelled outcome")
+    recovery_reference(evidence)
+    with store.transaction():
+        row = store.job(job_id)
+        if row["state"] != "unknown" or alive_worker(store, row):
+            raise ValueError("only an unknown job without a live worker can be reconciled")
+        if evidence.get("execution_id") != row["execution"]:
+            raise ValueError("recovery execution_id mismatch")
+        store.db.execute("UPDATE jobs SET state=?,result=?,recovery=? WHERE job_id=?",
+                         (evidence["outcome"], encode(evidence), encode(evidence), job_id))
+        store.event(job_id, "job-reconciled", evidence)
+    return store.receipt(store.job(job_id))
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("admit", "list", "start", "stop", "legacy-status", "retire-legacy"):
+        sub.add_parser(name)
+    for name in ("get", "cancel", "recover", "attempts"):
+        sub.add_parser(name).add_argument("job_id")
+    p = sub.add_parser("wait-child")
+    p.add_argument("job_id")
+    p.add_argument("child_id")
+    sub.add_parser("register").add_argument("handler")
+    p = sub.add_parser("attempt")
+    p.add_argument("job_id")
+    p.add_argument("attempt_id")
+    p.add_argument("argv", nargs=argparse.REMAINDER)
+    p = sub.add_parser("adapter-run")
+    p.add_argument("--deadline", type=int, default=0)
+    p.add_argument("argv", nargs=argparse.REMAINDER)
+    p = sub.add_parser("_adapter-guard")
+    for field in ("job_id", "attempt_id"):
+        p.add_argument(field)
+    for field in ("out_fd", "err_fd", "lock_fd"):
+        p.add_argument(field, type=int)
+    sub.add_parser("_dispatch").add_argument("ready_fd", type=int)
+    sub.add_parser("_legacy-start").add_argument("argv", nargs=argparse.REMAINDER)
+    for name in ("_worker", "_execute"):
+        p = sub.add_parser(name)
+        p.add_argument("job_id")
+        p.add_argument("execution")
+        if name == "_worker":
+            p.add_argument("lock_fd", type=int)
+    args = parser.parse_args()
+    store = Store()
+    if args.cmd == "register":
+        result = register(store, args.handler, read_json(sys.stdin))
+    elif args.cmd == "admit":
+        result = admit(store, read_json(sys.stdin))
+    elif args.cmd == "get":
+        result = store.receipt(store.job(args.job_id))
+    elif args.cmd == "attempts":
+        store.job(args.job_id)
+        result = [{"attempt_id": row["attempt_id"], "state": row["state"], "request_hash": row["request_hash"],
+                   "result": json.loads(row["result"]) if row["result"] else None}
+                  for row in store.db.execute("SELECT * FROM attempts WHERE job_id=? ORDER BY rowid", (args.job_id,))]
+    elif args.cmd == "list":
+        result = [store.receipt(row) for row in store.db.execute("SELECT * FROM jobs ORDER BY created,job_id")]
+    elif args.cmd == "cancel":
+        result = cancel(store, args.job_id)
+    elif args.cmd == "wait-child":
+        result = wait_child(store, args.job_id, args.child_id)
+    elif args.cmd == "recover":
+        result = recover(store, args.job_id, read_json(sys.stdin))
+    elif args.cmd == "start":
+        result = start(store)
+    elif args.cmd == "retire-legacy":
+        result = retire_legacy(store, read_json(sys.stdin))
+    elif args.cmd == "legacy-status":
+        epoch = store.db.execute("SELECT value FROM control WHERE key='legacy_execution'").fetchone()
+        result = {"legacy_execution": epoch["value"] if epoch else None}
+    elif args.cmd == "stop":
+        store.db.execute("INSERT OR REPLACE INTO control VALUES('dispatcher','stopped')")
+        result = {"mode": "jobs-only", "dispatch": "stop_requested", "running_jobs": "preserved"}
+    elif args.cmd == "_legacy-start":
+        with lock(store.root / "start.lock", blocking=True):
+            if (store.root / "mode.json").exists():
+                raise ValueError("identity uses durable jobs; start with --jobs-only")
+            store.db.execute("INSERT OR REPLACE INTO control VALUES('legacy_execution',?)", (uuid.uuid4().hex,))
+            return subprocess.call(args.argv, env=dict(os.environ, HEADLONG_START_LOCKED="1"))
+    elif args.cmd == "_dispatch":
+        dispatch(store, getattr(args, "ready_fd", None))
+        return 0
+    elif args.cmd == "_worker":
+        worker(store, args.job_id, args.execution, args.lock_fd)
+        return 0
+    elif args.cmd == "_execute":
+        execute(store, args.job_id, args.execution)
+        return 0
+    elif args.cmd == "_adapter-guard":
+        adapter_guard(store, args.job_id, args.attempt_id, args.out_fd, args.err_fd, args.lock_fd)
+        return 0
+    elif args.cmd == "adapter-run":
+        return run_adapter(store, args.argv[1:] if args.argv[:1] == ["--"] else args.argv, args.deadline)
+    else:
+        return attempt(store, args.job_id, args.attempt_id, args.argv[1:] if args.argv[:1] == ["--"] else args.argv)
+    print(encode(result))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        print("headlong-jobs: " + str(exc), file=sys.stderr)
+        sys.exit(1)

@@ -344,6 +344,7 @@ _start_dispatcher() {
 
     # Start dispatcher in background
     (
+        unset HEADLONG_START_LOCKED
         trap '_cleanup_dispatcher' EXIT
         trap '_dispatcher_on_signal INT' INT
         trap '_dispatcher_on_signal TERM' TERM
@@ -1092,9 +1093,28 @@ _ensure_shellm_bins() {
 # Subcommands
 # ---------------------------------------------------------------------------
 
+_jobs_tool() {
+    local own_bin
+    own_bin=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+    if [[ -x "$own_bin/../tools/headlong-jobs" ]]; then
+        printf '%s\n' "$own_bin/../tools/headlong-jobs"
+    else
+        command -v headlong-jobs || die "headlong-jobs not installed"
+    fi
+}
+
 cmd_start() {
+    if [[ "${1:-}" == "--jobs-only" ]]; then
+        [[ $# -eq 1 ]] || die "--jobs-only cannot start legacy thinkers"
+        _ensure_shellm_bins
+        exec "$(_jobs_tool)" start
+    fi
+    [[ ! -f "$IDENTITY_DIR/jobs/mode.json" ]] || die "Identity uses durable jobs; start with --jobs-only"
     _require_env
     _ensure_shellm_bins
+    if [[ "${HEADLONG_START_LOCKED:-}" != "1" ]]; then
+        exec "$(_jobs_tool)" _legacy-start bash "${BASH_SOURCE[0]}" start "$@"
+    fi
 
     # Parse start-specific flags
     while [[ $# -gt 0 ]]; do
@@ -1279,6 +1299,11 @@ _drain_all_then_finish() {
 }
 
 cmd_stop() {
+    if [[ -f "$IDENTITY_DIR/jobs/mode.json" ]]; then
+        [[ $# -eq 0 ]] || die "Use thinkers jobs cancel JOB_ID for exact job cancellation"
+        _ensure_shellm_bins
+        exec "$(_jobs_tool)" stop
+    fi
     _require_env
 
     local run_dir="$IDENTITY_DIR/run"
@@ -1743,6 +1768,8 @@ usage() {
 thinkers — Modular reactive thought process manager
 
 Usage:
+  thinkers start --jobs-only   Start the exclusive durable application-job dispatcher
+  thinkers jobs <command>      Durable register/admit/get/list/cancel/recover/attempt API
   thinkers start [--no-self-trigger] [name ...]
                                Start all thinkers (or specific ones by name)
   thinkers stop [name ...] [--force] [--self] [--drain-timeout N]
@@ -1796,6 +1823,7 @@ cmd="${1:-}"
 [[ -n "$cmd" ]] && shift
 
 case "$cmd" in
+    jobs)     _ensure_shellm_bins; exec "$(_jobs_tool)" "$@" ;;
     start)    cmd_start "$@" ;;
     stop)     cmd_stop "$@" ;;
     status)   cmd_status ;;
