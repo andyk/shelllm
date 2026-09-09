@@ -185,8 +185,13 @@ expecting `new` on an old trajectory to discard its Conversation.
 Acknowledgements live at
 `$SHELLM_TRAJ_DIR/.responses-conversations/<conv_id>.json`, bound to canonical
 trajectory, provider and endpoint. The directory is 0700, files 0600, replacement
-atomic, and a local exclusive lock lasts for the whole run. Before dispatch the
-checkpoint becomes `in_flight`; terminal validation advances it to `ready`.
+atomic, and a local exclusive lock lasts for the whole run. That lock is keyed
+by provider, effective endpoint, and Conversation ID under
+`$HEADLONG_HOME/run/responses-conversations/` (or the selected legacy state
+home), independent of the trajectory root. Before dispatch the checkpoint
+becomes `in_flight`; terminal validation advances it to `ready`. A failed
+Conversation context render stops before dispatch and leaves the ready
+acknowledgement unchanged.
 Resume sends genuinely unsent rows, not old prompts and outputs a second time.
 Generated child calls and summaries do not inherit the parent's Conversation.
 
@@ -230,9 +235,11 @@ can overflow before upkeep. There is no universal threshold across models.
 `SHELLM_RESPONSES_COMPACT_MODE=auto` chooses server compaction for native OpenAI
 and standalone for other endpoints. `server` explicitly declares support for
 `context_management`; `standalone` forces replay and calls `/responses/compact`.
-Server output prunes replay to its **newest** compaction marker. Standalone output
-replaces the window **as-is**, including items before any marker. A failed
-standalone compact preserves the chain and disables upkeep for that run.
+Server output prunes replay to its **newest usable** compaction marker. A marker
+without non-empty opaque `encrypted_content` cannot prune or enter the replay.
+Standalone output replaces the window **as-is**, including items before any
+marker, after the same payload check. A failed standalone compact preserves the
+chain and disables upkeep for that run.
 Standalone upkeep only receives the completion's remaining time budget; its
 reported usage enters the shared ledger as `operation:"responses.compact"`.
 
@@ -251,7 +258,8 @@ Retention; background execution can require temporary provider storage.
 ## What changed, and how it is checked
 
 PR #1 hardening fixes abandoned WebSocket ownership, realistic frame sizes,
-provider/body parity, connection errors and age rotation; secret temp cleanup;
+provider/body parity, connection errors, age rotation, and drain-before-reuse
+rotation after each generation's 32 unique stream names; secret temp cleanup;
 unknown-create and terminal-state handling; absolute deadlines and truthful
 cancellation; Conversation resume and body-mode validation; repeated compaction,
 provider preservation and accounting; pagination completeness; and copy installs.

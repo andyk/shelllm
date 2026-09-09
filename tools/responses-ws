@@ -564,6 +564,8 @@ class Connection:
         self.opened_at = time.monotonic()
         self.lanes = {}
         self.free_lanes = ["lane-%d" % i for i in range(MAX_LANES)]
+        self.drained = asyncio.Event()
+        self.drained.set()
         self.retired = False
 
 
@@ -587,12 +589,29 @@ class Broker:
 
     async def ensure_connection(self):
         """Called under the admission lock, BEFORE inserting a lane."""
+        if self.stopping.is_set():
+            raise ValueError("broker stopped before admission")
         generation = self.connection
+        if generation and not generation.free_lanes:
+            # Reusing a lane before its new response ID arrives would let a
+            # delayed old terminal settle the new call. Drain before rotation
+            # so name exhaustion does not abandon another caller's response.
+            try:
+                await asyncio.wait_for(generation.drained.wait(), IO_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise ValueError("connection lane exhaustion wait timed out") from None
+            if self.stopping.is_set():
+                raise ValueError("broker stopped before admission")
+            if self.connection is generation:
+                self.retire(generation, transport_error("connection stream names exhausted"))
         if generation and time.monotonic() - generation.opened_at > CONNECTION_MAX_AGE:
             if not generation.lanes:
                 self.retire(generation, transport_error("idle connection rotated"))
         if self.connection is None:
             ws = await ws_connect(self.url, **connect_kwargs())
+            if self.stopping.is_set():
+                await self._close(ws)
+                raise ValueError("broker stopped before admission")
             self.connection = Connection(ws)
             self.track(self._read_forever(self.connection))
         return self.connection
@@ -601,6 +620,7 @@ class Broker:
         if generation.retired:
             return
         generation.retired = True
+        generation.drained.set()
         if self.connection is generation:
             self.connection = None
         try:
@@ -715,6 +735,7 @@ class Broker:
                 lane = generation.free_lanes.pop(0)
                 state = Lane()
                 generation.lanes[lane] = state
+                generation.drained.clear()
                 body = dict(body, stream_id=lane)
                 await generation.ws.send(encode_frame(body).decode("utf-8"))
             while True:
@@ -731,7 +752,8 @@ class Broker:
                     self.retire(generation, transport_error("caller abandoned or transport failed; response outcome unknown"))
                 if generation.lanes.get(lane) is state:
                     del generation.lanes[lane]
-                    generation.free_lanes.append(lane)
+                    if not generation.lanes:
+                        generation.drained.set()
             self.slots.release()
             self.last_activity = time.monotonic()
 

@@ -16,6 +16,16 @@ bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 
 mkdir -p "$WORK/home" "$WORK/wd"
 cp -R "$REPO/bin" "$WORK/toolbin"
+mv "$WORK/toolbin/context" "$WORK/toolbin/context.real"
+cat > "$WORK/toolbin/context" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${TEST_CONTEXT_FAIL:-0}" == 1 ]]; then
+    echo "injected context renderer failure" >&2
+    exit 91
+fi
+exec "$(dirname "$0")/context.real" "$@"
+STUB
+chmod +x "$WORK/toolbin/context"
 cat > "$WORK/toolbin/llm" <<'STUB'
 #!/usr/bin/env bash
 main_loop=0
@@ -43,13 +53,29 @@ printf '%s\n' "${LLM_RESPONSES_COMPACT_THRESHOLD-unset}" > "$LLM_STUB_DIR/thresh
 printf '%s\n' "${LLM_RESPONSES_CONVERSATION-unset}" > "$LLM_STUB_DIR/conversation-$n"
 printf '%s\n' "${LLM_RESPONSE_FILE:-}" > "$LLM_STUB_DIR/response-file-$n"
 [[ -n "$messages_file" ]] && cp "$messages_file" "$LLM_STUB_DIR/messages-$n.json"
-if [[ "${TEST_LOCK_PROBE:-0}" == 1 && "$n" == 1 ]]; then
-    checkpoint="$HEADLONG_HOME/trajectories/.responses-conversations/conv_locked.json"
+if [[ "${TEST_LOCK_PROBE:-0}" != 0 && "$n" == 1 ]]; then
+    conversation_id="${LLM_RESPONSES_CONVERSATION:-}"
+    checkpoint="$HEADLONG_HOME/trajectories/.responses-conversations/$conversation_id.json"
     cp "$checkpoint" "$LLM_STUB_DIR/checkpoint-before"
     mkdir -p "$LLM_STUB_DIR/contender"
-    TEST_LOCK_PROBE=0 LLM_STUB_DIR="$LLM_STUB_DIR/contender" \
-        shellm --resume --max-iterations 1 "contending input" </dev/null \
-        > "$LLM_STUB_DIR/contender.out" 2> "$LLM_STUB_DIR/contender.err"
+    if [[ "$TEST_LOCK_PROBE" == cross-root ]]; then
+        TEST_LOCK_PROBE=0 LLM_STUB_DIR="$LLM_STUB_DIR/contender" \
+            SHELLM_TRAJ_DIR="$HEADLONG_HOME/other-trajectories" \
+            SHELLM_RESPONSES_CONVERSATION="$conversation_id" \
+            shellm --max-iterations 1 "contending input" </dev/null \
+            > "$LLM_STUB_DIR/contender.out" 2> "$LLM_STUB_DIR/contender.err"
+    elif [[ "$TEST_LOCK_PROBE" == equivalent-endpoint ]]; then
+        TEST_LOCK_PROBE=0 LLM_STUB_DIR="$LLM_STUB_DIR/contender" \
+            SHELLM_TRAJ_DIR="$HEADLONG_HOME/other-trajectories" \
+            SHELLM_API_URL="https://api.openai.com/v1/responses/" \
+            SHELLM_RESPONSES_CONVERSATION="$conversation_id" \
+            shellm --max-iterations 1 "contending input" </dev/null \
+            > "$LLM_STUB_DIR/contender.out" 2> "$LLM_STUB_DIR/contender.err"
+    else
+        TEST_LOCK_PROBE=0 LLM_STUB_DIR="$LLM_STUB_DIR/contender" \
+            shellm --resume --max-iterations 1 "contending input" </dev/null \
+            > "$LLM_STUB_DIR/contender.out" 2> "$LLM_STUB_DIR/contender.err"
+    fi
     printf '%s\n' "$?" > "$LLM_STUB_DIR/contender.rc"
     cp "$checkpoint" "$LLM_STUB_DIR/checkpoint-after"
 fi
@@ -115,11 +141,11 @@ write_response_server_compacted() {
 }
 
 case "$LLM_STUB_MODE:$n" in
-    compact:1|compact-window:1|compactfail:1|stateful-compact:1)
+    compact:1|compact-window:1|compact-malformed:1|compactfail:1|stateful-compact:1)
         write_response_usage resp_1 9000
         printf '%s\n' '```bash' 'printf "first output\n"' '```'
         ;;
-    compact:2|compact-window:2|stateful-compact:2)
+    compact:2|compact-window:2|compact-malformed:2|stateful-compact:2)
         write_response_usage resp_2 10
         printf '%s\n' '```bash' 'FINAL=done-after-compaction' '```'
         ;;
@@ -135,7 +161,18 @@ case "$LLM_STUB_MODE:$n" in
         write_response_server_compacted resp_1
         printf '%s\n' '```bash' 'printf "first output\n"' '```'
         ;;
+    server-compaction-malformed:1)
+        write_response resp_1
+        jq '.output |= ([.[0], {id:"cmp_bad", type:"compaction"}, .[1]])' \
+            "$LLM_RESPONSE_FILE" > "$LLM_RESPONSE_FILE.tmp"
+        mv "$LLM_RESPONSE_FILE.tmp" "$LLM_RESPONSE_FILE"
+        printf '%s\n' '```bash' 'printf "first output\n"' '```'
+        ;;
     server-compaction:2)
+        write_response resp_2
+        printf '%s\n' '```bash' 'FINAL=done-after-server-compaction' '```'
+        ;;
+    server-compaction-malformed:2)
         write_response resp_2
         printf '%s\n' '```bash' 'FINAL=done-after-server-compaction' '```'
         ;;
@@ -268,6 +305,10 @@ case "${1:-}" in
         fi
         if [[ "$LLM_STUB_MODE" == compact-window ]]; then
             printf '%s\n' '{"output":[{"role":"user","content":"retained prefix"},{"type":"compaction","encrypted_content":"canonical"},{"role":"user","content":"retained suffix"}]}'
+            exit 0
+        fi
+        if [[ "$LLM_STUB_MODE" == compact-malformed ]]; then
+            printf '%s\n' '{"output":[{"type":"compaction"}]}'
             exit 0
         fi
         jq -nc '{
@@ -695,15 +736,23 @@ else
 fi
 
 cp "$checkpoint" "$WORK/checkpoint-locked"
-mkdir "${checkpoint%.json}.lock"
+lock_identity=$(jq -c '[.provider,.endpoint,.conversation]' "$checkpoint")
+if command -v sha256sum >/dev/null 2>&1; then
+    lock_digest=$(printf '%s' "$lock_identity" | sha256sum)
+else
+    lock_digest=$(printf '%s' "$lock_identity" | shasum -a 256)
+fi
+lock_digest=${lock_digest%%[[:space:]]*}
+lock_path="$HEADLONG_HOME/run/responses-conversations/conv_locked-$lock_digest.lock"
+mkdir "$lock_path"
 resume_shellm continue
-if [[ "$?" != 0 && "$(main_calls)" == 0 && -d "${checkpoint%.json}.lock" ]] \
+if [[ "$?" != 0 && "$(main_calls)" == 0 && -d "$lock_path" ]] \
     && cmp -s "$checkpoint" "$WORK/checkpoint-locked"; then
     ok "a stale crash lock is never stolen or released by a contender"
 else
     bad "a stale crash lock is never stolen or released by a contender"
 fi
-rmdir "${checkpoint%.json}.lock"
+rmdir "$lock_path"
 
 LLM_PROVIDER=openai-compatible resume_shellm continue
 if [[ "$?" != 0 && "$(main_calls)" == 0 ]] && cmp -s "$checkpoint" "$WORK/checkpoint-locked"; then
@@ -722,6 +771,30 @@ else
     bad "a different trajectory cannot overwrite a shared Conversation acknowledgement"
 fi
 
+TEST_LOCK_PROBE=cross-root SHELLM_RESPONSES_CONVERSATION=conv_cross_root \
+    run_shellm continue responses
+rc=$?
+if [[ "$rc" == 0 && "$(cat "$WORK/stub/contender.rc")" != 0 \
+    && ! -e "$WORK/stub/contender/calls" ]] \
+    && cmp -s "$WORK/stub/checkpoint-before" "$WORK/stub/checkpoint-after" \
+    && grep -q 'Conversation is locked' "$WORK/stub/contender.err"; then
+    ok "a Conversation lock holds across different trajectory roots"
+else
+    bad "a Conversation lock holds across different trajectory roots" "rc=$rc contender=$(cat "$WORK/stub/contender.rc" 2>/dev/null) calls=$(cat "$WORK/stub/contender/calls" 2>/dev/null) stderr=$(tail -3 "$WORK/stub/contender.err" 2>/dev/null | tr '\n' ' ')"
+fi
+
+TEST_LOCK_PROBE=equivalent-endpoint \
+    SHELLM_RESPONSES_CONVERSATION=conv_equivalent_endpoint run_shellm continue responses
+rc=$?
+if [[ "$rc" == 0 && "$(cat "$WORK/stub/contender.rc")" != 0 \
+    && ! -e "$WORK/stub/contender/calls" ]] \
+    && cmp -s "$WORK/stub/checkpoint-before" "$WORK/stub/checkpoint-after" \
+    && grep -q 'Conversation is locked' "$WORK/stub/contender.err"; then
+    ok "an explicit default endpoint shares the unset endpoint's Conversation lock"
+else
+    bad "an explicit default endpoint shares the unset endpoint's Conversation lock" "rc=$rc contender=$(cat "$WORK/stub/contender.rc" 2>/dev/null) calls=$(cat "$WORK/stub/contender/calls" 2>/dev/null) stderr=$(tail -3 "$WORK/stub/contender.err" 2>/dev/null | tr '\n' ' ')"
+fi
+
 SHELLM_RESPONSES_CONVERSATION=conv_unknown run_shellm no-terminal responses
 checkpoint="$HEADLONG_HOME/trajectories/.responses-conversations/conv_unknown.json"
 cp "$checkpoint" "$WORK/checkpoint-unknown"
@@ -733,6 +806,19 @@ if [[ "$rc" != 0 && "$(main_calls)" == 0 ]] \
     ok "ambiguous delivery remains unacknowledged and resume fails closed without resending"
 else
     bad "ambiguous delivery remains unacknowledged and resume fails closed without resending"
+fi
+
+SHELLM_RESPONSES_CONVERSATION=conv_context_fail run_shellm continue responses
+checkpoint="$HEADLONG_HOME/trajectories/.responses-conversations/conv_context_fail.json"
+cp "$checkpoint" "$WORK/checkpoint-context-fail"
+TEST_CONTEXT_FAIL=1 resume_shellm continue
+rc=$?
+if [[ "$rc" != 0 && "$(main_calls)" == 0 ]] \
+    && cmp -s "$checkpoint" "$WORK/checkpoint-context-fail" \
+    && grep -q 'could not render Conversation context' "$WORK/err"; then
+    ok "Conversation context rendering fails closed before dispatch or acknowledgement"
+else
+    bad "Conversation context rendering fails closed before dispatch or acknowledgement" "rc=$rc calls=$(main_calls) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
 fi
 
 SHELLM_RESPONSES_CONVERSATION=conv_missing run_shellm continue responses
@@ -910,6 +996,17 @@ else
     bad "a compaction item in a terminal output truncates the replay chain" "rc=$rc calls=$(main_calls) compacts=$(compact_calls) m2=$(jq -c 'map(.type // .role)' "$WORK/stub/messages-2.json" 2>/dev/null)"
 fi
 
+run_shellm server-compaction-malformed responses openrouter openai/o4-mini
+if [[ "$?" == 0 ]] \
+   && jq -e 'any(.[]; .encrypted_content == "enc_resp_1")
+        and all(.[]; .id? != "cmp_bad")' \
+        "$WORK/stub/messages-2.json" >/dev/null 2>&1 \
+   && grep -q 'unusable compaction item' "$WORK/err"; then
+    ok "an unusable server compaction marker cannot prune known-good replay"
+else
+    bad "an unusable server compaction marker cannot prune known-good replay" "m2=$(jq -c 'map(.type // .role)' "$WORK/stub/messages-2.json" 2>/dev/null) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
+fi
+
 run_shellm multiple-compactions responses openrouter openai/o4-mini
 if [[ "$?" == 0 ]] && jq -e '.[0].id == "cmp_resp_2"
     and all(.[]; .id != "cmp_resp_1" and .id != "msg_resp_1")
@@ -926,6 +1023,16 @@ if [[ "$?" == 0 ]] && jq -e '.[0:3] == [{role:"user",content:"retained prefix"},
     ok "standalone compact.output is preserved as-is including items before the marker"
 else
     bad "standalone compact.output is preserved as-is including items before the marker"
+fi
+
+SHELLM_RESPONSES_COMPACT_THRESHOLD=1000 run_shellm compact-malformed responses openrouter openai/o4-mini
+if [[ "$?" == 0 && "$(compact_calls)" == 1 ]] \
+    && jq -e 'any(.[]; .encrypted_content == "enc_resp_1")' \
+        "$WORK/stub/messages-2.json" >/dev/null 2>&1 \
+    && grep -q 'unusable compaction item' "$WORK/err"; then
+    ok "an unusable standalone compact reply keeps known-good replay"
+else
+    bad "an unusable standalone compact reply keeps known-good replay" "calls=$(compact_calls) m2=$(jq -c 'map(.type // .role)' "$WORK/stub/messages-2.json" 2>/dev/null) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
 fi
 if [[ "$(cat "$WORK/stub/compact-provider-1")" == openrouter \
     && -s "$WORK/stub/compact-instructions-1" ]]; then
@@ -970,9 +1077,10 @@ done
 # Exercise the actual upkeep function without a model, so elapsed completion
 # time can be pinned rather than relying on slow wall-clock test fixtures.
 if (
+    eval "$(sed -n '/^has_usable_compaction_window() {/,/^}/p' "$REPO/bin/shellm")"
     eval "$(sed -n '/^compact_replay_chain() {/,/^}/p' "$REPO/bin/shellm")"
     progress() { :; }
-    responses() { printf '%s' "$LLM_MAX_TIME" > "$WORK/compact-budget"; printf '{"output":[{"type":"compaction"}]}'; }
+    responses() { printf '%s' "$LLM_MAX_TIME" > "$WORK/compact-budget"; printf '{"output":[{"type":"compaction","encrypted_content":"opaque"}]}'; }
     _SHELLM_COMPACT_MODE=standalone
     _SHELLM_HOST_PROVIDER=openai
     # Used by the sourced upkeep function above.
@@ -991,7 +1099,10 @@ if (
     LLM_MAX_TIME=100
     _call_started=$((SECONDS-5))
     compact_replay_chain "$replay" "$WORK/compact-response" 1
-    [[ "$(cat "$WORK/compact-budget")" -gt 0 && "$(cat "$WORK/compact-budget")" -le 95 ]]
+    [[ "$(cat "$WORK/compact-budget")" -gt 0 \
+        && "$(cat "$WORK/compact-budget")" -le 95 ]] || exit 1
+    jq -e 'length == 1 and .[0].type == "compaction"
+        and .[0].encrypted_content == "opaque"' "$replay" >/dev/null
 ); then
     ok "standalone compaction only spends remaining completion deadline budget"
 else

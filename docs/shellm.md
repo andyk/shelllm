@@ -419,11 +419,13 @@ threshold, not a hard window-size limit. Select the method with
 - `standalone`: with a threshold, forces replay and calls `responses compact`
   when a terminal response reports at least N input tokens. The underlying
   provider, endpoint, and current instructions are retained even with WebSocket
-  transport. The returned `output` array replaces the chain **as-is**.
+  transport. Once its compaction item carries non-empty opaque
+  `encrypted_content`, the returned `output` array replaces the chain **as-is**.
 
 Server-produced compaction prunes replay to the **newest** marker and skips a
-second standalone compact on that turn. A failed/invalid standalone compact
-warns, preserves the chain, and disables standalone upkeep for the run.
+second standalone compact on that turn. An unusable server marker cannot prune
+known-good replay. A failed/invalid standalone compact warns, preserves the
+chain, and disables standalone upkeep for the run.
 Conversation mode with a threshold requires server compaction.
 
 `SHELLM_RESPONSES_CONVERSATION` moves that state to the server instead.
@@ -440,7 +442,10 @@ asked for and nothing local is a safe substitute.
 
 Shellm persists sent-step acknowledgements under the effective trajectory
 directory (`$SHELLM_TRAJ_DIR/.responses-conversations/`), using atomic mode-0600
-checkpoints and a local exclusive lock held for the whole run. Resume restores
+checkpoints. A local exclusive lock keyed by provider, effective endpoint, and
+Conversation ID lives under the canonical state home's
+`run/responses-conversations/` and is held for the whole run, regardless of the
+selected trajectory directory. Resume restores
 acknowledged step IDs, not text matching, so unsent execution output is still
 sent. Dispatch marks the checkpoint `in_flight`; successful terminal validation
 advances it to `ready`. Ambiguous/missing/mismatched checkpoints and stale locks
@@ -468,9 +473,10 @@ shellm "audit this repo"
 shellm starts `tools/responses-ws` as a broker at run start, with its unix
 socket inside the run's private directory, and stops it at cleanup. The broker
 holds the connection, opens a new connection for later calls after retirement,
-rotates idle connections older than 55 minutes, and multiplexes callers within
-the
-documented limits of 16 in flight and 32 named lanes. `llm` reaches it through
+rotates idle connections older than 55 minutes, and multiplexes at most 16 live
+lanes. Each connection generation assigns at most 32 stream names once, then
+drains its live lanes and rotates before reusing a name. Admission waits are
+bounded and stop when broker shutdown cancels them. `llm` reaches it through
 the adapter seam (`LLM_PROVIDER=adapter`), so nothing in the completion path
 gains a Python dependency.
 
