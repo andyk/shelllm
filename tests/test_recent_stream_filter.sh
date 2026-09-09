@@ -161,6 +161,19 @@ case "$ids" in *" ro "*) ok "a responder observation (other run id) is untouched
 ids2=$(stream 2 | jq -r .step_id | tr '\n' ' ')
 [[ "$ids2" == "f3 o3 " ]] && ok "pairing happens before the window cut (N=2 -> f3 o3)" || bad "pairing before the window cut" "got $ids2"
 
+# Delivery notices (design/outbound_delivery.md, part 4): a failed one is
+# admitted, with its status and reason, so the mind learns it did not speak;
+# a delivered one is not (it would double every send inside the window).
+step d1 delivery "not delivered to slack-...: unknown slack address form" 1 ',"source":"slack-bridge","transport":"slack","status":"failed","reason":"unknown slack address form","trigger_step":"m-0001","to":"slack-..."'
+step d2 delivery "delivered to slack-C0BMVH6LM4K" 1 ',"source":"slack-bridge","transport":"slack","status":"delivered","channel":"C0BMVH6LM4K","ts":"1757372480.000001","trigger_step":"m-0002","to":"slack-C0BMVH6LM4K"'
+dl=$(stream 40 | jq -c 'select(.type == "delivery")')
+if [[ "$(printf '%s\n' "$dl" | jq -r .step_id | tr '\n' ' ')" == "d1 " ]] \
+   && [[ "$(printf '%s' "$dl" | jq -r '.status + " " + .reason + " " + .to')" == "failed unknown slack address form slack-..." ]]; then
+    ok "a failed delivery is shown with status and reason; a delivered one is not"
+else
+    bad "failed delivery shown, delivered hidden" "$dl"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

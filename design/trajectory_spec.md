@@ -105,6 +105,7 @@ The canonical list of step types. Families:
 | `observation` | thinker | `actor` | The actor recording a result to the mind log; carries `run_id` (written from inside the actor's run) |
 | `tp-thought` | thinker | thinkers scaffolded by `thinkers create` | Generic thinker output; carries `run_id` when written from inside a run |
 | `message` | conversation | `chat send` / `chat reply` / `chat send-file` | Carries `from`/`to`; file variant adds `filename` + `content_b64`; text files keep the body in `content`, binary files use a short marker |
+| `delivery` | conversation | a bridge (`slack-bridge`; Telegram and phone chat planned) | Written back for every outbound `message` step the bridge handled; carries `trigger_step` (the message step), `to`, `transport`, `status` (`delivered`, `failed`, `skipped`), and on success `channel`/`ts`/`permalink`, on failure `reason`. Subscribed by no thinker; failed ones show in the monolith's recent stream. See design/outbound_delivery.md |
 | `human-msg` | conversation | *(legacy — nothing writes it)* | Still read by `chat repl` for old logs |
 | `agent-msg` | conversation | *(legacy — nothing writes it)* | Still read by `chat repl` for old logs |
 

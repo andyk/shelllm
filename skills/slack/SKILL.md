@@ -54,6 +54,24 @@ To continue a Slack conversation later (e.g. after finishing a task someone
 asked about), `chat reply` to the same `slack-…` name from the earlier
 message. The bridge posts it into that conversation.
 
+### Posting to a channel or DMing someone without an earlier message
+
+Two short forms exist for when you are starting the conversation:
+
+- `slack-C09XYZ123` — post top-level in that channel
+- `slack-U07AB12CD` — DM that person (the bridge opens the DM)
+
+```bash
+chat send --to slack-C09XYZ123 "Daily papers for today: ..."
+chat send --to slack-U07AB12CD "Built the thing you asked about."
+```
+
+Slack ids are uppercase; users start with U, channels with C. `chat` rejects
+any other `slack-…` shape with a non-zero exit, and the bridge writes a
+`delivery` step back to your trajectory for every send, `status: delivered`
+with the permalink or `status: failed` with the reason. A failed delivery
+shows in your recent stream; check it before assuming a message landed.
+
 ### Formatting
 
 Write normal markdown; the bridge converts it for Slack (bold, links,

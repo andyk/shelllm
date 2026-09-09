@@ -497,6 +497,10 @@ _RECENT_STREAM_PAIR_JQ='
 # 2026-09-03. Ids are cut to 8 characters (traj accepts a prefix), except
 # trigger_step and resolves, which the mind copies verbatim; the details
 # command keeps the full run id because the traj filter matches exactly.
+# Failed `delivery` steps (a bridge could not post an outbound message) are
+# admitted so the mind learns at its next wake that it did not actually speak;
+# delivered ones are not, they would double every send inside the window and
+# belong to the sent ledger (design/outbound_delivery.md, part 4).
 _recent_stream() {
     local n="${1:-${THINK_CONTEXT_TAIL:-20}}"
     # Tolerant parse (fromjson?): skip corrupt lines rather than dying —
@@ -505,7 +509,8 @@ _recent_stream() {
         | jq -cR 'fromjson? // empty
             | select(.type == "thought" or .type == "action" or .type == "observation"
                      or .type == "message" or .type == "idle" or .type == "merge"
-                     or .type == "final" or .type == "error")
+                     or .type == "final" or .type == "error"
+                     or (.type == "delivery" and .status == "failed"))
             | del(.content_b64)
             | .content = (
                 (if ((.content // "") == "") and ((.filename // "") != "")
@@ -515,7 +520,7 @@ _recent_stream() {
                 | if length > 1500 then .[0:1500] + "…[truncated]" else . end)
             | if .type == "final" and ((.run_id // "") | tostring) != ""
               then .details = "traj tail -n 400 --filter run_id=" + (.run_id | tostring) else . end
-            | with_entries(select(.key | IN("type", "content", "source", "ts", "from", "to", "run_id", "step_id", "request", "person", "resolves", "trigger_step", "reply_to", "follow_up", "decision", "deferred", "rc", "details")))' \
+            | with_entries(select(.key | IN("type", "content", "source", "ts", "from", "to", "run_id", "step_id", "request", "person", "resolves", "trigger_step", "reply_to", "follow_up", "decision", "deferred", "rc", "details", "status", "reason")))' \
         2>/dev/null \
         | jq -cs "$_RECENT_STREAM_PAIR_JQ" 2>/dev/null \
         | tail -n "$n" \

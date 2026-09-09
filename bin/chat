@@ -38,6 +38,28 @@ _chat_append() {
     traj append "${ROOT_TRAJ_ID:-$TRAJ_ID}" >/dev/null
 }
 
+# Slack target grammar. This string is a copy of NAME_RE_TEXT in
+# slack/src/headlong_slack/naming.py and slack/tests/test_naming.py asserts the
+# two are identical, so chat cannot accept a name the bridge would drop (the
+# bridge dropped 23 of Audel's 74 sends in one week with no error, 2026-09-09;
+# design/outbound_delivery.md). Edit both or CI fails.
+_SLACK_NAME_RE='^slack-([UW][A-Z0-9]+|[CGD][A-Z0-9]+|[A-Za-z0-9]+-[A-Za-z0-9]+(-[0-9.]+)?)$'
+
+# _check_target <name>: a name that claims to be Slack must be one the bridge
+# can deliver. Other transports' names pass through untouched.
+_check_target() {
+    local name="$1"
+    [[ "$name" == slack-* ]] || return 0
+    [[ "$name" =~ $_SLACK_NAME_RE ]] && return 0
+    die "cannot deliver to '$name': not a Slack address the bridge understands.
+Accepted forms:
+  slack-<user>-<channel>-<thread ts>   reply in a channel thread (copy the sender's name verbatim)
+  slack-<user>-<channel>               a DM, or a channel top-level
+  slack-C<id>                          post top-level in a channel (e.g. slack-C0BMVH6LM4K)
+  slack-U<id>                          DM a person (e.g. slack-U0BFD9NDVE3)
+Slack ids are uppercase: users start with U, channels with C."
+}
+
 # Handle --help before env var check
 case "${1:-}" in -h|--help|help) ;; *)
     [[ -n "${TRAJ_DIR:-}" ]] || die "TRAJ_DIR not set. Run: identity shell <name>"
@@ -82,6 +104,7 @@ cmd_send() {
     [[ -z "$message" ]] && die "No message provided. Usage: chat send [--from <name>] [--to <name>] <message>"
 
     _resolve_from_to
+    _check_target "$to"
 
     # A self-addressed message re-triggers the identity's own message
     # subscriptions, which can loop it into replying to itself forever.
@@ -122,6 +145,7 @@ cmd_reply() {
     local to_name="${1:-}"
     [[ -z "$to_name" ]] && die "Usage: chat reply [--reply-to <step_id>] <to_name> [message]"
     shift
+    _check_target "$to_name"
 
     local message=""
     while [[ $# -gt 0 ]]; do
@@ -209,6 +233,7 @@ cmd_send_file() {
     done
     [[ -z "$filepath" ]] && die "Usage: chat send-file [--from <name>] [--to <name>] <filename>"
     [[ -f "$filepath" ]] || die "File not found: $filepath"
+    _check_target "$to"
 
     local size max
     size=$(stat -c%s "$filepath" 2>/dev/null || wc -c < "$filepath")
@@ -278,6 +303,7 @@ cmd_react() {
         to="$1"; shift
     fi
     [[ -z "$to" ]] && die "Usage: chat react [--reply-to <step_id>] [--source-url <url>] <to_name> <emoji>"
+    _check_target "$to"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires a name}"; shift 2 ;;

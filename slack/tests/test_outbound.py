@@ -540,3 +540,162 @@ def test_forged_reaction_without_chat_source_is_ignored(tmp_path, monkeypatch):
 
     outbound.run(_cfg(tmp_path), FakeClient(), FakeThreads(), threading.Event())
     assert added == []
+
+
+# --- delivery notices and the short address forms (design/outbound_delivery.md)
+
+def _drive(tmp_path, monkeypatch, steps, client):
+    monkeypatch.setattr(outbound.mindlog, "find_trajectory", lambda d: tmp_path / "t.jsonl")
+    monkeypatch.setattr(outbound.mindlog, "follow", lambda *a, **k: iter(steps))
+
+    class FakeThreads:
+        def touch(self, channel, thread_ts):
+            pass
+
+    outbound.run(_cfg(tmp_path), client, FakeThreads(), threading.Event())
+
+
+class RecordingClient:
+    """A Slack client that answers like slack_sdk does: postMessage returns
+    a ts, conversations.open returns a DM channel, getPermalink a link."""
+
+    def __init__(self, fail_post=False):
+        self.posts = []
+        self.opened = []
+        self.fail_post = fail_post
+
+    def chat_postMessage(self, channel, thread_ts, text, unfurl_links=False, **kw):
+        if self.fail_post:
+            raise RuntimeError("channel_not_found")
+        self.posts.append({"channel": channel, "thread_ts": thread_ts, "text": text})
+        return {"ok": True, "ts": f"1757372480.{len(self.posts):06d}"}
+
+    def conversations_open(self, users):
+        self.opened.append(users)
+        return {"ok": True, "channel": {"id": f"D-{users}"}}
+
+    def chat_getPermalink(self, channel, message_ts):
+        return {"ok": True, "permalink": f"https://x.slack.com/archives/{channel}/p{message_ts.replace('.', '')}"}
+
+
+def _msg(step_id, to, content="hello"):
+    return {"type": "message", "from": "audel", "to": to, "source": "chat",
+            "content": content, "step_id": step_id}
+
+
+def test_bare_channel_posts_top_level_and_is_confirmed(tmp_path, monkeypatch, notices):
+    client = RecordingClient()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "slack-C0BMVH6LM4K", "papers")], client)
+    assert client.posts == [{"channel": "C0BMVH6LM4K", "thread_ts": None, "text": "papers"}]
+    assert client.opened == []
+    assert len(notices) == 1
+    n = notices[0]
+    assert n["type"] == "delivery" and n["source"] == "slack-bridge" and n["transport"] == "slack"
+    assert n["status"] == "delivered" and n["trigger_step"] == "m1" and n["to"] == "slack-C0BMVH6LM4K"
+    assert n["channel"] == "C0BMVH6LM4K" and n["ts"] == "1757372480.000001"
+    assert n["permalink"].endswith("/archives/C0BMVH6LM4K/p1757372480000001")
+    assert n["content"] == "delivered to slack-C0BMVH6LM4K"
+
+
+def test_bare_user_opens_the_dm_once(tmp_path, monkeypatch, notices):
+    client = RecordingClient()
+    steps = [_msg("m1", "slack-U0BFD9NDVE3", "one"), _msg("m2", "slack-U0BFD9NDVE3", "two")]
+    _drive(tmp_path, monkeypatch, steps, client)
+    assert client.opened == ["U0BFD9NDVE3"]
+    assert [p["channel"] for p in client.posts] == ["D-U0BFD9NDVE3", "D-U0BFD9NDVE3"]
+    assert [n["status"] for n in notices] == ["delivered", "delivered"]
+    assert notices[0]["channel"] == "D-U0BFD9NDVE3"
+
+
+def test_malformed_slack_address_fails_loudly(tmp_path, monkeypatch, notices, caplog):
+    """The bug of 2026-09-05..09: a slack- name the grammar rejects was
+    dropped with no trace. Now: no post, a failed notice, a journal warning."""
+    client = RecordingClient()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "slack-...", "x"), _msg("m2", "slack-nick", "y")], client)
+    assert client.posts == []
+    assert [n["status"] for n in notices] == ["failed", "failed"]
+    assert [n["trigger_step"] for n in notices] == ["m1", "m2"]
+    assert "unknown slack address form" in notices[0]["reason"]
+    assert "slack-C<id>" in notices[0]["reason"]
+    assert notices[0]["content"].startswith("not delivered to slack-...")
+    assert any("undeliverable address" in r.message for r in caplog.records)
+
+
+def test_other_transports_get_no_notice(tmp_path, monkeypatch, notices):
+    client = RecordingClient()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "telegram-1-1"), _msg("m2", "pwa-andy")], client)
+    assert client.posts == [] and notices == []
+
+
+def test_slack_api_failure_is_a_failed_notice(tmp_path, monkeypatch, notices):
+    client = RecordingClient(fail_post=True)
+    _drive(tmp_path, monkeypatch, [_msg("m1", "slack-U1-C1-1.2")], client)
+    assert notices[0]["status"] == "failed"
+    assert "channel_not_found" in notices[0]["reason"]
+    assert "ts" not in notices[0]
+
+
+def test_duplicate_within_window_is_a_skipped_notice(tmp_path, monkeypatch, notices):
+    client = RecordingClient()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "slack-C1", "same"), _msg("m2", "slack-C1", "same")], client)
+    assert len(client.posts) == 1
+    assert [n["status"] for n in notices] == ["delivered", "skipped"]
+    assert "duplicate" in notices[1]["reason"]
+
+
+def test_dm_open_failure_is_a_failed_notice(tmp_path, monkeypatch, notices):
+    class NoDm(RecordingClient):
+        def conversations_open(self, users):
+            raise RuntimeError("user_not_found")
+    client = NoDm()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "slack-U9")], client)
+    assert client.posts == []
+    assert notices[0]["status"] == "failed" and "user_not_found" in notices[0]["reason"]
+
+
+def test_file_upload_writes_a_delivered_notice(tmp_path, monkeypatch, notices):
+    body = b"hello file\n"
+    step = {"type": "message", "from": "audel", "to": "slack-C1", "source": "chat",
+            "filename": "note.txt", "content": "hello file",
+            "content_b64": base64.b64encode(body).decode("ascii"), "step_id": "f1"}
+
+    class Uploader(RecordingClient):
+        def files_upload_v2(self, **kw):
+            return {"ok": True}
+    _drive(tmp_path, monkeypatch, [step], Uploader())
+    assert notices[0]["status"] == "delivered" and notices[0]["filename"] == "note.txt"
+    assert notices[0]["channel"] == "C1"
+
+
+def test_client_without_ts_still_confirms(tmp_path, monkeypatch, notices):
+    """Older fakes and clients return None; delivery is still recorded, just
+    without ts or permalink."""
+    class Bare:
+        def chat_postMessage(self, channel, thread_ts, text, unfurl_links=False, **kw):
+            return None
+    _drive(tmp_path, monkeypatch, [_msg("m1", "slack-U1-C1")], Bare())
+    assert notices[0]["status"] == "delivered"
+    assert "ts" not in notices[0] and "permalink" not in notices[0]
+
+
+def test_append_step_via_traj_uses_bin_traj(tmp_path, monkeypatch):
+    """The production writer shells out to bin/traj with the trajectory's dir
+    and hex prefix, and feeds the step as JSON on stdin."""
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append((argv, kw))
+
+        class R:
+            returncode = 0
+        return R()
+    monkeypatch.setattr(outbound.subprocess, "run", fake_run)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "traj").write_text("#!/bin/sh\n")
+    traj_path = tmp_path / "trajectories" / "455a2181-root" / "trajectory.jsonl"
+    outbound._append_step_via_traj(tmp_path, traj_path, {"type": "delivery", "status": "delivered"})
+    argv, kw = calls[0]
+    assert argv[0] == str(tmp_path / "bin" / "traj")
+    assert argv[1:] == ["append", "--traj_dir", str(tmp_path / "trajectories"), "455a2181"]
+    assert '"type": "delivery"' in kw["input"]
+    assert kw["check"] is True

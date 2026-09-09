@@ -4,13 +4,23 @@ Follows the identity's root trajectory and forwards message steps the
 identity addressed to a slack-* conversation name. The bridge's own
 inbound steps have a slack-* `from` (not the identity), so they never
 match — no echo loop.
+
+Every send gets a `delivery` step written back to the trajectory, either
+delivered (with the Slack ts and permalink) or failed (with the reason), so
+the mind can tell "I spoke" from "I tried to". Before this, a malformed
+address was dropped with no trace and the mind re-sent the same papers four
+times believing none had gone out (design/outbound_delivery.md).
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
+import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -23,6 +33,8 @@ from .state import ActiveThreads
 log = logging.getLogger(__name__)
 
 DUPLICATE_WINDOW_SECONDS = 300
+SOURCE = "slack-bridge"
+TRANSPORT = "slack"
 
 
 class RecentPosts:
@@ -127,7 +139,7 @@ def _upload_file(
     filename: str,
     data: bytes | str,
     comment: str | None,
-) -> None:
+) -> Any:
     kwargs: dict[str, Any] = {
         "channel": conv.channel,
         "filename": filename,
@@ -138,7 +150,134 @@ def _upload_file(
         kwargs["thread_ts"] = conv.thread_ts
     if comment:
         kwargs["initial_comment"] = comment
-    client.files_upload_v2(**kwargs)
+    return client.files_upload_v2(**kwargs)
+
+
+def _resp_get(resp: Any, key: str) -> Any:
+    """Field from a slack_sdk response, a plain dict, or nothing (fake clients)."""
+    if resp is None:
+        return None
+    if isinstance(resp, dict):
+        return resp.get(key)
+    getter = getattr(resp, "get", None)
+    if callable(getter):
+        try:
+            return getter(key)
+        except Exception:
+            return None
+    data = getattr(resp, "data", None)
+    if isinstance(data, dict):
+        return data.get(key)
+    return None
+
+
+def _exc_reason(exc: BaseException) -> str:
+    resp = getattr(exc, "response", None)
+    err = _resp_get(resp, "error")
+    text = f"{type(exc).__name__}: {err or exc}"
+    return text[:200]
+
+
+# --- delivery notices -------------------------------------------------------
+
+def _append_step_via_traj(serve_root: Path, traj_path: Path, step: dict[str, Any]) -> None:
+    """Append a step to the root trajectory through bin/traj, the same lock
+    every other writer uses. The bridge never opens the file for writing.
+
+    traj resolves an ID that is a UUID or a hex prefix; the trajectory's
+    directory is named <hex8>-<slug>, so its first 8 characters are enough.
+    """
+    traj_bin = serve_root / "bin" / "traj"
+    if not traj_bin.is_file():
+        found = shutil.which("traj")
+        if not found:
+            raise FileNotFoundError("bin/traj not found; cannot write delivery notice")
+        traj_bin = Path(found)
+    traj_dir = traj_path.parent.parent
+    traj_id = traj_path.parent.name[:8]
+    subprocess.run(
+        [str(traj_bin), "append", "--traj_dir", str(traj_dir), traj_id],
+        input=json.dumps(step),
+        text=True,
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+# Tests replace this with a collector; production writes through bin/traj.
+append_step = _append_step_via_traj
+
+
+def _notice(
+    cfg: Config,
+    traj_path: Path,
+    step: dict[str, Any],
+    status: str,
+    **fields: Any,
+) -> None:
+    """Write one delivery step for an outbound message step.
+
+    status is delivered, failed, or skipped. trigger_step names the message
+    step the notice is about, so a later reader (chat sent, the wake prompt)
+    can resolve a send by matching it. Never raises: a notice that cannot be
+    written must not stop delivery of the next message.
+    """
+    to = str(step.get("to") or "")
+    if status == "delivered":
+        content = f"delivered to {to}"
+    elif status == "skipped":
+        content = f"not sent to {to}: {fields.get('reason', 'skipped')}"
+    else:
+        content = f"not delivered to {to}: {fields.get('reason', 'unknown error')}"
+    record: dict[str, Any] = {
+        "type": "delivery",
+        "source": SOURCE,
+        "transport": TRANSPORT,
+        "status": status,
+        "to": to,
+        "content": content,
+    }
+    if step.get("step_id"):
+        record["trigger_step"] = step["step_id"]
+    for key, value in fields.items():
+        if value is not None and value != "":
+            record[key] = value
+    try:
+        append_step(cfg.serve_root, traj_path, record)
+    except Exception:
+        log.exception("could not write delivery notice for step %s", step.get("step_id"))
+
+
+def _permalink(client: Any, channel: str, ts: str | None) -> str | None:
+    if not ts or not hasattr(client, "chat_getPermalink"):
+        return None
+    try:
+        resp = client.chat_getPermalink(channel=channel, message_ts=ts)
+    except Exception:
+        return None
+    link = _resp_get(resp, "permalink")
+    return str(link) if link else None
+
+
+class DmChannels:
+    """Resolve a bare user id to its DM channel with conversations.open, once."""
+
+    def __init__(self) -> None:
+        self._cache: dict[str, str] = {}
+
+    def resolve(self, client: Any, user: str) -> str:
+        if user in self._cache:
+            return self._cache[user]
+        if not hasattr(client, "conversations_open"):
+            raise RuntimeError("client cannot open DMs (conversations_open missing)")
+        resp = client.conversations_open(users=user)
+        channel = _resp_get(resp, "channel")
+        channel_id = _resp_get(channel, "id") if channel is not None else None
+        if not channel_id:
+            raise RuntimeError(f"conversations.open returned no channel for {user}")
+        self._cache[user] = str(channel_id)
+        return self._cache[user]
 
 
 def run(
@@ -150,6 +289,7 @@ def run(
     traj = mindlog.find_trajectory(cfg.identity_dir)
     cursor = cfg.state_dir / "cursor"
     recent = RecentPosts()
+    dms = DmChannels()
     log.info("following %s", traj)
     for step in mindlog.follow(traj, cursor, should_stop=stop_event.is_set):
         if step.get("type") != "message" or step.get("from") != cfg.identity:
@@ -167,7 +307,12 @@ def run(
             )
             continue
         to = step.get("to")
+        if not naming.looks_like_slack(to):
+            continue  # another transport's message; its bridge owns it
         if not naming.is_slack_name(to):
+            reason = f"unknown slack address form; accepted: {naming.ACCEPTED_FORMS}"
+            log.warning("undeliverable address %r on step %s", to, step.get("step_id"))
+            _notice(cfg, traj, step, "failed", reason=reason)
             continue
         conv = naming.decode(to)
         if "reaction" in step:
@@ -178,6 +323,8 @@ def run(
                 log.error("invalid reaction on step %s", step.get("step_id"))
             elif not ts:
                 log.error("reaction %s for %s has no message timestamp", name, to)
+            elif not conv.channel:
+                log.error("reaction %s for %s needs a channel", name, to)
             elif sig is not None and recent.seen(to, sig):
                 log.warning("skipping duplicate reaction %s on %s", name, to)
             elif not hasattr(client, "reactions_add"):
@@ -189,6 +336,15 @@ def run(
                 except Exception:
                     log.exception("reactions.add failed for %s (%s)", to, name)
             continue
+        # A bare user id means "DM this person": open (or look up) the DM
+        # channel first, so the rest of the path only ever sees a channel.
+        if not conv.channel:
+            try:
+                conv = conv._replace(channel=dms.resolve(client, conv.user))
+            except Exception as exc:
+                log.exception("could not open DM with %s for %s", conv.user, to)
+                _notice(cfg, traj, step, "failed", reason=_exc_reason(exc))
+                continue
         payload = file_payload(step)
         if payload is not None:
             # File steps travel in content_b64 and often have empty `content`.
@@ -197,44 +353,75 @@ def run(
             data = payload["content"]
             comment = payload.get("initial_comment")
             sent_file = False
+            reason = ""
+            resp = None
             sig = file_signature(name, data) if data is not None else None
             if payload.get("decode_error") or data is None:
+                reason = f"undecodable file payload ({name})"
                 log.error("undecodable file payload for %s (%s)", to, name)
             elif sig is not None and recent.seen(to, sig):
                 log.warning("skipping duplicate file post to %s", to)
+                _notice(cfg, traj, step, "skipped", reason="duplicate of a file posted within 5 minutes", filename=name)
                 continue
             elif not hasattr(client, "files_upload_v2"):
+                reason = "client cannot upload files"
                 log.error("client cannot upload files for %s", to)
             else:
                 try:
-                    _upload_file(client, conv, name, data, comment)
+                    resp = _upload_file(client, conv, name, data, comment)
                     sent_file = True
                     if sig is not None:
                         recent.record(to, sig)
-                except Exception:
+                except Exception as exc:
+                    reason = _exc_reason(exc)
                     log.exception("file upload failed for %s", to)
             threads.touch(conv.channel, conv.thread_ts)
-            if not sent_file:
+            if sent_file:
+                _notice(cfg, traj, step, "delivered", channel=conv.channel, filename=name)
+            else:
                 _post_notice(client, conv, f"(failed to deliver file {name})")
+                _notice(cfg, traj, step, "failed", reason=reason, filename=name)
             continue
         text = to_mrkdwn(strip_leaked_command(str(step.get("content") or ""))).strip()
         if not text:
             continue
         if recent.is_duplicate(to, text):
             log.warning("skipping duplicate post to %s", to)
+            _notice(cfg, traj, step, "skipped", reason="duplicate of a post within 5 minutes")
             continue
         threads.touch(conv.channel, conv.thread_ts)
+        first_ts: str | None = None
+        failure: str | None = None
         for part in chunk(text):
             try:
-                client.chat_postMessage(
+                resp = client.chat_postMessage(
                     channel=conv.channel,
                     thread_ts=conv.thread_ts,
                     text=part,
                     unfurl_links=False,
                 )
-            except Exception:
+            except Exception as exc:
+                failure = _exc_reason(exc)
                 log.exception("chat_postMessage failed for %s", to)
                 break
+            if first_ts is None:
+                ts = _resp_get(resp, "ts")
+                first_ts = str(ts) if ts else None
+        if failure is not None and first_ts is None:
+            _notice(cfg, traj, step, "failed", reason=failure)
+        elif failure is not None:
+            _notice(
+                cfg, traj, step, "failed",
+                reason=f"partly posted, then {failure}",
+                channel=conv.channel, ts=first_ts,
+                permalink=_permalink(client, conv.channel, first_ts),
+            )
+        else:
+            _notice(
+                cfg, traj, step, "delivered",
+                channel=conv.channel, ts=first_ts,
+                permalink=_permalink(client, conv.channel, first_ts),
+            )
 
 
 def start(
