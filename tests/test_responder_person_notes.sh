@@ -143,7 +143,7 @@ msg trig-4 stranger "$ME" "hello"
 printf 'hi\n' > "$STUB_REPLY_FILE"
 printf 'Stranger said hello.\n' > "$STUB_NOTES_FILE"
 run_step "$(grep -F '"step_id":"trig-4"' "$TRAJ")"
-jq -e 'select(.type=="message" and .reply_to=="trig-4")' "$TRAJ" >/dev/null && ok "first contact replies and writes notes without error" || bad "first contact replies"
+jq -s -e 'any(.[]; .type=="message" and .reply_to=="trig-4")' "$TRAJ" >/dev/null && ok "first contact replies and writes notes without error" || bad "first contact replies"
 
 echo
 echo "$pass passed, $fail failed"
