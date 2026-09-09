@@ -500,6 +500,11 @@ _RECENT_STREAM_COLLAPSE_JQ='
         | del(.n, .first_ts, .last_ts))
   | .[]'
 
+# An idle run writes an idle step and then a final that says the same thing
+# ("Idle — nothing to do"); the final is dropped so a string of idle wakes
+# collapses to one "idle xN" line instead of two steps per wake. Sixteen idle
+# runs on 2026-09-08 took 48 of the window's 20 slots in 35 minutes and the
+# mind lost sight of a send it had just made (design/outbound_delivery.md).
 # An observation followed by its run's final is the same report written
 # twice: the prompt asks for both, and the model writes the handoff into each
 # (7 of 20 stream slots on Audel, 2026-09-04). When a final arrives, the
@@ -510,10 +515,13 @@ _RECENT_STREAM_COLLAPSE_JQ='
 _RECENT_STREAM_PAIR_JQ='
   reduce .[] as $s ([];
     if $s.type == "final" and (($s.run_id // "") | tostring) != ""
-    then (to_entries
-          | map(select(.value.type == "observation" and ((.value.run_id // "") | tostring) == ($s.run_id | tostring)))
-          | last | .key) as $j
-         | (if $j == null then . else del(.[$j]) end) + [$s]
+    then ($s.run_id | tostring) as $r
+         | (to_entries
+            | map(select(.value.type == "observation" and ((.value.run_id // "") | tostring) == $r))
+            | last | .key) as $j
+         | if $j != null then del(.[$j]) + [$s]
+           elif (map(select(.type == "idle" and ((.run_id // "") | tostring) == $r)) | length) > 0 then .
+           else . + [$s] end
     else . + [$s] end)
   | .[]'
 

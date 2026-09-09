@@ -68,7 +68,7 @@ Commands:
                             -r/--recursive includes sub-trajectory steps.
                             --raw for JSONL output.
 
-  search <pattern> [ID] [--field F] [-i] [-C N] [-E] [-r]
+  search <pattern> [ID] [--field F] [-i] [-C N] [-E] [-r] [--tail N]
                             Search step fields. Default field: all.
                             -r, --recursive  Search sub-trajectories too.
 
@@ -1186,10 +1186,11 @@ TAILHELP
 # ---------------------------------------------------------------------------
 
 cmd_search() {
-    local pattern="" field="all" case_flag="" context_lines=0 use_regex=0 traj_dir_opt="" traj_id_opt="" recursive=0
+    local pattern="" field="all" case_flag="" context_lines=0 use_regex=0 traj_dir_opt="" traj_id_opt="" recursive=0 tail_n=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --field)     field="${2:?--field requires a value}"; shift 2 ;;
+            --tail)      tail_n="${2:?--tail requires a number}"; shift 2 ;;
             --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
             -i)          case_flag="-i"; shift ;;
             -C)          context_lines="${2:?-C requires a number}"; shift 2 ;;
@@ -1209,6 +1210,7 @@ cmd_search() {
         esac
     done
     [[ -n "$pattern" ]] || die "search requires <pattern>"
+    [[ "$tail_n" =~ ^[0-9]+$ ]] || die "search: --tail must be a number, got '$tail_n'"
 
     local traj_file
     traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "search")
@@ -1244,7 +1246,22 @@ cmd_search() {
         local blob_base
         blob_base="$(dirname "$_sf")"
 
-        # Iterate over each row in the trajectory.
+        # Only rows that can match are parsed: one grep over the file keeps the
+        # rows containing the pattern, plus rows whose searched text lives in
+        # a blob (a *_ref field), and --tail N looks at the last N rows only.
+        # Before this every row went through several jq calls (136K rows on
+        # Audel: killed by timeout, 2026-09-09).
+        local _cand _pre
+        _cand=$(mktemp) || die "search: mktemp failed"
+        _pre=("$grep_mode")
+        [[ -n "$case_flag" ]] && _pre+=("$case_flag")
+        if [[ "$tail_n" -gt 0 ]]; then
+            tail -n "$tail_n" -- "$_sf" | grep "${_pre[@]}" -e "$pattern" -e '_ref":' > "$_cand" || true
+        else
+            grep "${_pre[@]}" -e "$pattern" -e '_ref":' -- "$_sf" > "$_cand" || true
+        fi
+
+        # Iterate over each candidate row.
         while IFS= read -r row; do
             local step_id
             step_id=$(printf '%s' "$row" | jq -r '.step_id // empty')
@@ -1280,7 +1297,8 @@ cmd_search() {
                     fi
                 done <<< "$matches"
             done
-        done < "$_sf"
+        done < "$_cand"
+        rm -f "$_cand"
     done <<< "$_search_files"
 }
 

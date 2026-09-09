@@ -210,13 +210,27 @@ rather than `pending` (a bridge that has not reported yet), so a stale
 phone-chat send does not read as a bridge outage. If the phone client ever
 acknowledges, the web server can write the same step.
 
+## Small changes shipped alongside (2026-09-09)
+
+- The recent stream drops an idle run's final, so a string of idle wakes
+  collapses to one "idle xN" line instead of two steps per wake
+  (`_RECENT_STREAM_PAIR_JQ`). This does not replace the ledger; it keeps
+  idle wakes from eating the window.
+- The dispatcher's mid-run `feedback` injection is removed (dead since run
+  scope; the responder and the deferral cover its jobs). The pending file
+  handoff is unchanged.
+- A monolith run that dies with no durable step now records the last stderr
+  lines in its `error` step (`stderr_tail`), so bursts like 2026-09-07 have
+  a reason attached.
+- `traj search` prefilters rows with one grep and takes `--tail N`, so a
+  self-check on a long log finishes instead of being killed by timeout.
+- `mem add` rejects a flag it does not know instead of storing it as the
+  memory's first word.
+
 ## What this does not do
 
-- It does not fix the 20-step recent stream window. Collapsing idle runs
-  there is a separate small change and still worth making.
 - It does not give recurring goals a progress log. That is a separate design.
-- It does not touch the run scope render or the dispatcher's mid-run
-  injection.
+- It does not touch the run scope render.
 
 ## Rollout
 

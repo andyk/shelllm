@@ -402,15 +402,23 @@ esac
 # design/monolith_run_health.md.
 prompt_file_tmp=$(mktemp "$state_dir/monolith_prompt.XXXXXX")
 printf '%s' "$route_prompt" > "$prompt_file_tmp"
+# shellm's stderr still streams to the journal, and a copy lands in a temp
+# file so a run that dies with no durable step can say why in its error step
+# (19 "run failed (rc=1)" steps on 2026-09-07/08 carried no reason at all).
+# fd 3 carries shellm's stdout past the tee; PIPESTATUS keeps shellm's rc.
+run_err_tmp=$(mktemp "$state_dir/monolith_run_err.XXXXXX")
 run_rc=0
-run_response=$(SHELLM_NO_BANNER=1 \
+run_response=$( { SHELLM_NO_BANNER=1 \
     SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
     SHELLM_WAKE="$wake_reason" \
     SHELLM_RUN_ID_OUT="$run_id_file" \
     shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
     "${shellm_flags[@]}" \
-    --prompt-file "$prompt_file_tmp") || run_rc=$?
+    --prompt-file "$prompt_file_tmp" 2>&1 >&3 | tee "$run_err_tmp" >&2
+    exit "${PIPESTATUS[0]}"; } 3>&1 ) || run_rc=$?
 rm -f "$prompt_file_tmp"
+run_err_tail=$(grep -v '^[[:space:]]*$' "$run_err_tmp" 2>/dev/null | tail -n 3 | cut -c1-300 | tr '\n' ' ' | sed 's/ $//') || run_err_tail=""
+rm -f "$run_err_tmp"
 
 after_visible=""
 after_thought=""
@@ -443,8 +451,10 @@ if [[ "$did_work" -eq 0 ]]; then
             --arg source "$THINKER_NAME" \
             --arg trigger "$trigger_step_id" \
             --arg run_id "$idle_run_id" \
+            --arg detail "$run_err_tail" \
             --argjson rc "$run_rc" \
-            '{type:"error", content:("monolith run failed (rc=\($rc)) with no durable step"), source:$source, reason:"run-failed", rc:$rc}
+            '{type:"error", content:("monolith run failed (rc=\($rc)) with no durable step" + (if $detail == "" then "" else ": " + $detail end)), source:$source, reason:"run-failed", rc:$rc}
+             + (if $detail == "" then {} else {stderr_tail: $detail} end)
              + (if $trigger == "" then {} else {trigger_step: $trigger} end)
              + (if $run_id == "" then {} else {run_id: $run_id} end)' \
             | traj append >/dev/null || true

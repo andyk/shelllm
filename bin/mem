@@ -114,6 +114,12 @@ parse_filename() {
 # ---------------------------------------------------------------------------
 
 action_add() {
+    # A flag mem add does not know (Audel wrote `--content` twice on
+    # 2026-09-05) must not become the memory's first word.
+    if [[ "${1:-}" == --* ]]; then
+        die "add: unknown option '$1'. mem add takes only --type and --until, then the text:
+  mem add [--type TYPE] [--until YYYY-MM-DD] <text>      (or the text on stdin)"
+    fi
     local text="$*"
 
     # Read from stdin if no text arg

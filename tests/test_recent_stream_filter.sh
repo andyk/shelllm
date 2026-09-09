@@ -174,6 +174,21 @@ else
     bad "failed delivery shown, delivered hidden" "$dl"
 fi
 
+# An idle run's final repeats its idle step; the final is dropped and a string
+# of idle runs collapses to one line (design/outbound_delivery.md).
+: > "$TRAJ"
+printf '{"step_id":"hdr","type":"trajectory","ts":"%s"}\n' "$(ts 9999)" >> "$TRAJ"
+step w1 thought "some work" 60
+for k in 1 2 3; do
+    step "ii$k" idle  "idle"                       $((50 - k*10)) ",\"run_id\":\"run-idle-$k\""
+    step "if$k" final "Idle — nothing worth doing" $((50 - k*10)) ",\"run_id\":\"run-idle-$k\""
+done
+step w2 observation "real result" 5 ',"run_id":"run-w2"'
+step wf final "run w2 done" 5 ',"run_id":"run-w2"'
+ids=$(stream 20 | jq -r .step_id | tr '\n' ' ')
+[[ "$ids" == "w1 ii3 wf " ]] && ok "three idle runs collapse to one idle line; their finals are dropped; a working run keeps its final" || bad "idle-run finals dropped" "got $ids"
+stream 20 | jq -e 'select(.step_id == "ii3") | .collapsed == 3' >/dev/null && ok "the collapsed idle line counts the runs" || bad "idle count" "$(stream 20 | jq -c 'select(.step_id == "ii3")')"
+
 echo
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

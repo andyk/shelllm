@@ -21,6 +21,7 @@ TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"; : > "$TRAJ"
 printf 'test-token\n' > "$ID/run/dispatcher.token"
 cat > "$WORK/stub/shellm" <<'STUB'
 #!/usr/bin/env bash
+if [[ -n "${STUB_FAIL:-}" ]]; then printf 'Iteration 1 — calling test-model...\nllm: API error: 502 upstream unavailable\n' >&2; exit 1; fi
 prev=""
 for a in "$@"; do [[ "$prev" == "--prompt-file" ]] && cp "$a" "$STUB_CAPTURE"; prev="$a"; done
 printf '{"step_id":"obs-%s","type":"observation","content":"did a thing","source":"monolith","ts":"%s"}\n' "$RANDOM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$STUB_TRAJ"
@@ -82,6 +83,12 @@ rm -f "$STATE"; run_step "$WAKE" MONOLITH_RELATED_MEMORIES=0 MONOLITH_GOAL_REVIE
 p3=$(cat "$STUB_CAPTURE")
 grep -q '^Related memories' <<<"$p3" && bad "MONOLITH_RELATED_MEMORIES=0 removes the section" || ok "MONOLITH_RELATED_MEMORIES=0 removes the section"
 grep -q 'GOAL REVIEW (about once a week)' <<<"$p3" && bad "MONOLITH_GOAL_REVIEW_DAYS=0 disables the hint" || ok "MONOLITH_GOAL_REVIEW_DAYS=0 disables the hint"
+
+# A run that dies with no durable step records why (the last stderr lines).
+run_step "$WAKE" STUB_FAIL=1
+e=$(grep '"reason":"run-failed"' "$TRAJ" | tail -1)
+printf '%s' "$e" | jq -e '.rc == 1 and (.stderr_tail | test("502 upstream")) and (.content | test("502 upstream"))' >/dev/null 2>&1 \
+    && ok "a failed run's error step carries the last stderr lines" || bad "failed run reason" "$e"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
