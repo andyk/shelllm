@@ -1661,7 +1661,7 @@ conversation_checkpoint() {
     if jq -n --arg state "$state" --slurpfile ids "$ids_file" \
         --arg conversation "$SHELLM_RESPONSES_CONVERSATION_ID" \
         --arg trajectory "$_SHELLM_CONVERSATION_TRAJECTORY" \
-        --arg provider "$_SHELLM_HOST_PROVIDER" --arg endpoint "$SHELLM_API_URL" \
+        --arg provider "$_SHELLM_HOST_PROVIDER" --arg endpoint "$_SHELLM_CONVERSATION_ENDPOINT" \
         '{version:1,state:$state,conversation:$conversation,trajectory:$trajectory,
           provider:$provider,endpoint:$endpoint,sent:$ids[0]}' > "$tmp"; then
         mv -f "$tmp" "$SHELLM_CONVERSATION_CHECKPOINT"
@@ -1669,6 +1669,24 @@ conversation_checkpoint() {
         rm -f "$tmp"
         return 1
     fi
+}
+
+# A compaction item is opaque, but it is not structureless: the Responses
+# contract gives it a type plus non-empty encrypted_content. Compatible
+# endpoints may omit an item id or preserve more surrounding input items, so
+# validate only the fields required to carry the opaque window forward. If a
+# reply contains several markers, every marker must be usable; otherwise the
+# newest malformed marker could still poison the next request.
+has_usable_compaction_window() {
+    local response_file="$1"
+    jq -e '
+        (.output | type == "array")
+        and ([.output[] | select(.type? == "compaction")] as $markers
+             | ($markers | length) > 0
+             and all($markers[];
+                 (.encrypted_content | type) == "string"
+                 and (.encrypted_content | length) > 0))
+    ' "$response_file" >/dev/null 2>&1
 }
 
 release_conversation_lock() {
@@ -1692,6 +1710,11 @@ compact_replay_chain() {
     replay_dir=$(dirname "$replay_file")
 
     if jq -e 'any(.output[]?; .type == "compaction")' "$response_file" >/dev/null 2>&1; then
+        if ! has_usable_compaction_window "$response_file"; then
+            echo "shellm: warning: response carried an unusable compaction item; keeping the replay chain and disabling compaction for this run" >&2
+            ( umask 077; : > "$replay_dir/.compact-disabled" )
+            return 0
+        fi
         chain_tmp=$(mktemp "$replay_dir/.responses-replay.XXXXXX") || return 0
         chmod 600 "$chain_tmp"
         if jq '(map(.type? == "compaction") | rindex(true)) as $at
@@ -1728,14 +1751,9 @@ compact_replay_chain() {
     compact_err=$(mktemp) || { rm -f "$compact_out"; return 0; }
     if ! LLM_MAX_TIME="$compact_max_time" responses compact --provider "$_SHELLM_HOST_PROVIDER" \
             --model "$SHELLM_MODEL" --input-file "$replay_file" --instructions "$system_prompt" \
-            > "$compact_out" 2> "$compact_err"; then
-        echo "shellm: warning: compaction failed, keeping the replay chain; disabling standalone compaction for this run" >&2
-        ( umask 077; : > "$replay_dir/.compact-disabled" )
-        rm -f "$compact_out" "$compact_err"
-        return 0
-    fi
-    if ! jq -e '.output | type == "array" and length > 0' "$compact_out" >/dev/null 2>&1; then
-        echo "shellm: warning: compaction failed, the compact reply carried no window" >&2
+            > "$compact_out" 2> "$compact_err" \
+            || ! has_usable_compaction_window "$compact_out"; then
+        echo "shellm: warning: compaction failed or returned an unusable compaction item; keeping the replay chain and disabling standalone compaction for this run" >&2
         ( umask 077; : > "$replay_dir/.compact-disabled" )
         rm -f "$compact_out" "$compact_err"
         return 0
@@ -1948,7 +1966,14 @@ call_llm() {
                     turn_tmp=$(mktemp)
                     chmod 600 "$replay_tmp"
                     printf '%s' "$new_messages_json" > "$turn_tmp"
-                    jq -s '.[0] + .[1] + (.[2].output // [])' \
+                    # Do not carry a malformed compaction marker into the
+                    # otherwise known-good replay. compact_replay_chain below
+                    # will warn and refuse pruning; ordinary output items from
+                    # the same terminal response remain part of the turn.
+                    jq -s '.[0] + .[1] + ((.[2].output // [])
+                        | map(select(.type? != "compaction"
+                            or ((.encrypted_content | type) == "string"
+                                and (.encrypted_content | length) > 0))))' \
                         "$replay_file" "$turn_tmp" "$response_file" > "$replay_tmp"
                     mv -f "$replay_tmp" "$replay_file"
                     rm -f "$turn_tmp"
@@ -2597,6 +2622,14 @@ run_loop() {
             _SHELLM_COMPACT_MODE=server
         fi
     fi
+    # Conversation ownership is keyed by the effective remote route, not by
+    # the caller-selected trajectory root. Spell provider defaults explicitly
+    # so an unset URL and its equivalent configured URL contend on one lock.
+    local _SHELLM_CONVERSATION_ENDPOINT="${SHELLM_API_URL%/}"
+    case "$_SHELLM_HOST_PROVIDER:$_SHELLM_CONVERSATION_ENDPOINT" in
+        openai:) _SHELLM_CONVERSATION_ENDPOINT="https://api.openai.com/v1/responses" ;;
+        openrouter:) _SHELLM_CONVERSATION_ENDPOINT="https://openrouter.ai/api/v1/responses" ;;
+    esac
     if [[ "$SHELLM_API_FORMAT" == responses ]]; then
         case "$_SHELLM_HOST_PROVIDER" in
             openai|openai-compatible|openrouter|adapter) ;;
@@ -2982,14 +3015,33 @@ run_loop() {
         local _ack_dir="$_run_traj_dir/.responses-conversations" _lock_path
         ( umask 077; mkdir -p "$_ack_dir" )
         chmod 700 "$_ack_dir"
-        _lock_path="$_ack_dir/$_run_conversation.lock"
+        # Checkpoints remain trajectory-bound, but the ownership lock lives in
+        # the canonical state home. Hash the route because endpoints may carry
+        # unsafe path/query bytes (and credentials must never appear in names).
+        local _lock_root="$_shellm_home/run/responses-conversations"
+        local _lock_identity _lock_digest
+        ( umask 077; mkdir -p "$_lock_root" )
+        chmod 700 "$_lock_root"
+        _lock_identity=$(jq -nc --arg provider "$_SHELLM_HOST_PROVIDER" \
+            --arg endpoint "$_SHELLM_CONVERSATION_ENDPOINT" \
+            --arg conversation "$_run_conversation" \
+            '[$provider,$endpoint,$conversation]')
+        if command -v sha256sum >/dev/null 2>&1; then
+            _lock_digest=$(printf '%s' "$_lock_identity" | sha256sum)
+        elif command -v shasum >/dev/null 2>&1; then
+            _lock_digest=$(printf '%s' "$_lock_identity" | shasum -a 256)
+        else
+            die "Conversation locking requires sha256sum or shasum"
+        fi
+        _lock_digest=${_lock_digest%%[[:space:]]*}
+        _lock_path="$_lock_root/$_run_conversation-$_lock_digest.lock"
         ( umask 077; mkdir "$_lock_path" ) 2>/dev/null \
             || die "Conversation is locked by another run or a crash; reconcile before reuse"
         _SHELLM_CONVERSATION_LOCK="$_lock_path"
         SHELLM_CONVERSATION_CHECKPOINT="$_ack_dir/$_run_conversation.json"
         if [[ -e "$SHELLM_CONVERSATION_CHECKPOINT" ]]; then
             jq -e --arg conv "$_run_conversation" --arg traj "$_SHELLM_CONVERSATION_TRAJECTORY" \
-                --arg provider "$_SHELLM_HOST_PROVIDER" --arg endpoint "$SHELLM_API_URL" \
+                --arg provider "$_SHELLM_HOST_PROVIDER" --arg endpoint "$_SHELLM_CONVERSATION_ENDPOINT" \
                 '.version == 1 and .state == "ready" and .conversation == $conv
                  and .trajectory == $traj and .provider == $provider and .endpoint == $endpoint
                  and (.sent | type == "object") and ([.sent[] | . == true] | all)' \
@@ -3209,7 +3261,15 @@ run_loop() {
                 --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")
             [[ -n "$_prompt_step_id" ]] && _ctx_args+=(--pin "$_prompt_step_id")
         fi
-        messages_json=$(context "${_ctx_args[@]}" 2>/dev/null) || messages_json='[]'
+        if ! messages_json=$(context "${_ctx_args[@]}" 2>/dev/null); then
+            # A Conversation has no replay fallback: dispatching after a
+            # failed render would send none of the newly appended rows while
+            # leaving the ready acknowledgement unchanged. Keep that evidence
+            # and stop before call_llm can mark delivery in flight.
+            [[ -z "$_run_conversation" ]] \
+                || die "could not render Conversation context; no model call was dispatched"
+            messages_json='[]'
+        fi
 
         # Call Claude (capture thinking/reasoning to file)
         local thinking_file="$rundir/.last_thinking"

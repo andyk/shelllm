@@ -51,8 +51,17 @@ if [[ "$url" == */cancel ]]; then
 fi
 
 completed='{"id":"resp_bg","object":"response","status":"completed","output":[{"id":"msg_bg","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":11,"output_tokens":2}}'
-[[ "${CURL_DELAY:-0}" == 0 ]] || sleep "$CURL_DELAY"
+if [[ "${CURL_DELAY:-0}" != 0 ]]; then
+    printf '{"call":%d,"mode":"%s","phase":"delay-entered","epoch_seconds":%s}\n' \
+        "$n" "$mode" "$(date +%s)" >> "$CURL_DIR/delay-phases.jsonl"
+    sleep "$CURL_DELAY"
+    printf '{"call":%d,"mode":"%s","phase":"delay-released","epoch_seconds":%s}\n' \
+        "$n" "$mode" "$(date +%s)" >> "$CURL_DIR/delay-phases.jsonl"
+fi
 case "$mode" in
+    stream-fixture)
+        cat "$CURL_STREAM_FIXTURE"
+        ;;
     poll-error)
         printf '%s' '{"error":{"message":"backend failed"}}' > "$out_file"
         printf '200'
@@ -96,6 +105,9 @@ case "$mode" in
         printf 'data: %s\n\n' '{"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_bg","status":"in_progress","output":[]}}'
         printf 'data: %s\n\n' '{"type":"response.output_text.delta","sequence_number":2,"delta":"a"}'
         printf 'data: %s\n\n' '{"type":"response.output_text.delta","sequence_number":3,"delta":"b"}'
+        ;;
+    stream-created-only)
+        printf 'data: %s\n\n' '{"type":"response.created","sequence_number":0,"response":{"id":"resp_bg","status":"queued","output":[]}}'
         ;;
     stream-resume-complete)
         printf 'data: %s\n\n' '{"type":"response.output_text.delta","sequence_number":4,"delta":"!"}'
@@ -159,6 +171,132 @@ run_bg() {
     LLM_USAGE_FILE="$WORK/usage.json" \
     "$LLM" --provider openai -m gpt-5.4-mini "$@"
 }
+
+export CURL_STREAM_FIXTURE="$WORK/stream-fixture"
+stream_events() {
+    printf 'data: %s\n\n' "$@" > "$CURL_STREAM_FIXTURE"
+}
+
+# Initial stream errors still leave the accepted background job running.
+# A permanent generic error is not evidence that the job reached a terminal.
+for error in transient permanent after-text; do
+    for cancel_fail in 0 1; do
+        reset stream-fixture
+        stream_events '{"type":"response.created","sequence_number":0,"response":{"id":"resp_bg","status":"in_progress","output":[]}}'
+        if [[ "$error" == after-text ]]; then
+            printf 'data: %s\n\n' '{"type":"response.output_text.delta","sequence_number":1,"delta":"partial"}' >> "$CURL_STREAM_FIXTURE"
+        fi
+        if [[ "$error" == permanent ]]; then
+            printf 'data: %s\n\n' '{"type":"error","error":{"param":"previous_response_id","message":"previous response rejected"}}' >> "$CURL_STREAM_FIXTURE"
+        else
+            printf 'data: %s\n\n' '{"type":"error","error":{"message":"synthetic stream failure"}}' >> "$CURL_STREAM_FIXTURE"
+        fi
+        CANCEL_FAIL="$cancel_fail" LLM_RETRIES=2 LLM_RESPONSES_BACKGROUND=1 run_bg "bg" >"$WORK/stdout" 2>"$WORK/stderr"
+        rc=$?
+        expected_status=cancelled
+        [[ "$cancel_fail" == 0 ]] || expected_status=unknown
+        if [[ "$rc" -ne 0 && "$(calls)" -eq 2 && "$(cancels)" -eq 1 ]] \
+           && [[ "$(cancel_url)" == "https://api.openai.com/v1/responses/resp_bg/cancel" ]] \
+           && jq -e --arg status "$expected_status" '.id == "resp_bg"
+                and (if $status == "unknown" then .error.code == "outcome_unknown"
+                     and .cancellation.requested == true else .status == $status end)' "$WORK/response.json" >/dev/null; then
+            ok "initial $error stream failure cancels once and records $expected_status"
+        else
+            bad "initial $error stream failure cancels once and records $expected_status" "rc=$rc calls=$(calls) cancels=$(cancels) stderr=$(cat "$WORK/stderr")"
+        fi
+    done
+done
+
+for terminal in cancelled failed; do
+    reset stream-fixture
+    stream_events '{"type":"response.created","sequence_number":0,"response":{"id":"resp_bg","status":"in_progress","output":[]}}' \
+        "{\"type\":\"response.$terminal\",\"sequence_number\":1,\"response\":{\"id\":\"resp_bg\",\"status\":\"$terminal\",\"output\":[]}}"
+    LLM_RETRIES=2 LLM_RESPONSES_BACKGROUND=1 run_bg "bg" >"$WORK/stdout" 2>"$WORK/stderr"
+    rc=$?
+    if [[ "$rc" -ne 0 && "$(calls)" -eq 1 && "$(cancels)" -eq 0 ]] \
+       && jq -e --arg status "$terminal" '.id == "resp_bg" and .status == $status' "$WORK/response.json" >/dev/null; then
+        ok "validated $terminal terminal is not cancelled again"
+    else
+        bad "validated $terminal terminal is not cancelled again" "rc=$rc calls=$(calls) cancels=$(cancels)"
+    fi
+done
+
+# Every advertised identity is checked before its text can escape. Invalid
+# terminal envelopes must not suppress cancellation of the known response.
+for invalid in \
+    '{"type":"response.output_text.delta","sequence_number":1,"response_id":"resp_other","delta":"FOREIGN"}' \
+    '{"type":"response.output_text.delta","sequence_number":1,"response_id":null,"delta":"FOREIGN"}' \
+    '{"type":"response.output_text.delta","sequence_number":1,"response_id":"resp_other","response":{"id":"resp_bg"},"delta":"FOREIGN"}' \
+    '{"type":"response.cancelled","sequence_number":1,"response":{"id":"resp_bg","status":"in_progress","output":[]}}' \
+    '{"type":"response.failed","sequence_number":1}' \
+    '{"type":"response.cancelled","sequence_number":1}' \
+    '{"type":"response.cancelled","sequence_number":1,"response":{"id":"resp_bg","status":"cancelled"}}' \
+    'not-json' '[]' '{"type":"response.output_text.delta","delta":"FOREIGN"} {}'; do
+    reset stream-fixture
+    stream_events '{"type":"response.created","sequence_number":0,"response":{"id":"resp_bg","status":"in_progress","output":[]}}' \
+        "$invalid" '{"type":"response.completed","sequence_number":2,"response":{"id":"resp_bg","status":"completed","output":[]}}'
+    CANCEL_FAIL=1 LLM_RETRIES=2 LLM_RESPONSES_BACKGROUND=1 run_bg "bg" >"$WORK/stdout" 2>"$WORK/stderr"
+    rc=$?
+    if [[ "$rc" -ne 0 && ! -s "$WORK/stdout" && "$(calls)" -eq 2 && "$(cancels)" -eq 1 ]] \
+       && jq -e '.id == "resp_bg" and .error.code == "outcome_unknown" and .cancellation.requested == true' "$WORK/response.json" >/dev/null; then
+        ok "invalid stream event fails before output and cancels the known response: $invalid"
+    else
+        bad "invalid stream event fails before output and cancels the known response: $invalid" "rc=$rc calls=$(calls) cancels=$(cancels) out=$(cat "$WORK/stdout")"
+    fi
+done
+
+# The resume cursor follows the highest accepted sequence in the current
+# stream, not only the floor supplied at the start of a resumed stream.
+reset $'stream-fixture\nstream-resume-complete'
+stream_events '{"type":"response.created","sequence_number":0,"response":{"id":"resp_bg","status":"in_progress","output":[]}}' \
+    '{"type":"response.output_text.delta","sequence_number":2,"response_id":"resp_bg","delta":"a"}' \
+    '{"type":"response.output_text.delta","sequence_number":2,"response_id":"resp_bg","delta":"DUPLICATE"}' \
+    '{"type":"response.output_text.delta","sequence_number":1,"response_id":"resp_bg","delta":"BACKWARD"}' \
+    '{"type":"response.output_text.delta","sequence_number":3,"response_id":"resp_bg","delta":"b"}' \
+    '{"type":"response.output_text.delta","sequence_number":2,"response_id":"resp_bg","delta":"BACKWARD"}'
+LLM_RETRIES=1 LLM_RESPONSES_BACKGROUND=1 run_bg "bg" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 && "$(cat "$WORK/stdout")" == 'ab!' && "$(calls)" -eq 2 && "$(cancels)" -eq 0 ]] \
+   && [[ "$(url_of 2)" == "https://api.openai.com/v1/responses/resp_bg?stream=true&starting_after=3" ]]; then
+    ok "duplicate and out-of-order sequences cannot repeat text or move the resume cursor backwards"
+else
+    bad "duplicate and out-of-order sequences cannot repeat text or move the resume cursor backwards" "rc=$rc calls=$(calls) out=$(cat "$WORK/stdout") resume=$(url_of 2)"
+fi
+reset $'stream-created-only\nstream-fixture\nstream-resume-complete'
+LLM_RETRIES=2 LLM_RESPONSES_BACKGROUND=1 run_bg "bg" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 && "$(cat "$WORK/stdout")" == 'ab!' && "$(calls)" -eq 3 && "$(cancels)" -eq 0 ]] \
+   && [[ "$(url_of 2)" == "https://api.openai.com/v1/responses/resp_bg?stream=true&starting_after=0" ]] \
+   && [[ "$(url_of 3)" == "https://api.openai.com/v1/responses/resp_bg?stream=true&starting_after=3" ]]; then
+    ok "a resumed stream advances its own high-water sequence before a second resume"
+else
+    bad "a resumed stream advances its own high-water sequence before a second resume" "rc=$rc calls=$(calls) out=$(cat "$WORK/stdout") resume=$(url_of 3)"
+fi
+
+reset stream-fixture
+printf 'data: %s\n\n' '{"type":"response.completed","sequence_number":4,"response":{"id":"resp_bg","status":"completed","output":[]}}' >> "$CURL_STREAM_FIXTURE"
+LLM_RESPONSES_BACKGROUND=0 run_bg "foreground" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 && "$(cat "$WORK/stdout")" == 'ab' && "$(calls)" -eq 1 && "$(cancels)" -eq 0 ]]; then
+    ok "foreground streams also discard duplicate and out-of-order deltas"
+else
+    bad "foreground streams also discard duplicate and out-of-order deltas" "rc=$rc calls=$(calls) out=$(cat "$WORK/stdout")"
+fi
+
+for sequence in '"08"' '0.5' '9007199254740992' '-1' 'null' 'true'; do
+    reset stream-fixture
+    stream_events '{"type":"response.created","sequence_number":0,"response":{"id":"resp_bg","status":"in_progress","output":[]}}' \
+        "{\"type\":\"response.output_text.delta\",\"sequence_number\":$sequence,\"delta\":\"INVALID\"}" \
+        '{"type":"response.completed","sequence_number":4,"response":{"id":"resp_bg","status":"completed","output":[]}}'
+    LLM_RESPONSES_BACKGROUND=0 run_bg "foreground" >"$WORK/stdout" 2>"$WORK/stderr"
+    rc=$?
+    if [[ "$rc" -ne 0 && ! -s "$WORK/stdout" && "$(calls)" -eq 1 && "$(cancels)" -eq 0 ]] \
+       && jq -e '.id == "resp_bg" and .error.code == "outcome_unknown"' "$WORK/response.json" >/dev/null; then
+        ok "foreground stream refuses a sequence that is not a nonnegative safe integer number: $sequence"
+    else
+        bad "foreground stream refuses a sequence that is not a nonnegative safe integer number: $sequence" "rc=$rc calls=$(calls) out=$(cat "$WORK/stdout")"
+    fi
+done
 
 # --- polling ------------------------------------------------------------------
 # A buffered background create returns queued; llm polls the response by id
@@ -380,12 +518,25 @@ for mode in create-queued stream-created-drop; do
     reset "$mode"
     args=(--no-stream)
     [[ "$mode" != stream-* ]] || args=()
-    CURL_DELAY=2 LLM_MAX_TIME=1 LLM_RETRIES=3 LLM_RESPONSES_BACKGROUND=1 \
+    # Allow local setup to finish before the fake transfer consumes the
+    # original budget. The phase receipt keeps a pre-CREATE refusal visible.
+    CURL_DELAY=4 LLM_MAX_TIME=3 LLM_RETRIES=3 LLM_RESPONSES_BACKGROUND=1 \
         run_bg "${args[@]+"${args[@]}"}" bg >"$WORK/stdout" 2>"$WORK/stderr"
     rc=$?
-    if [[ "$rc" -ne 0 && "$(calls)" -eq 2 && "$(cancels)" -eq 1 ]] && grep -q 'LLM_MAX_TIME' "$WORK/stderr"; then
+    printf 'slow %s phase receipt: %s\n' "$mode" "$(cat "$CURL_DIR/delay-phases.jsonl" 2>/dev/null)"
+    if [[ "$rc" -ne 0 && "$(calls)" -eq 2 && "$(cancels)" -eq 1 ]] \
+       && grep -q 'LLM_MAX_TIME' "$WORK/stderr" \
+       && jq -e -s --arg mode "$mode" 'length == 2
+            and all(.[]; .call == 1 and .mode == $mode)
+            and .[0].phase == "delay-entered" and .[1].phase == "delay-released"
+            and (.[1].epoch_seconds - .[0].epoch_seconds >= 4)' "$CURL_DIR/delay-phases.jsonl" >/dev/null 2>&1 \
+       && jq -es 'length == 1 and (.[0] | type == "object" and .id == "resp_bg"
+            and .status == "cancelled" and (.output | type == "array"))' "$WORK/response.json" >/dev/null 2>&1; then
         ok "slow $mode spends the original deadline, not a new poll/resume budget"
-    else bad "slow $mode spends the original deadline, not a new poll/resume budget" "rc=$rc calls=$(calls)"; fi
+    else
+        bad "slow $mode spends the original deadline, not a new poll/resume budget" \
+            "rc=$rc calls=$(calls) cancels=$(cancels) stderr=$(cat "$WORK/stderr")"
+    fi
 done
 
 reset stream-created-drop

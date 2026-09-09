@@ -123,6 +123,9 @@ PY
     stream-truncated)
         printf '%s\n\n' 'event: response.output_text.delta' 'data: {"type":"response.output_text.delta","sequence_number":43,"delta":"hi"}'
         ;;
+    stream-fixture)
+        printf '%s\n' "$CURL_FIXTURE"
+        ;;
     *)
         echo "curl stub: unknown CURL_MODE=$CURL_MODE" >&2
         exit 2
@@ -328,6 +331,58 @@ else
     bad "a stream that ends without a terminal event fails" "rc=$rc err=$(cat "$WORK/stderr")"
 fi
 
+# Retrieval succeeds for any valid terminal state of the requested response,
+# but an unrelated terminal tag or malformed payload cannot complete the read.
+stream_case() {
+    local label="$1" expected="$2" fixture="$3" rc
+    reset
+    CURL_MODE=stream-fixture CURL_FIXTURE="$fixture" run get resp_1 --stream
+    rc=$?
+    if [[ "$expected" == success && "$rc" -eq 0 ]] \
+       && jq -se 'length > 0 and all(.[]; type == "object")' "$WORK/stdout" >/dev/null 2>&1; then
+        ok "$label"
+    elif [[ "$expected" == failure && "$rc" -ne 0 ]] \
+         && grep -q '^responses: error: ' "$WORK/stderr" \
+         && jq -se 'all(.[]; type == "object"
+             and (.type | type == "string" and length > 0)
+             and (if has("response") then .response.id == "resp_1" else true end)
+             and (if has("response_id") then .response_id == "resp_1" else true end))' \
+             "$WORK/stdout" >/dev/null 2>&1; then
+        ok "$label"
+    else
+        bad "$label" "rc=$rc expected=$expected"
+    fi
+}
+for status in completed incomplete failed cancelled; do
+    stream_case "stream retrieval accepts a same-response $status terminal" success \
+        "data: {\"type\":\"response.$status\",\"response\":{\"id\":\"resp_1\",\"status\":\"$status\",\"output\":[]}}"
+done
+terminal='data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}'
+stream_case "a foreign response terminal cannot complete retrieval" failure \
+    'data: {"type":"response.completed","response":{"id":"resp_other","status":"completed","output":[]}}'
+stream_case "terminal type and response status must agree" failure \
+    'data: {"type":"response.completed","response":{"id":"resp_1","status":"in_progress","output":[]}}'
+stream_case "a terminal requires its response object" failure \
+    'data: {"type":"response.completed"}'
+stream_case "a terminal requires the requested response ID" failure \
+    'data: {"type":"response.completed","response":{"status":"completed","output":[]}}'
+stream_case "a response field cannot be a scalar" failure \
+    'data: {"type":"response.completed","response":"resp_1"}'
+stream_case "a foreign created event cannot precede a matching terminal" failure \
+    $'data: {"type":"response.created","response":{"id":"resp_other","status":"in_progress"}}\n'"$terminal"
+stream_case "a foreign top-level response ID cannot enter the stream" failure \
+    $'data: {"type":"response.output_text.delta","response_id":"resp_other","delta":"foreign"}\n'"$terminal"
+stream_case "malformed data before a valid terminal fails" failure \
+    $'data: not-json\n'"$terminal"
+stream_case "malformed data after a valid terminal fails" failure \
+    "$terminal"$'\ndata: not-json'
+stream_case "two JSON values are not one SSE data payload" failure \
+    $'data: {"type":"response.created"} {"type":"response.created"}\n'"$terminal"
+stream_case "an array is not a typed SSE event" failure \
+    $'data: []\n'"$terminal"
+stream_case "an event requires a nonempty type" failure \
+    $'data: {"delta":"untyped"}\n'"$terminal"
+
 # --- base URL derivation ----------------------------------------------------
 reset
 export CURL_MODE=response
@@ -487,6 +542,27 @@ usage_case "an items file that is not a JSON array" conversations add conv_1 \
 usage_case "an items file that does not exist" conversations add conv_1 \
     --items-file "$WORK/missing.json"
 
+# Body validators require one JSON value before any provider request. An
+# explicit empty metadata argument is invalid even when create could omit it.
+for document in '' $' \t\n' '[] []'; do
+    printf '%s' "$document" > "$WORK/invalid-array.json"
+    usage_case "compact array file has zero or multiple JSON values: $document" \
+        compact --model m --input-file "$WORK/invalid-array.json"
+    usage_case "Conversation create array file has zero or multiple JSON values: $document" \
+        conversations create --items-file "$WORK/invalid-array.json"
+    usage_case "Conversation add array file has zero or multiple JSON values: $document" \
+        conversations add conv_1 --items-file "$WORK/invalid-array.json"
+done
+for document in '' $' \t\n' '{} {}'; do
+    printf '%s' "$document" > "$WORK/invalid-object.json"
+    usage_case "compact body file has zero or multiple JSON values: $document" \
+        compact --model m --previous-response-id resp_1 --body-file "$WORK/invalid-object.json"
+    usage_case "Conversation create metadata has zero or multiple JSON values: $document" \
+        conversations create --metadata "$document"
+    usage_case "Conversation update metadata has zero or multiple JSON values: $document" \
+        conversations update conv_1 --metadata "$document"
+done
+
 # Path ids must never change the target of a destructive operation.
 for id in '' '.' '..' '../resp_other' 'resp_1?other=1' 'resp_1#fragment' 'resp_%2fother' 'resp_[1-2]' 'resp_1/'; do
     usage_case "unsafe response id: $id" delete "$id"
@@ -635,7 +711,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', '67108865')
             self.end_headers()
             return
-        data = (b'data: {"type":"response.completed"}\n\n' if 'stream=true' in self.path
+        data = (b'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}\n\n' if 'stream=true' in self.path
                 else b'{"id":"resp_1"}')
         self.send_response(200)
         self.send_header('Content-Length', str(len(data)))

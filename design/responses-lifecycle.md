@@ -165,8 +165,11 @@ Sent trajectory step IDs are checkpointed in
 `$SHELLM_TRAJ_DIR/.responses-conversations/<conv_id>.json` (under the effective
 trajectory directory). These versioned files are atomically replaced at mode
 0600 in a mode-0700 directory, bound to the trajectory path, Conversation,
-underlying provider, and endpoint. A local exclusive `mkdir` lock is held for
-the whole run. Before dispatch the checkpoint becomes `in_flight`; only a
+underlying provider, and effective endpoint. A local exclusive `mkdir` lock,
+keyed by provider, effective endpoint, and Conversation ID under the canonical
+state home's `run/responses-conversations/`, is held for the whole run. It is
+independent of `SHELLM_TRAJ_DIR`, so two trajectory roots cannot become two
+local owners of the same remote Conversation. Before dispatch the checkpoint becomes `in_flight`; only a
 validated successful terminal response advances the sent-step acknowledgement
 and returns it to `ready`. Resume restores that acknowledgement, preserving
 genuinely unsent execution output rather than resending historical rows.
@@ -191,8 +194,10 @@ resume, and dies cleanly on a rejected conversation.
 
 Status: implemented (`tests/test_llm_responses.sh`,
 `tests/test_shellm_responses_continuation.sh`). The compact reply's window is
-its `output` array, passed on as is. A failed or invalid standalone compact
-reply warns, keeps the chain, and disables standalone upkeep for that run.
+its `output` array, passed on as is after its compaction items carry non-empty
+opaque `encrypted_content`. A failed or invalid standalone compact reply warns,
+keeps the chain, and disables standalone upkeep for that run. An unusable
+server-produced marker likewise cannot prune the known-good replay chain.
 
 - `bin/llm`: `LLM_RESPONSES_COMPACT_THRESHOLD=N` adds
   `context_management: [{type: "compaction", compact_threshold: N}]` to the
@@ -245,9 +250,12 @@ object in the sidecar, usage in `LLM_USAGE_FILE`, exit non-zero on failure.
 
 Two roles in one file. `serve` holds one connection to
 the resolved endpoint (rotating idle connections older than 55 minutes), listens
-on a unix socket, multiplexes callers onto `stream_id` lanes (16 in flight, 32
-named per connection), and exits when idle for `RESPONSES_WS_IDLE` minutes or
-told `stop`. The default role is the per-call adapter: when
+on a unix socket, and multiplexes callers onto `stream_id` lanes. A generation
+admits at most 16 live lanes and assigns each of at most 32 stream names once;
+when the name budget is exhausted, it drains the remaining live lanes and
+rotates the connection before reusing a name. Admission waits are bounded and
+cancellable when the broker shuts down. The broker exits when idle for
+`RESPONSES_WS_IDLE` minutes or told `stop`. The default role is the per-call adapter: when
 `RESPONSES_WS_SOCKET` is set it forwards through that broker; missing or failed
 brokers fail the call with no blind one-shot fallback. Only an unset socket
 selects one-shot mode. shellm's `SHELLM_API_TRANSPORT=websocket` starts

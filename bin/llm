@@ -1185,10 +1185,10 @@ check_response_responses() {
 # text field can be legitimate (tools, refusals), but an empty/error envelope
 # cannot. Keep this contract identical for SSE and buffered responses.
 valid_response_terminal() {
-    jq -e 'type == "object" and .error == null
+    jq -es 'length == 1 and (.[0] | type == "object" and .error == null
         and (.id | type == "string" and length > 0)
         and (.output | type == "array")
-        and (.status == "completed" or .status == "incomplete")' >/dev/null 2>&1
+        and (.status == "completed" or .status == "incomplete"))' >/dev/null 2>&1
 }
 
 responses_outcome_unknown() {
@@ -1496,7 +1496,7 @@ stream_responses() {
     # Background mode keeps the response id and the last sequence number in
     # LLM_BG_STATE: the retry loop resumes a dropped stream from there, and
     # the cancel path uses the id when llm is killed.
-    local _bg_id="${LLM_BG_RESUME_ID:-}" _bg_seq="${LLM_BG_RESUME_SEQ:-}" _seq="" _rid=""
+    local _bg_id="${LLM_BG_RESUME_ID:-}" _bg_seq="${LLM_BG_RESUME_SEQ:-}" _seq="" _rid="" _fields=""
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
         local line="${raw_line%$'\r'}"
         if [[ "$line" == data:\ * ]]; then
@@ -1504,8 +1504,26 @@ stream_responses() {
             local json="${line#data: }"
             [[ "$json" == "[DONE]" ]] && continue
             _event=""; _seq=""; _rid=""
-            IFS=$'\t' read -r _event _seq _rid < <(printf '%s' "$json" \
-                | jq -r '[(.type // "-"), ((.sequence_number // "-") | tostring), (.response.id // "-")] | @tsv' 2>/dev/null) || true
+            _fields=$(printf '%s' "$json" | jq -ers '
+                if length == 1 then .[0] else error("one event required") end
+                | if type == "object" and (.type | type == "string" and length > 0)
+                    and (if has("response") then
+                        (.response | type == "object")
+                        and (.response.id | type == "string" and test("^[A-Za-z0-9_-]+$"))
+                        else true end)
+                    and (if has("response_id") then
+                        (.response_id | type == "string" and test("^[A-Za-z0-9_-]+$"))
+                        and (if has("response") then .response_id == .response.id else true end)
+                        else true end)
+                    and (if has("sequence_number") then
+                        (.sequence_number | type == "number"
+                            and . >= 0 and . <= 9007199254740991 and floor == .)
+                        else true end)
+                    then [.type, ((.sequence_number // "-") | tostring),
+                          (.response.id // .response_id // "-")] | @tsv
+                    else error("invalid event identity") end' 2>/dev/null) \
+                || responses_outcome_unknown "invalid stream event or response identity" "$_bg_id"
+            IFS=$'\t' read -r _event _seq _rid <<<"$_fields"
             [[ "$_rid" == - ]] && _rid=""
             [[ "$_seq" == - ]] && _seq=""
             if [[ -n "$_rid" ]]; then
@@ -1515,14 +1533,12 @@ stream_responses() {
                     || responses_outcome_unknown "stream changed response identity" "$_bg_id"
                 _bg_id="$_rid"
             fi
-            if [[ -n "${LLM_BG_STATE:-}" ]]; then
-                [[ -z "$_seq" || "$_seq" =~ ^[0-9]+$ ]] \
-                    || responses_outcome_unknown "invalid stream sequence number" "$_bg_id"
-                if [[ -n "$_seq" && -n "${LLM_BG_RESUME_SEQ:-}" && "$_seq" -le "$LLM_BG_RESUME_SEQ" ]]; then
-                    continue
-                fi
-                [[ -n "$_seq" ]] && _bg_seq="$_seq"
+            # Every stream has one high-water mark. Background mode also
+            # persists it, but foreground output must not replay stale deltas.
+            if [[ -n "$_seq" && -n "$_bg_seq" && "$_seq" -le "$_bg_seq" ]]; then
+                continue
             fi
+            [[ -n "$_seq" ]] && _bg_seq="$_seq"
             case "$_event" in
                 response.output_text.delta|response.refusal.delta)
                     # Preserve newline-only deltas; see stream_openai.
@@ -1556,6 +1572,7 @@ stream_responses() {
                         && printf '%s' "$_response" | jq -e --arg status "${_event#response.}" \
                             '.status == $status' >/dev/null 2>&1; then
                         _terminal=1
+                        : > "$_llm_work/responses-terminal"
                         # A failed sidecar write is the call's failure, not a
                         # message on stderr: errexit is off inside the handler
                         # and the pipeline's die only leaves its own subshell.
@@ -1595,19 +1612,23 @@ stream_responses() {
                     mark_emitted
                     return 0
                     ;;
-                response.cancelled)
-                    # Someone else cancelled the background job (or a previous
-                    # llm did on its way out); nothing to retry or resume.
+                response.cancelled|response.failed)
+                    # Both terminals settle the same response. Keep their
+                    # diagnostics distinct after shared validation/publication.
+                    local _status="${_event#response.}" _failed_msg
                     _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
-                    [[ -n "$_response" ]] && printf '%s' "$_response" | write_response_file
-                    echo "llm: warning: response cancelled" >&2
-                    die_permanent "API stream error: response cancelled"
-                    ;;
-                response.failed)
-                    _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
-                    [[ -n "$_response" ]] && printf '%s' "$_response" | write_response_file
-                    local _failed_msg=""
-                    _failed_msg=$(printf '%s' "$json" | jq -r '.response.error.message // .error.message // "response failed"' 2>/dev/null) || _failed_msg="response failed"
+                    printf '%s' "$_response" | jq -es --arg status "$_status" 'length == 1
+                        and (.[0] | type == "object" and .status == $status
+                            and (.output | type == "array"))' >/dev/null 2>&1 \
+                        || responses_outcome_unknown "invalid $_status terminal response" "$_bg_id"
+                    : > "$_llm_work/responses-terminal"
+                    printf '%s' "$_response" | write_response_file || exit 1
+                    if [[ "$_status" == cancelled ]]; then
+                        echo "llm: warning: response cancelled" >&2
+                        _failed_msg="response cancelled"
+                    else
+                        _failed_msg=$(printf '%s' "$json" | jq -r '.response.error.message // .error.message // "response failed"' 2>/dev/null) || _failed_msg="response failed"
+                    fi
                     die_permanent "API stream error: $_failed_msg"
                     ;;
                 error)
@@ -1885,6 +1906,8 @@ _responses_base_url() {
 # killed or timed-out call does not leave a billable job running with no one
 # to read it. The id comes from the polling loop or the stream state file.
 _llm_bg_cancel() {
+    # A validated terminal already ended the job, even if its sidecar failed.
+    [[ ! -e "$_llm_work/responses-terminal" ]] || return 0
     local why="$1" id="${_bg_id:-}" code status
     if [[ -z "$id" && -n "${LLM_BG_STATE:-}" && -s "$LLM_BG_STATE" ]]; then
         IFS=$'\t' read -r id _ < "$LLM_BG_STATE" || true
@@ -2134,13 +2157,13 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
             _retry_msg="empty response: stream ended without emitting anything"
             _rc=1
         fi
-        if [[ "$_bg_resume" -eq 1 && "$_rc" -ne 76 ]]; then
-            # A failed resume is final: the response exists server-side, so
-            # re-creating it would run the model twice.
-            _llm_bg_cancel "resume failed"
-            [[ -n "$_retry_msg" ]] && { _llm_note error "" "$_retry_msg"; die "$_retry_msg"; }
-            [[ -n "$_ce" ]] && { _llm_note error "" "curl error: $_ce"; die "curl error: $_ce"; }
-            exit 1
+        if [[ "$_bg_active" -eq 1 && ! -e "$_llm_work/responses-terminal" ]]; then
+            # Initial-stream failures abandon a known job just like failed
+            # resumes. An error event is not a terminal response receipt.
+            _llm_bg_cancel "background stream failed"
+            # Responses never enters the retry branch below. Use the common
+            # final diagnostics after normalizing this abandonment to failure.
+            _rc=1
         fi
         # Anything that failed before output was emitted is retried (an
         # Anthropic overloaded_error arrives as an in-stream error event and

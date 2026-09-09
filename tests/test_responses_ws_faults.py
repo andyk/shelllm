@@ -340,6 +340,141 @@ class BrokerFaults(unittest.IsolatedAsyncioTestCase):
         await until(lambda: self.broker.slots._value == 16)
         self.assertEqual(len(self.received), 16)
 
+    async def test_completed_lane_cannot_deliver_a_stale_terminal_to_a_later_call(self):
+        old_ws = None
+        for index in range(M["MAX_LANES"]):
+            task, capture = self.call()
+            ws, body = await self.request()
+            old_ws = old_ws or ws
+            self.assertIs(ws, old_ws)
+            await self.send(ws, {"type": "response.created", "stream_id": body["stream_id"],
+                                 "response": {"id": f"resp_{index}"}})
+            await self.send(ws, completed(body["stream_id"], f"resp_{index}"))
+            self.assertEqual(await asyncio.wait_for(task, 5), 0)
+            await until(lambda: not self.broker.connection.lanes)
+
+        old_generation = self.broker.connection
+        close_gate = asyncio.Event()
+        real_close = self.broker._close
+
+        async def delayed_close(ws):
+            await close_gate.wait()
+            await real_close(ws)
+
+        self.broker._close = delayed_close
+        try:
+            task, capture = self.call()
+            ws, body = await self.request()
+            await self.send(old_ws, completed("lane-0", "resp_0", "stale response"))
+            await until(lambda: task.done() or old_generation.retired)
+            self.assertFalse(task.done(), "a retired response settled a later call")
+            self.assertIsNot(ws, old_ws)
+            await self.send(ws, {"type": "response.created", "stream_id": body["stream_id"],
+                                 "response": {"id": "resp_current"}})
+            await self.send(ws, completed(body["stream_id"], "resp_current", "current response"))
+            self.assertEqual(await asyncio.wait_for(task, 5), 0)
+            self.assertEqual(capture.events[-1]["response"]["id"], "resp_current")
+            self.assertEqual(len(self.received), M["MAX_LANES"] + 1)
+        finally:
+            close_gate.set()
+
+    async def test_lane_exhaustion_preserves_the_last_active_call_before_rotation(self):
+        old_ws = None
+        for index in range(M["MAX_LANES"] - 1):
+            task, _ = self.call()
+            ws, body = await self.request()
+            old_ws = old_ws or ws
+            self.assertIs(ws, old_ws)
+            await self.send(ws, completed(body["stream_id"], f"resp_{index}"))
+            self.assertEqual(await asyncio.wait_for(task, 5), 0)
+            await until(lambda: not self.broker.connection.lanes)
+
+        last, last_capture = self.call()
+        last_ws, last_body = await self.request()
+        self.assertIs(last_ws, old_ws)
+        next_call, next_capture = self.call()
+        await until(lambda: self.broker.slots._value == M["MAX_IN_FLIGHT"] - 2)
+        await self.send(last_ws, completed(last_body["stream_id"], "resp_last"))
+        self.assertEqual(await asyncio.wait_for(last, 5), 0)
+        self.assertEqual(last_capture.events[-1]["response"]["id"], "resp_last")
+        next_ws, next_body = await self.request()
+        self.assertIsNot(next_ws, old_ws)
+        await self.send(next_ws, completed(next_body["stream_id"], "resp_new"))
+        self.assertEqual(await asyncio.wait_for(next_call, 5), 0)
+        self.assertEqual(next_capture.events[-1]["response"]["id"], "resp_new")
+
+    async def last_available_lane(self):
+        for index in range(M["MAX_LANES"] - 1):
+            task, _ = self.call()
+            ws, body = await self.request()
+            await self.send(ws, completed(body["stream_id"], f"resp_{index}"))
+            self.assertEqual(await asyncio.wait_for(task, 5), 0)
+            await until(lambda: not self.broker.connection.lanes)
+        task, capture = self.call()
+        ws, body = await self.request()
+        return task, capture, ws, body
+
+    async def test_disconnected_exhaustion_waiter_never_creates(self):
+        last, _, ws, body = await self.last_available_lane()
+        _, writer = await self.client()
+        await until(lambda: self.broker.slots._value == M["MAX_IN_FLIGHT"] - 2)
+        writer.close()
+        await until(lambda: self.broker.slots._value == M["MAX_IN_FLIGHT"] - 1)
+        self.assertEqual(len(self.received), M["MAX_LANES"])
+        await self.send(ws, completed(body["stream_id"], "resp_last"))
+        self.assertEqual(await asyncio.wait_for(last, 5), 0)
+        next_call, capture = self.call()
+        next_ws, next_body = await self.request()
+        self.assertIsNot(next_ws, ws)
+        await self.send(next_ws, completed(next_body["stream_id"], "resp_next"))
+        self.assertEqual(await asyncio.wait_for(next_call, 5), 0)
+        self.assertEqual(capture.events[-1]["response"]["id"], "resp_next")
+        self.assertEqual(len(self.received), M["MAX_LANES"] + 1)
+
+    async def test_exhaustion_wait_is_bounded_without_abandoning_live_call(self):
+        last, _, ws, body = await self.last_available_lane()
+        with patch.dict(G, IO_TIMEOUT=.05):
+            waiting, capture = self.call()
+            self.assertEqual(await asyncio.wait_for(waiting, 1), 1)
+        self.assertIn("lane exhaustion wait timed out", capture.events[-1]["error"]["message"])
+        self.assertEqual(len(self.received), M["MAX_LANES"])
+        self.assertFalse(self.broker.connection.retired)
+        await self.send(ws, completed(body["stream_id"], "resp_last"))
+        self.assertEqual(await asyncio.wait_for(last, 5), 0)
+
+    async def test_shutdown_wakes_exhaustion_waiters_without_reconnecting(self):
+        last, _, _, _ = await self.last_available_lane()
+        waiting, capture = self.call()
+        await until(lambda: self.broker.slots._value == M["MAX_IN_FLIGHT"] - 2)
+        self.broker.stopping.set()
+        await asyncio.wait_for(self.broker.close_connection(), 5)
+        self.assertEqual(await asyncio.wait_for(last, 5), 1)
+        self.assertEqual(await asyncio.wait_for(waiting, 5), 1)
+        self.assertIn("broker stopped before admission", capture.events[-1]["error"]["message"])
+        self.assertIsNone(self.broker.connection)
+        self.assertEqual(len(self.received), M["MAX_LANES"])
+
+    async def test_shutdown_during_connect_never_admits_a_create(self):
+        connected, release = asyncio.Event(), asyncio.Event()
+        connect = G["ws_connect"]
+
+        async def held_connect(*args, **kwargs):
+            ws = await connect(*args, **kwargs)
+            connected.set()
+            await release.wait()
+            return ws
+
+        with patch.dict(G, ws_connect=held_connect):
+            task, capture = self.call()
+            await asyncio.wait_for(connected.wait(), 5)
+            self.broker.stopping.set()
+            await asyncio.wait_for(self.broker.close_connection(), 5)
+            release.set()
+            self.assertEqual(await asyncio.wait_for(task, 5), 1)
+        self.assertIn("broker stopped before admission", capture.events[-1]["error"]["message"])
+        self.assertIsNone(self.broker.connection)
+        self.assertEqual(self.received, [])
+
     async def test_untagged_error_fans_out_original_diagnostic(self):
         a, ca = self.call()
         b, cb = self.call()
