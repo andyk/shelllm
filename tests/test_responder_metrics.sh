@@ -105,7 +105,7 @@ if [[ -n "$obs" && "$(field "$obs" decision)" == replied ]]; then
 else
     bad "replied observation written" "$(tail -3 "$WORK/step.log")"
 fi
-if jq -e --arg t trig-1 'select(.type=="message" and .from=="testid" and .reply_to==$t)' "$TRAJ" >/dev/null; then
+if jq -s -e --arg t trig-1 'any(.[]; .type=="message" and .from=="testid" and .reply_to==$t)' "$TRAJ" >/dev/null; then
     ok "reply stamped to the trigger"
 else
     bad "reply stamped to the trigger"

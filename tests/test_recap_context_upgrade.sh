@@ -64,8 +64,8 @@ mk_block() { # mk_block <run-name> <tier> <s> <e> <summary>
     local f
     f=$(blockfile "$1" "$2" "$3" "$4")
     mkdir -p "$(dirname "$f")"
-    jq -n -c --argjson tier "$2" --argjson start "$3" --argjson end "$4" --arg sum "$5" \
-        '{tier:$tier, start:$start, end:$end, n:($end-$start), summary:$sum, step_ids:["x1","x2"]}' > "$f"
+    jq -n -c --argjson tier "$2" --argjson start "$3" --argjson stop "$4" --arg sum "$5" \
+        '{tier:$tier, start:$start, end:$stop, n:($stop-$start), summary:$sum, step_ids:["x1","x2"]}' > "$f"
 }
 
 # ---------------------------------------------------------------------------

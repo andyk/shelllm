@@ -68,17 +68,18 @@ step t2  thought   "$(head -c 2000 /dev/zero | tr '\0' x)" 5
 out=$(stream 30)
 types=$(printf '%s\n' "$out" | jq -r .type | tr '\n' ' ')
 
-if ! printf '%s\n' "$out" | jq -e 'select(.type == "reasoning")' >/dev/null 2>&1; then
+# Slurp once so jq 1.6 checks every record instead of the last input's exit status.
+if printf '%s\n' "$out" | jq -s -e 'all(.[]; .type != "reasoning")' >/dev/null 2>&1; then
     ok "reasoning steps are dropped"
 else
     bad "reasoning steps are dropped" "$types"
 fi
-if ! printf '%s\n' "$out" | jq -e 'select(.type == "shell-output")' >/dev/null 2>&1; then
+if printf '%s\n' "$out" | jq -s -e 'all(.[]; .type != "shell-output")' >/dev/null 2>&1; then
     ok "machinery steps stay out"
 else
     bad "machinery steps stay out"
 fi
-printf '%s\n' "$out" | jq -e 'select(.step_id == "f1")' >/dev/null 2>&1 && ok "final steps are kept" || bad "final steps are kept" "$types"
+printf '%s\n' "$out" | jq -s -e 'any(.[]; .step_id == "f1")' >/dev/null 2>&1 && ok "final steps are kept" || bad "final steps are kept" "$types"
 # A final is all the next wake sees of its run, so it carries a command that
 # prints the run's raw steps; a final without a run id (old rows) carries none.
 details=$(printf '%s\n' "$out" | jq -r 'select(.step_id == "f1") | .details // "none"')
@@ -143,7 +144,7 @@ fi
 
 # A final without a run id (old rows) carries no details command.
 step f2 final "old final, no run id" 4
-printf '%s\n' "$(stream 30)" | jq -e 'select(.step_id == "f2") | has("details") | not' >/dev/null 2>&1 && ok "a final without a run id carries no details" || bad "a final without a run id carries no details"
+printf '%s\n' "$(stream 30)" | jq -s -e 'any(.[]; .step_id == "f2" and (has("details") | not))' >/dev/null 2>&1 && ok "a final without a run id carries no details" || bad "a final without a run id carries no details"
 
 # Observation/final pairs: a final drops the nearest earlier observation of
 # its run; earlier milestones, orphan observations, and orphan finals stay.

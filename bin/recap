@@ -330,12 +330,12 @@ _summarize_window() {
     jq -n -c \
         --argjson idx "$idx" \
         --argjson body "$body" \
-        --argjson start "$first_line" --argjson end "$last_line" \
+        --argjson start "$first_line" --argjson stop "$last_line" \
         --arg fs "$first_step" --arg ls "$last_step" \
         --arg fts "$first_ts" --arg lts "$last_ts" \
         --argjson n "$n" --argjson partial "$partial" \
         --arg model "$MAP_MODEL" --arg created "$(date +%Y-%m-%dT%H:%M:%S)" '
-        {idx: $idx, raw_start_line: $start, raw_end_line: $end,
+        {idx: $idx, raw_start_line: $start, raw_end_line: $stop,
          first_step: $fs, last_step: $ls, first_ts: $fts, last_ts: $lts,
          n_steps: $n, partial: $partial, model: $model, created: $created}
         + {title: ($body.title // "untitled"),
@@ -565,10 +565,10 @@ _ctx_seal_tier1() {
     note "rollup t1 [$s,$e)"
     body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" 1024) || die "rollup t1 [$s,$e): bad JSON"
     mkdir -p "$(dirname "$file")"
-    jq -n -c --argjson tier 1 --argjson start "$s" --argjson end "$e" --argjson n "$((e - s))" \
+    jq -n -c --argjson tier 1 --argjson start "$s" --argjson stop "$e" --argjson n "$((e - s))" \
         --argjson body "$body" --arg fid "$fid" --arg lid "$lid" \
         --arg model "$MAP_MODEL" --argjson pv "$ROLLUP_PROMPT_VERSION" --arg created "$(date +%Y-%m-%dT%H:%M:%S)" '
-        {tier:$tier, start:$start, end:$end, n:$n,
+        {tier:$tier, start:$start, end:$stop, n:$n,
          summary:($body.summary // ""), themes:($body.themes // []),
          step_ids:(($body.step_ids // []) | if length==0 then [$fid,$lid] else . end),
          model:$model, prompt_version:$pv, created:$created}' > "$file"
@@ -595,10 +595,10 @@ _ctx_seal_tierk() {
     # once the payload outgrows the pipe buffer (large --fanout).
     fb_json=$(printf '%s' "$fallback" | awk 'NF && ++c <= 4' | jq -R . | jq -sc .)
     mkdir -p "$(dirname "$file")"
-    jq -n -c --argjson tier "$tier" --argjson start "$s" --argjson end "$e" --argjson n "$((e - s))" \
+    jq -n -c --argjson tier "$tier" --argjson start "$s" --argjson stop "$e" --argjson n "$((e - s))" \
         --argjson body "$body" --argjson fb "$fb_json" \
         --arg model "$MAP_MODEL" --argjson pv "$ROLLUP_PROMPT_VERSION" --arg created "$(date +%Y-%m-%dT%H:%M:%S)" '
-        {tier:$tier, start:$start, end:$end, n:$n,
+        {tier:$tier, start:$start, end:$stop, n:$n,
          summary:($body.summary // ""), themes:($body.themes // []),
          step_ids:(($body.step_ids // []) | if length==0 then $fb else . end),
          model:$model, prompt_version:$pv, created:$created}' > "$file"

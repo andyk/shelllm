@@ -46,7 +46,7 @@ check "stderr carries the command message"   grep -q 'boom: no frontmatter' "$WO
 n=$(jq -r 'select(.type=="error" and .reason=="prompt-section-failed") | .section' "$TRAJ" | grep -c '^skills$')
 check "one error step recorded for the skills section" test "$n" -eq 1
 check "error step says the section is missing"       bash -c 'jq -r "select(.type==\"error\") | .content" "$1" | grep -q "missing from every wakeup"' _ "$TRAJ"
-check "error step carries the exit code"             bash -c 'jq -e "select(.type==\"error\") | .rc == 1" "$1"' _ "$TRAJ"
+check "error step carries the exit code"             bash -c 'jq -s -e "any(.[]; .type==\"error\" and .reason==\"prompt-section-failed\" and .section==\"skills\" and .rc == 1)" "$1"' _ "$TRAJ"
 
 build >/dev/null 2>"$WORK/err2"
 n=$(jq -r 'select(.type=="error" and .reason=="prompt-section-failed") | .section' "$TRAJ" | grep -c '^skills$')

@@ -87,10 +87,10 @@ _prompt_section() {  # _prompt_section <label> <cmd> [args...]
     printf '%s: error: wake prompt section "%s" failed: `%s` exited %s%s; the section is left out of this wakeup\n' \
         "${THINKER_NAME:-thinker}" "$label" "$*" "$rc" "${first:+ ($first)}" >&2
     if ! _prompt_section_reported "$label"; then
-        jq -nc --arg label "$label" --arg cmd "$*" --argjson rc "$rc" --arg err "$first" \
+        jq -nc --arg section "$label" --arg cmd "$*" --argjson rc "$rc" --arg err "$first" \
             --arg source "${THINKER_NAME:-thinker}" \
-            '{type:"error", content:("wake prompt section \"\($label)\" failed: `\($cmd)` exited \($rc)" + (if $err=="" then "" else ": "+$err end) + ". The section is missing from every wakeup until this is fixed."),
-              source:$source, reason:"prompt-section-failed", section:$label, rc:$rc}' \
+            '{type:"error", content:("wake prompt section \"\($section)\" failed: `\($cmd)` exited \($rc)" + (if $err=="" then "" else ": "+$err end) + ". The section is missing from every wakeup until this is fixed."),
+              source:$source, reason:"prompt-section-failed", section:$section, rc:$rc}' \
             | traj append >/dev/null 2>&1 || true
     fi
     return "$rc"
