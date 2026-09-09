@@ -1,0 +1,617 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# responses: OpenAI Responses lifecycle operations (design/responses-lifecycle.md).
+#
+# bin/llm is the completion boundary: one request, one terminal object. The
+# Responses API also has server-side state with a life of its own, so fetching,
+# cancelling, deleting, listing, compacting, and the Conversations family live
+# here instead. Stdout is the machine channel: the API object exactly as
+# returned, one JSON document per command. Errors go to stderr and exit 1;
+# usage errors exit 2.
+
+# Load .env files the way bin/llm does, layered: the cwd's .env, then the state
+# home's. Each fills in only vars that are not already set, so the real
+# environment always wins over a file.
+_res_load_env() {
+    local envfile="$1"
+    [[ -f "$envfile" ]] || return 1
+    local key val
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        [[ -n "${!key+x}" ]] && continue
+        # shellcheck disable=SC1090  # sourcing the user's own env file
+        val=$(set -a; . "$envfile" >/dev/null 2>&1; printf '%s' "${!key}") || { printf 'responses: warning: could not read %s; ignoring it\n' "$envfile" >&2; return 0; }
+        export "$key=$val"
+    done < <(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\2/p' "$envfile")
+    return 0
+}
+_res_load_env ".env" || true
+_res_load_env "${HEADLONG_HOME:-${SHELLM_HOME:-$HOME/.headlong}}/.env" || true
+
+PROVIDER="${LLM_PROVIDER:-}"
+PRETTY=0
+CONNECT_TIMEOUT="${LLM_CONNECT_TIMEOUT:-10}"
+MAX_TIME="${LLM_MAX_TIME:-600}"
+
+_tmp_dir=""
+_curl_pid=""
+_cleanup() {
+    # curl is a direct, owned child, including while streaming. Stop and reap
+    # it before removing files it may still be reading or writing.
+    if [[ -n "$_curl_pid" ]]; then
+        kill -TERM "$_curl_pid" 2>/dev/null || true
+        kill -KILL "$_curl_pid" 2>/dev/null || true
+        wait "$_curl_pid" 2>/dev/null || true
+        _curl_pid=""
+    fi
+    [[ -z "$_tmp_dir" ]] || rm -rf -- "$_tmp_dir"
+    return 0
+}
+trap _cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+die() { printf 'responses: error: %s\n' "$*" >&2; exit 1; }
+usage_error() {
+    printf 'responses: error: %s\n' "$*" >&2
+    printf "Try 'responses --help'.\n" >&2
+    exit 2
+}
+init_tmp() {
+    [[ -z "$_tmp_dir" ]] || return 0
+    umask 077
+    _tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/responses.XXXXXX") \
+        || die "cannot create a temporary directory"
+}
+mktmp() {
+    # Allocation may run in a subshell; ownership stays with the parent dir.
+    mktemp "$_tmp_dir/file.XXXXXX" || die "cannot create a temporary file"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: responses [--provider P] [--pretty] <command> [options]
+
+Operations on stored Responses state. Completions stay in `llm`.
+
+  responses get ID [--include V]... [--stream] [--starting-after N]
+  responses cancel ID
+  responses delete ID
+  responses input-items ID [--after ID] [--limit N] [--order asc|desc]
+                           [--include V]... [--all]
+  responses compact --model M (--input-file F | --previous-response-id ID)
+                    [--instructions S] [--body-file F]
+  responses conversations create [--items-file F] [--metadata JSON]
+  responses conversations get CID
+  responses conversations update CID --metadata JSON
+  responses conversations delete CID
+  responses conversations items CID [--after ID] [--limit N]
+                                    [--order asc|desc] [--include V]... [--all]
+  responses conversations add CID --items-file F [--include V]...
+  responses conversations item CID ITEM_ID
+  responses conversations remove CID ITEM_ID
+
+Options:
+  --provider P    openai (default), openrouter, or openai-compatible;
+                  LLM_PROVIDER is the environment spelling.
+  --pretty        Indent the JSON on stdout.
+
+Environment: OPENAI_API_KEY / OPENROUTER_API_KEY / LLM_API_KEY, LLM_API_URL
+(its /responses or /chat/completions suffix is stripped to find the API base),
+LLM_CONNECT_TIMEOUT, LLM_MAX_TIME.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+
+POS=()
+INCLUDES=()
+OPT_SEEN=""
+OPT_AFTER=""; OPT_LIMIT=""; OPT_ORDER=""; OPT_ALL=0
+OPT_STREAM=0; OPT_STARTING_AFTER=""
+OPT_MODEL=""; OPT_INPUT_FILE=""; OPT_PREV=""; OPT_INSTRUCTIONS=""
+OPT_BODY_FILE=""; OPT_ITEMS_FILE=""; OPT_METADATA=""
+
+_need_value() { [[ "$2" -ge 2 ]] || usage_error "$1 requires a value"; }
+_seen() { OPT_SEEN="$OPT_SEEN $1"; }
+
+parse_opts() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --provider)  _need_value "$1" $#; PROVIDER="$2"; shift 2 ;;
+            --pretty)    PRETTY=1; shift ;;
+            -h|--help)   usage; exit 0 ;;
+            --include)   _need_value "$1" $#; _seen "$1"; INCLUDES+=("$2"); shift 2 ;;
+            --after)     _need_value "$1" $#; _seen "$1"; OPT_AFTER="$2"; shift 2 ;;
+            --limit)     _need_value "$1" $#; _seen "$1"; OPT_LIMIT="$2"; shift 2 ;;
+            --order)     _need_value "$1" $#; _seen "$1"; OPT_ORDER="$2"; shift 2 ;;
+            --all)       _seen "$1"; OPT_ALL=1; shift ;;
+            --stream)    _seen "$1"; OPT_STREAM=1; shift ;;
+            --starting-after) _need_value "$1" $#; _seen "$1"; OPT_STARTING_AFTER="$2"; shift 2 ;;
+            --model)     _need_value "$1" $#; _seen "$1"; OPT_MODEL="$2"; shift 2 ;;
+            --input-file) _need_value "$1" $#; _seen "$1"; OPT_INPUT_FILE="$2"; shift 2 ;;
+            --previous-response-id) _need_value "$1" $#; _seen "$1"; OPT_PREV="$2"; shift 2 ;;
+            --instructions) _need_value "$1" $#; _seen "$1"; OPT_INSTRUCTIONS="$2"; shift 2 ;;
+            --body-file) _need_value "$1" $#; _seen "$1"; OPT_BODY_FILE="$2"; shift 2 ;;
+            --items-file) _need_value "$1" $#; _seen "$1"; OPT_ITEMS_FILE="$2"; shift 2 ;;
+            --metadata)  _need_value "$1" $#; _seen "$1"; OPT_METADATA="$2"; shift 2 ;;
+            --)          shift; while [[ $# -gt 0 ]]; do POS+=("$1"); shift; done ;;
+            -*)          usage_error "unknown option: $1" ;;
+            *)           POS+=("$1"); shift ;;
+        esac
+    done
+}
+
+# Each command declares the options it understands, so a flag that belongs to
+# another subcommand is a usage error instead of a silent no-op.
+allow_opts() {
+    local seen
+    for seen in $OPT_SEEN; do
+        case " $1 " in
+            *" $seen "*) ;;
+            *) usage_error "$COMMAND does not take $seen" ;;
+        esac
+    done
+}
+
+# Drop the leading positional (the command name) without tripping over an
+# empty array under set -u in bash 3.2.
+shift_pos() {
+    if [[ "${#POS[@]}" -gt 1 ]]; then POS=("${POS[@]:1}"); else POS=(); fi
+}
+
+want_pos() {  # want_pos <count> <what>
+    [[ "${#POS[@]}" -eq "$1" ]] || usage_error "$COMMAND takes $2"
+    local id
+    for id in ${POS[@]+"${POS[@]}"}; do
+        valid_id "$id" || usage_error "ids must contain only letters, digits, underscores, or hyphens"
+    done
+}
+
+valid_id() { [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]; }
+
+# ---------------------------------------------------------------------------
+# Provider, base URL, auth
+# ---------------------------------------------------------------------------
+
+# LLM_API_URL names a completion endpoint; the lifecycle paths hang off the
+# same API base, so drop the completion suffix and keep the rest.
+api_base_from_url() {
+    local u="$1"
+    u="${u%/}"
+    case "$u" in
+        */responses) u="${u%/responses}" ;;
+        */chat/completions) u="${u%/chat/completions}" ;;
+    esac
+    printf '%s' "${u%/}"
+}
+
+# Secret headers reach curl through a 0600 config file (-K), never argv, which
+# is readable by every same-host process. This is bin/llm's add_auth_header,
+# escaping included: curl config values are double quoted, so every character
+# curl treats specially inside those quotes has to be escaped or an unusual key
+# could add a second config option.
+add_auth_header() {
+    local h="$1" f
+    h="${h//\\/\\\\}"
+    h="${h//\"/\\\"}"
+    h="${h//$'\t'/\\t}"
+    h="${h//$'\n'/\\n}"
+    h="${h//$'\r'/\\r}"
+    h="${h//$'\v'/\\v}"
+    f=$(mktmp)
+    ( umask 077; printf 'header = "%s"\n' "$h" > "$f" )
+    HEADERS+=(-K "$f")
+}
+
+BASE=""
+HEADERS=()
+resolve_provider() {
+    init_tmp
+    [[ -n "$PROVIDER" ]] || PROVIDER="openai"
+    HEADERS=(-H "Content-Type: application/json")
+    case "$PROVIDER" in
+        openai)
+            [[ -n "${OPENAI_API_KEY:-}" ]] || die "OPENAI_API_KEY is not set"
+            BASE=$(api_base_from_url "${LLM_API_URL:-https://api.openai.com/v1}")
+            add_auth_header "Authorization: Bearer $OPENAI_API_KEY"
+            ;;
+        openrouter)
+            [[ -n "${OPENROUTER_API_KEY:-}" ]] || die "OPENROUTER_API_KEY is not set"
+            BASE=$(api_base_from_url "${LLM_API_URL:-https://openrouter.ai/api/v1}")
+            add_auth_header "Authorization: Bearer $OPENROUTER_API_KEY"
+            ;;
+        openai-compatible)
+            local u="${LLM_API_URL:-${SHELLM_API_URL:-}}"
+            [[ -n "$u" ]] || die "LLM_API_URL is not set (openai-compatible has no default endpoint)"
+            BASE=$(api_base_from_url "$u")
+            if [[ -n "${LLM_API_KEY:-}" ]]; then
+                add_auth_header "Authorization: Bearer $LLM_API_KEY"
+            fi
+            ;;
+        *)
+            usage_error "provider $PROVIDER has no Responses lifecycle API (use openai, openrouter, or openai-compatible)"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Requests
+# ---------------------------------------------------------------------------
+
+urlencode() {
+    local s="$1" out="" c i
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [A-Za-z0-9._~-]) out="$out$c" ;;
+            *) out="$out$(printf '%%%02X' "'$c")" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+QUERY=""
+# The key is a literal we control (include[] keeps its brackets, which is how
+# the OpenAI SDKs encode an array parameter); only the value is escaped.
+qadd() { QUERY="${QUERY:+$QUERY&}$1=$(urlencode "$2")"; }
+qadd_includes() {
+    local v
+    for v in ${INCLUDES[@]+"${INCLUDES[@]}"}; do qadd 'include[]' "$v"; done
+}
+
+net_args() {
+    NET=()
+    [[ "$CONNECT_TIMEOUT" =~ ^[0-9]+$ && "$CONNECT_TIMEOUT" -gt 0 ]] \
+        && NET+=(--connect-timeout "$CONNECT_TIMEOUT")
+    [[ "$MAX_TIME" =~ ^[0-9]+$ && "$MAX_TIME" -gt 0 ]] \
+        && NET+=(--max-time "$MAX_TIME")
+    return 0
+}
+
+BODY=""
+# do_request <method> <path>. Reads QUERY and BODY, leaves the reply in
+# $RESP_FILE, and dies on a non-2xx with the API's own message.
+RESP_FILE=""
+REQUEST_MAX_BYTES=0
+do_request() {
+    local method="$1" url="$BASE$2" code code_file body_file="" rc=0
+    [[ -n "$QUERY" ]] && url="$url?$QUERY"
+    RESP_FILE=$(mktmp)
+    code_file=$(mktmp)
+    local args=(--globoff -sS -o "$RESP_FILE" -w '%{http_code}')
+    args+=(${NET[@]+"${NET[@]}"} "${HEADERS[@]}" -X "$method")
+    [[ "$REQUEST_MAX_BYTES" -eq 0 ]] || args+=(--max-filesize "$REQUEST_MAX_BYTES")
+    if [[ -n "$BODY" ]]; then
+        body_file=$(mktmp)
+        printf '%s' "$BODY" > "$body_file"
+        args+=(-d @"$body_file")
+    fi
+    curl "${args[@]}" "$url" > "$code_file" 2>/dev/null &
+    _curl_pid=$!
+    wait "$_curl_pid" || rc=$?
+    _curl_pid=""
+    code=$(cat "$code_file")
+    [[ "$rc" -eq 0 ]] || code="000"
+    [[ "$code" =~ ^2[0-9][0-9]$ ]] && return 0
+    local msg=""
+    msg=$(jq -r '(.error.message // .message // empty)' < "$RESP_FILE" 2>/dev/null) || msg=""
+    [[ -n "$msg" ]] || msg="HTTP $code from $method $url"
+    die "$msg"
+}
+
+emit() {
+    if [[ "$PRETTY" -eq 1 ]]; then jq . < "$1"; else jq -c . < "$1"; fi \
+        || die "the API reply was not JSON"
+}
+
+# GET a list endpoint, following has_more when --all was asked for. The merged
+# object is one page as far as a caller is concerned, so has_more is false and
+# the ids bracket the whole set.
+run_list() {
+    local path="$1" after="$OPT_AFTER" n=0 has_more last pages merged
+    local seen="|$OPT_AFTER|" bytes=0 size
+    pages="$_tmp_dir/pages"
+    mkdir "$pages"
+    # Bound both each transfer and the aggregate before slurping it into jq.
+    REQUEST_MAX_BYTES=67108864
+    while :; do
+        n=$(( n + 1 ))
+        QUERY=""
+        [[ -n "$after" ]] && qadd after "$after"
+        [[ -n "$OPT_LIMIT" ]] && qadd limit "$OPT_LIMIT"
+        [[ -n "$OPT_ORDER" ]] && qadd order "$OPT_ORDER"
+        qadd_includes
+        do_request GET "$path"
+        if [[ "$OPT_ALL" -ne 1 ]]; then emit "$RESP_FILE"; return 0; fi
+        size=$(wc -c < "$RESP_FILE")
+        bytes=$((bytes + size))
+        [[ "$bytes" -le "$REQUEST_MAX_BYTES" ]] || die "paginated reply exceeds 64 MiB; list is incomplete"
+        jq -se 'length == 1 and (.[0] |
+            type == "object" and (.data | type == "array") and
+            (.has_more | type == "boolean") and
+            all(.data[]; type == "object" and (.id | type == "string") and
+                (.id | test("^[A-Za-z0-9_-]+$"))) and
+            ((has("last_id") | not) or .last_id == (.data[-1].id // null)))' \
+            < "$RESP_FILE" >/dev/null 2>&1 || die "malformed list page $n; list is incomplete"
+        cp "$RESP_FILE" "$pages/$(printf '%05d' "$n").json"
+        has_more=$(jq -r '.has_more' < "$RESP_FILE")
+        [[ "$has_more" == "true" ]] || break
+        last=$(jq -r '.data[-1].id // empty' < "$RESP_FILE")
+        [[ -n "$last" ]] || die "empty continuing page $n; list is incomplete"
+        case "$seen" in *"|$last|"*) die "pagination cursor did not progress (page $n); list is incomplete" ;; esac
+        [[ "$n" -lt 500 ]] || die "pagination reached the 500-page limit; list is incomplete"
+        seen="$seen$last|"
+        after="$last"
+    done
+    merged=$(mktmp)
+    jq -s '(map(.data[])) as $d
+           | if ($d | map(.id) | unique | length) != ($d | length)
+             then error("duplicate item ids; list is incomplete") else . end
+           | {object: (.[0].object // "list"),
+              data: $d,
+              first_id: (if ($d | length) > 0 then $d[0].id else null end),
+              last_id: (if ($d | length) > 0 then $d[-1].id else null end),
+              has_more: false}' "$pages"/*.json > "$merged" \
+        || die "cannot merge the paginated reply"
+    emit "$merged"
+}
+
+# One object-returning request owns provider setup, query includes, transport,
+# and output. Command-specific validation/body construction precedes this call.
+request_object() {
+    resolve_provider; net_args
+    QUERY=""
+    qadd_includes
+    do_request "$@"
+    emit "$RESP_FILE"
+}
+
+# Stored-resource operations share the same id validation and URL shape.
+# Build the path only after want_pos succeeds, including under bash set -u.
+request_ids() {  # allowed-options count what method collection [suffix]
+    allow_opts "$1"
+    want_pos "$2" "$3"
+    local path="$5/${POS[0]}${6:-}"
+    [[ "$2" -ne 2 ]] || path="$path/${POS[1]}"
+    request_object "$4" "$path"
+}
+
+# --- streaming get ----------------------------------------------------------
+
+# The SSE resume channel returns typed JSON events for the requested response.
+# A terminal tag succeeds only with that response's matching terminal status.
+# Keep non-data lines separately so an HTTP error body can explain a refusal.
+stream_get() {
+    local url="$BASE$1" wanted="$2" line payload etype terminal=0 other msg rc=0
+    [[ -n "$QUERY" ]] && url="$url?$QUERY"
+    other=$(mktmp)
+    mkfifo "$_tmp_dir/stream"
+    curl --globoff -sS -N ${NET[@]+"${NET[@]}"} "${HEADERS[@]}" "$url" \
+        > "$_tmp_dir/stream" 2>/dev/null &
+    _curl_pid=$!
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        case "$line" in
+            data:*) ;;
+            *) printf '%s\n' "$line" >> "$other"; continue ;;
+        esac
+        payload="${line#data:}"
+        payload="${payload# }"
+        [[ -z "$payload" || "$payload" == "[DONE]" ]] && continue
+        payload=$(printf '%s' "$payload" | jq -cs --arg wanted "$wanted" '
+            if length != 1 then error("event cardinality") else .[0] end
+            | if type != "object" then error("event object")
+              elif (.type | type) != "string" or .type == "" then error("event type")
+              elif has("response") and (.response | type) != "object" then error("response object")
+              elif has("response") and .response.id != $wanted then error("response identity")
+              elif has("response_id") and .response_id != $wanted then error("response identity")
+              else . end' 2>/dev/null) || die "invalid or foreign response stream event"
+        etype=$(printf '%s' "$payload" | jq -r '.type')
+        case "$etype" in
+            response.completed|response.incomplete|response.failed|response.cancelled)
+                printf '%s' "$payload" | jq -e --arg wanted "$wanted" --arg status "${etype#response.}" \
+                    '.response.id == $wanted and .response.status == $status' >/dev/null 2>&1 \
+                    || die "terminal response identity or status does not match"
+                terminal=1 ;;
+        esac
+        printf '%s\n' "$payload"
+    done < "$_tmp_dir/stream"
+    wait "$_curl_pid" || rc=$?
+    _curl_pid=""
+    [[ "$terminal" -eq 1 && "$rc" -eq 0 ]] && return 0
+    msg=$(jq -r '(.error.message // .message // empty)' < "$other" 2>/dev/null) || msg=""
+    [[ -n "$msg" ]] || msg="the stream ended without a terminal response event"
+    die "$msg"
+}
+
+# ---------------------------------------------------------------------------
+# Bodies
+# ---------------------------------------------------------------------------
+
+# These validators run in the caller's shell rather than returning their input
+# through a command substitution, so a usage_error inside one really does end
+# the process with exit 2 instead of only ending a subshell.
+require_json_file() {  # file kind what
+    [[ -f "$1" ]] || usage_error "$3: no such file: $1"
+    jq -es --arg kind "$2" 'length == 1 and (.[0] | type == $kind)' < "$1" >/dev/null 2>&1 \
+        || usage_error "$3 must hold a JSON $2: $1"
+}
+
+require_json_object() {  # require_json_object <json> <what>
+    printf '%s' "$1" | jq -es 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 \
+        || usage_error "$2 must be a JSON object"
+}
+
+# Sets BODY to {"items": [...]}. The API takes 20 items at a time, so a longer
+# file is a usage error here rather than a rejected request.
+build_items_body() {  # build_items_body <file>
+    require_json_file "$1" array "--items-file"
+    local count
+    count=$(jq 'length' < "$1")
+    [[ "$count" -le 20 ]] \
+        || usage_error "--items-file holds $count items; the API takes at most 20 at a time"
+    BODY=$(jq -c '{items: .}' < "$1")
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+parse_opts "$@"
+[[ "${#POS[@]}" -gt 0 ]] || usage_error "no command given"
+[[ -z "$OPT_AFTER" ]] || valid_id "$OPT_AFTER" || usage_error "invalid --after id"
+[[ -z "$OPT_PREV" ]] || valid_id "$OPT_PREV" || usage_error "invalid --previous-response-id"
+[[ -z "$OPT_LIMIT" || "$OPT_LIMIT" =~ ^[1-9][0-9]*$ ]] || usage_error "--limit must be a positive integer"
+[[ -z "$OPT_ORDER" || "$OPT_ORDER" == asc || "$OPT_ORDER" == desc ]] || usage_error "--order must be asc or desc"
+[[ -z "$OPT_STARTING_AFTER" || "$OPT_STARTING_AFTER" =~ ^[0-9]+$ ]] || usage_error "--starting-after must be a nonnegative integer"
+COMMAND="${POS[0]}"
+shift_pos
+NET=()
+
+case "$COMMAND" in
+    get)
+        allow_opts "--include --stream --starting-after"
+        want_pos 1 "one response id"
+        resolve_provider; net_args
+        QUERY=""
+        if [[ "$OPT_STREAM" -eq 1 ]]; then
+            qadd stream true
+            [[ -n "$OPT_STARTING_AFTER" ]] && qadd starting_after "$OPT_STARTING_AFTER"
+            qadd_includes
+            stream_get "/responses/${POS[0]}" "${POS[0]}"
+        else
+            [[ -n "$OPT_STARTING_AFTER" ]] && usage_error "--starting-after only means something with --stream"
+            qadd_includes
+            do_request GET "/responses/${POS[0]}"
+            emit "$RESP_FILE"
+        fi
+        ;;
+    cancel)
+        request_ids "" 1 "one response id" POST /responses /cancel
+        ;;
+    delete)
+        request_ids "" 1 "one response id" DELETE /responses
+        ;;
+    input-items)
+        allow_opts "--after --limit --order --include --all"
+        want_pos 1 "one response id"
+        resolve_provider; net_args
+        run_list "/responses/${POS[0]}/input_items"
+        ;;
+    compact)
+        allow_opts "--model --input-file --previous-response-id --instructions --body-file"
+        want_pos 0 "no positional arguments"
+        [[ -n "$OPT_MODEL" ]] || usage_error "compact requires --model"
+        [[ -n "$OPT_INPUT_FILE" || -n "$OPT_PREV" ]] \
+            || usage_error "compact requires --input-file or --previous-response-id"
+        [[ -n "$OPT_INPUT_FILE" && -n "$OPT_PREV" ]] \
+            && usage_error "compact takes --input-file or --previous-response-id, not both"
+        _base_body='{}'
+        if [[ -n "$OPT_BODY_FILE" ]]; then
+            require_json_file "$OPT_BODY_FILE" object "--body-file"
+            _base_body=$(cat "$OPT_BODY_FILE")
+        fi
+        _filter='$body + {model: $model}'
+        _jq_args=(--argjson body "$_base_body" --arg model "$OPT_MODEL")
+        if [[ -n "$OPT_INPUT_FILE" ]]; then
+            require_json_file "$OPT_INPUT_FILE" array "--input-file"
+            _jq_args+=(--slurpfile input "$OPT_INPUT_FILE")
+            _filter="$_filter + {input: \$input[0]}"
+        else
+            _jq_args+=(--arg prev "$OPT_PREV")
+            _filter="$_filter + {previous_response_id: \$prev}"
+        fi
+        if [[ -n "$OPT_INSTRUCTIONS" ]]; then
+            _jq_args+=(--arg instructions "$OPT_INSTRUCTIONS")
+            _filter="$_filter + {instructions: \$instructions}"
+        fi
+        BODY=$(jq -nc "${_jq_args[@]}" "$_filter") || die "cannot build the compact request body"
+        resolve_provider; net_args
+        QUERY=""
+        do_request POST "/responses/compact"
+        # Compaction is billable inference too. Use the completion ledger's
+        # units/schema without overwriting the parent completion usage file.
+        _ledger_home="${IDENTITY_DIR:-${HEADLONG_HOME:-${SHELLM_HOME:-$HOME/.headlong}}}"
+        _ledger="${LLM_USAGE_LEDGER:-$_ledger_home/usage/llm.jsonl}"
+        _identity="${IDENTITY_NAME:-}"
+        [[ -n "$_identity" || -z "${IDENTITY_DIR:-}" ]] || _identity=$(basename "$IDENTITY_DIR")
+        if [[ "$_ledger" != /dev/null ]] && mkdir -p "$(dirname "$_ledger")" 2>/dev/null; then
+            jq -c --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg provider "$PROVIDER" \
+                --arg model "$OPT_MODEL" --arg identity "$_identity" \
+                --arg run_id "${LLM_RUN_ID:-${SHELLM_RUN_STEP_ID:-}}" '
+                select(.usage | type == "object") | .usage as $u
+                | {ts:$ts,provider:$provider,model:$model,operation:"responses.compact"}
+                + (if ($u.input_tokens | type) == "number" then {in_tok:$u.input_tokens} else {} end)
+                + (if ($u.output_tokens | type) == "number" then {out_tok:$u.output_tokens} else {} end)
+                + (if ($u.input_tokens_details.cached_tokens | type) == "number" then {cache_tok:$u.input_tokens_details.cached_tokens} else {} end)
+                + (if ($u.output_tokens_details.reasoning_tokens | type) == "number" then {think_tok:$u.output_tokens_details.reasoning_tokens} else {} end)
+                + (if $identity == "" then {} else {identity:$identity} end)
+                + (if $run_id == "" then {} else {run_id:$run_id} end)' \
+                "$RESP_FILE" >> "$_ledger" 2>/dev/null || true
+        fi
+        emit "$RESP_FILE"
+        ;;
+    conversations)
+        [[ "${#POS[@]}" -gt 0 ]] || usage_error "conversations needs a subcommand"
+        SUB="${POS[0]}"
+        shift_pos
+        COMMAND="conversations $SUB"
+        case "$SUB" in
+            create)
+                allow_opts "--items-file --metadata"
+                want_pos 0 "no positional arguments"
+                BODY='{}'
+                [[ -n "$OPT_ITEMS_FILE" ]] && build_items_body "$OPT_ITEMS_FILE"
+                if [[ " $OPT_SEEN " == *" --metadata "* ]]; then
+                    require_json_object "$OPT_METADATA" "--metadata"
+                    BODY=$(printf '%s' "$BODY" | jq -c --argjson m "$OPT_METADATA" '. + {metadata: $m}')
+                fi
+                request_object POST /conversations
+                ;;
+            get)
+                request_ids "" 1 "one conversation id" GET /conversations
+                ;;
+            update)
+                allow_opts "--metadata"
+                want_pos 1 "one conversation id"
+                [[ -n "$OPT_METADATA" ]] || usage_error "conversations update requires --metadata"
+                require_json_object "$OPT_METADATA" "--metadata"
+                BODY=$(jq -nc --argjson m "$OPT_METADATA" '{metadata: $m}')
+                request_object POST "/conversations/${POS[0]}"
+                ;;
+            delete)
+                request_ids "" 1 "one conversation id" DELETE /conversations
+                ;;
+            items)
+                allow_opts "--after --limit --order --include --all"
+                want_pos 1 "one conversation id"
+                resolve_provider; net_args
+                run_list "/conversations/${POS[0]}/items"
+                ;;
+            add)
+                allow_opts "--items-file --include"
+                want_pos 1 "one conversation id"
+                [[ -n "$OPT_ITEMS_FILE" ]] || usage_error "conversations add requires --items-file"
+                build_items_body "$OPT_ITEMS_FILE"
+                request_object POST "/conversations/${POS[0]}/items"
+                ;;
+            item)
+                request_ids "--include" 2 "a conversation id and an item id" GET /conversations /items
+                ;;
+            remove)
+                request_ids "" 2 "a conversation id and an item id" DELETE /conversations /items
+                ;;
+            *)
+                usage_error "unknown conversations subcommand: $SUB"
+                ;;
+        esac
+        ;;
+    *)
+        usage_error "unknown command: $COMMAND"
+        ;;
+esac

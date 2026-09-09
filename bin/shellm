@@ -94,7 +94,20 @@ fi
 unset _shellm_process_shellm_api_url_set _shellm_process_shellm_api_url \
     _shellm_process_llm_api_url_set _shellm_process_llm_api_url 2>/dev/null || true
 SHELLM_API_FORMAT="${SHELLM_API_FORMAT:-chat}"
+SHELLM_API_TRANSPORT="${SHELLM_API_TRANSPORT:-https}"
 SHELLM_RESPONSES_BODY_FILE="${SHELLM_RESPONSES_BODY_FILE:-}"
+SHELLM_RESPONSES_BACKGROUND="${SHELLM_RESPONSES_BACKGROUND:-}"
+SHELLM_RESPONSES_COMPACT_THRESHOLD="${SHELLM_RESPONSES_COMPACT_THRESHOLD:-}"
+SHELLM_RESPONSES_COMPACT_MODE="${SHELLM_RESPONSES_COMPACT_MODE:-auto}"
+# Server-held conversation state instead of the process-local chain: "new"
+# creates one at run start, a conv_ id joins an existing one. The id is
+# durable on purpose (Conversations do not expire), so it is recorded in the
+# run header and a resume of that run picks it back up.
+SHELLM_RESPONSES_CONVERSATION="${SHELLM_RESPONSES_CONVERSATION:-}"
+# The provider this run inherited, kept because the websocket transport
+# overwrites LLM_PROVIDER for llm calls and the Docker sandbox must still be
+# told the original: the host broker's socket does not exist in a container.
+_SHELLM_HOST_PROVIDER="${LLM_PROVIDER:-}"
 # Clear any inherited LLM_API_URL so llm uses per-provider defaults
 unset LLM_API_URL 2>/dev/null || true
 if [[ -n "$SHELLM_API_URL" ]]; then
@@ -171,10 +184,50 @@ case "$SHELLM_API_FORMAT" in
     chat|responses) ;;
     *) die "Invalid SHELLM_API_FORMAT: $SHELLM_API_FORMAT (expected chat or responses)" ;;
 esac
+case "$SHELLM_API_TRANSPORT" in
+    https) ;;
+    websocket)
+        # WebSocket mode is a Responses transport and nothing else: the
+        # protocol on the wire is response.create and Responses events, so
+        # asking for it under Chat Completions is a configuration mistake
+        # rather than something to silently downgrade.
+        [[ "$SHELLM_API_FORMAT" == "responses" ]] \
+            || die "SHELLM_API_TRANSPORT=websocket needs SHELLM_API_FORMAT=responses"
+        ;;
+    *) die "Invalid SHELLM_API_TRANSPORT: $SHELLM_API_TRANSPORT (expected https or websocket)" ;;
+esac
 if [[ -n "$SHELLM_RESPONSES_BODY_FILE" ]]; then
     [[ -f "$SHELLM_RESPONSES_BODY_FILE" ]] \
         || die "SHELLM_RESPONSES_BODY_FILE not found: $SHELLM_RESPONSES_BODY_FILE"
     SHELLM_RESPONSES_BODY_FILE=$(realpath "$SHELLM_RESPONSES_BODY_FILE")
+    jq -e 'type == "object"' "$SHELLM_RESPONSES_BODY_FILE" >/dev/null 2>&1 \
+        || die "SHELLM_RESPONSES_BODY_FILE must contain a JSON object"
+    if jq -e '.conversation != null' "$SHELLM_RESPONSES_BODY_FILE" >/dev/null; then
+        die "body-file conversation is not supported by shellm; use SHELLM_RESPONSES_CONVERSATION instead"
+    fi
+fi
+case "$SHELLM_RESPONSES_BACKGROUND" in
+    ""|0|1) ;;
+    *) die "Invalid SHELLM_RESPONSES_BACKGROUND: $SHELLM_RESPONSES_BACKGROUND (expected 0 or 1)" ;;
+esac
+if [[ -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ]]; then
+    [[ "$SHELLM_RESPONSES_COMPACT_THRESHOLD" =~ ^[1-9][0-9]*$ ]] \
+        || die "Invalid SHELLM_RESPONSES_COMPACT_THRESHOLD: $SHELLM_RESPONSES_COMPACT_THRESHOLD (expected a positive integer)"
+fi
+case "$SHELLM_RESPONSES_COMPACT_MODE" in
+    auto|server|standalone) ;;
+    *) die "Invalid SHELLM_RESPONSES_COMPACT_MODE (expected auto, server, or standalone)" ;;
+esac
+if [[ -n "$SHELLM_RESPONSES_CONVERSATION" ]]; then
+    # Conversations are a Responses-only container, and an operator who asked
+    # for durable server state under Chat Completions has a configuration
+    # mistake rather than something to silently ignore.
+    [[ "$SHELLM_API_FORMAT" == "responses" ]] \
+        || die "SHELLM_RESPONSES_CONVERSATION needs SHELLM_API_FORMAT=responses"
+    case "$SHELLM_RESPONSES_CONVERSATION" in
+        new|conv_*) ;;
+        *) die "Invalid SHELLM_RESPONSES_CONVERSATION: $SHELLM_RESPONSES_CONVERSATION (expected new or a conv_ id)" ;;
+    esac
 fi
 
 # A local model bound to the Docker host is usually configured as localhost
@@ -343,9 +396,35 @@ Environment:
                           Responses persists and reuses previous_response_id
                           within a run, with one full-context fallback when a
                           provider rejects continuation
+  SHELLM_API_TRANSPORT    How Responses calls travel: https (default) or
+                          websocket, which holds one connection open for the
+                          whole run through tools/responses-ws
   SHELLM_RESPONSES_BODY_FILE
                           Optional Responses create-body JSON object passed to
-                          llm (tools, include, store, text format, etc.)
+                          llm (tools, include, store, text format, etc.). A body
+                          conversation is refused; use the dedicated setting
+  SHELLM_RESPONSES_BACKGROUND
+                          1 runs each Responses create in the background
+                          (llm polls or resumes the stream, and cancels the
+                          job if killed); 0 forces foreground
+  SHELLM_RESPONSES_COMPACT_THRESHOLD
+                          Input-token count at which the Responses window is
+                          compacted (opt-in; unset disables automatic upkeep)
+  SHELLM_RESPONSES_COMPACT_MODE
+                          auto (default): native OpenAI uses server compaction,
+                          including store=false replay; other providers use
+                          standalone compact. server declares endpoint support;
+                          standalone forces replay and uses /responses/compact.
+                          A failed standalone call disables upkeep for this run
+  SHELLM_RESPONSES_CONVERSATION
+                          new, or a conv_ id: keep the turns in a server-side
+                          Conversation instead of the process-local chain.
+                          new creates one per run, the id is recorded in the
+                          run header. --resume/--traj reuses it with new or an
+                          empty/unset value; a different literal id redirects.
+                          Private acknowledgements live under SHELLM_TRAJ_DIR;
+                          ambiguous delivery or stale locks require reconciliation.
+                          Generated child calls do not inherit the Conversation
   SHELLM_EMPTY_RESPONSE_RETRIES
                           Empty-response retries before the run dies
                           (default 8; set empty for unlimited)
@@ -1570,9 +1649,130 @@ execute_code() {
 # LLM API call (delegates to the `llm` tool)
 # ---------------------------------------------------------------------------
 
+# Conversation checkpoints are private, atomic files. A mkdir lock is held for
+# the whole run; it is never stolen, including after a crash. An in-flight
+# checkpoint means delivery is unknown and requires operator reconciliation.
+# There is deliberately no automatic retry or inferred acknowledgement.
+conversation_checkpoint() {
+    local state="$1" ids_file="$2" tmp
+    [[ -n "${SHELLM_CONVERSATION_CHECKPOINT:-}" ]] || return 0
+    tmp=$(mktemp "${SHELLM_CONVERSATION_CHECKPOINT}.XXXXXX") || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    if jq -n --arg state "$state" --slurpfile ids "$ids_file" \
+        --arg conversation "$SHELLM_RESPONSES_CONVERSATION_ID" \
+        --arg trajectory "$_SHELLM_CONVERSATION_TRAJECTORY" \
+        --arg provider "$_SHELLM_HOST_PROVIDER" --arg endpoint "$_SHELLM_CONVERSATION_ENDPOINT" \
+        '{version:1,state:$state,conversation:$conversation,trajectory:$trajectory,
+          provider:$provider,endpoint:$endpoint,sent:$ids[0]}' > "$tmp"; then
+        mv -f "$tmp" "$SHELLM_CONVERSATION_CHECKPOINT"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# A compaction item is opaque, but it is not structureless: the Responses
+# contract gives it a type plus non-empty encrypted_content. Compatible
+# endpoints may omit an item id or preserve more surrounding input items, so
+# validate only the fields required to carry the opaque window forward. If a
+# reply contains several markers, every marker must be usable; otherwise the
+# newest malformed marker could still poison the next request.
+has_usable_compaction_window() {
+    local response_file="$1"
+    jq -e '
+        (.output | type == "array")
+        and ([.output[] | select(.type? == "compaction")] as $markers
+             | ($markers | length) > 0
+             and all($markers[];
+                 (.encrypted_content | type) == "string"
+                 and (.encrypted_content | length) > 0))
+    ' "$response_file" >/dev/null 2>&1
+}
+
+release_conversation_lock() {
+    [[ -z "${_SHELLM_CONVERSATION_LOCK:-}" ]] \
+        || rmdir "$_SHELLM_CONVERSATION_LOCK" 2>/dev/null || true
+}
+
+# Compaction upkeep for the process-local replay chain, run once per terminal
+# response. Two independent things happen here. A server that compacted inside
+# the turn returns a compaction item in the output, and the API says that item
+# is where the next window starts, so everything before it is dropped. Then, in
+# standalone mode only: once the reported input
+# tokens reach SHELLM_RESPONSES_COMPACT_THRESHOLD we call the compact endpoint
+# and swap the chain for the window it hands back, which must be sent as is.
+# A failed compact call is not fatal. The chain is still correct, only longer,
+# and standalone compaction is disabled for the rest of this run.
+compact_replay_chain() {
+    local replay_file="$1" response_file="$2" replay_mode="$3"
+    local replay_dir chain_tmp
+    [[ -n "$replay_file" && -s "$replay_file" && -s "$response_file" ]] || return 0
+    replay_dir=$(dirname "$replay_file")
+
+    if jq -e 'any(.output[]?; .type == "compaction")' "$response_file" >/dev/null 2>&1; then
+        if ! has_usable_compaction_window "$response_file"; then
+            echo "shellm: warning: response carried an unusable compaction item; keeping the replay chain and disabling compaction for this run" >&2
+            ( umask 077; : > "$replay_dir/.compact-disabled" )
+            return 0
+        fi
+        chain_tmp=$(mktemp "$replay_dir/.responses-replay.XXXXXX") || return 0
+        chmod 600 "$chain_tmp"
+        if jq '(map(.type? == "compaction") | rindex(true)) as $at
+               | if $at == null then . else .[$at:] end' \
+                "$replay_file" > "$chain_tmp" 2>/dev/null; then
+            mv -f "$chain_tmp" "$replay_file"
+        else
+            rm -f "$chain_tmp"
+        fi
+        # The server already compacted this turn; its pre-compaction usage
+        # must not immediately trigger another standalone compaction.
+        return 0
+    fi
+
+    [[ "${_SHELLM_COMPACT_MODE:-auto}" == standalone \
+        && "$replay_mode" -eq 1 && -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" \
+        && ! -e "$replay_dir/.compact-disabled" ]] || return 0
+    local input_tokens
+    input_tokens=$(jq -r '.usage.input_tokens // empty' "$response_file" 2>/dev/null || true)
+    [[ "$input_tokens" =~ ^[0-9]+$ ]] || return 0
+    [[ "$input_tokens" -ge "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ]] || return 0
+
+    local compact_max_time="${LLM_MAX_TIME:-600}"
+    if [[ "$compact_max_time" =~ ^[0-9]+$ && "$compact_max_time" -gt 0 ]]; then
+        compact_max_time=$((compact_max_time - SECONDS + ${_call_started:-$SECONDS}))
+        if [[ "$compact_max_time" -le 0 ]]; then
+            echo "shellm: warning: no completion deadline budget remains for compaction; keeping replay chain" >&2
+            return 0
+        fi
+    fi
+    progress "compacting the Responses replay chain at $input_tokens input tokens"
+    local compact_out compact_err
+    compact_out=$(mktemp) || return 0
+    compact_err=$(mktemp) || { rm -f "$compact_out"; return 0; }
+    if ! LLM_MAX_TIME="$compact_max_time" responses compact --provider "$_SHELLM_HOST_PROVIDER" \
+            --model "$SHELLM_MODEL" --input-file "$replay_file" --instructions "$system_prompt" \
+            > "$compact_out" 2> "$compact_err" \
+            || ! has_usable_compaction_window "$compact_out"; then
+        echo "shellm: warning: compaction failed or returned an unusable compaction item; keeping the replay chain and disabling standalone compaction for this run" >&2
+        ( umask 077; : > "$replay_dir/.compact-disabled" )
+        rm -f "$compact_out" "$compact_err"
+        return 0
+    fi
+    chain_tmp=$(mktemp "$replay_dir/.responses-replay.XXXXXX") || {
+        rm -f "$compact_out" "$compact_err"; return 0; }
+    chmod 600 "$chain_tmp"
+    if jq '.output' "$compact_out" > "$chain_tmp" 2>/dev/null; then
+        mv -f "$chain_tmp" "$replay_file"
+    else
+        rm -f "$chain_tmp"
+    fi
+    rm -f "$compact_out" "$compact_err"
+}
+
 call_llm() {
     local system_prompt="$1"
     local full_messages_json="$2"
+    local _call_started=$SECONDS
     local thinking_output_file="${3:-}"
     local messages_are_delta="${4:-0}"
     local api_format="${SHELLM_API_FORMAT:-chat}"
@@ -1582,10 +1782,14 @@ call_llm() {
     local replay_file="${SHELLM_RESPONSES_REPLAY_FILE:-}"
     local context_file="${SHELLM_RESPONSES_CONTEXT_FILE:-}"
     local stateless="${SHELLM_RESPONSES_STATELESS:-0}"
+    local conversation="${SHELLM_RESPONSES_CONVERSATION_ID:-}"
     local request_messages_json="$full_messages_json"
     local new_messages_json="$full_messages_json"
     local previous_response_id=""
     local fallback_used=0
+    # Continuation and compaction capability are independent: native OpenAI
+    # can compact input-array replay even when store=false.
+    local replay_mode=0
 
     export LLM_API_FORMAT="$api_format"
     if [[ "$api_format" == "responses" ]]; then
@@ -1598,6 +1802,20 @@ call_llm() {
             export LLM_RESPONSES_BODY_FILE="$SHELLM_RESPONSES_BODY_FILE"
         else
             unset LLM_RESPONSES_BODY_FILE 2>/dev/null || true
+        fi
+        # Background creates change nothing here: llm still hands back one
+        # terminal object per call, polling or resuming on its own.
+        if [[ -n "${SHELLM_RESPONSES_BACKGROUND:-}" ]]; then
+            export LLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
+        else
+            unset LLM_RESPONSES_BACKGROUND 2>/dev/null || true
+        fi
+        # Conversation mode and previous_response_id are alternatives, and llm
+        # refuses the pair; the id file this run never writes keeps them apart.
+        if [[ -n "$conversation" ]]; then
+            export LLM_RESPONSES_CONVERSATION="$conversation"
+        else
+            unset LLM_RESPONSES_CONVERSATION 2>/dev/null || true
         fi
         local replay_has_history=0
         if [[ -n "$replay_file" && -s "$replay_file" ]] \
@@ -1621,8 +1839,14 @@ call_llm() {
         # eventually resend it. Growth is a few dozen bytes per turn.
         local seen_src=/dev/null sent_ids_json='{}'
         [[ -n "$context_file" && -s "$context_file" ]] && seen_src="$context_file"
+        local conversation_has_history=0
+        if [[ -n "$conversation" && "$seen_src" != /dev/null ]] \
+            && jq -e 'length > 0' "$seen_src" >/dev/null; then
+            conversation_has_history=1
+        fi
         if [[ "$messages_are_delta" != "1" \
-            && ( -n "$previous_response_id" || "$replay_has_history" -eq 1 ) ]]; then
+            && ( -n "$previous_response_id" || "$replay_has_history" -eq 1 \
+                 || "$conversation_has_history" -eq 1 ) ]]; then
             [[ "$seen_src" != /dev/null ]] \
                 || die "Responses continuation context is missing"
             new_messages_json=$(printf '%s' "$full_messages_json" | jq -c --slurpfile seen_file "$seen_src" '
@@ -1635,25 +1859,27 @@ call_llm() {
             sent_ids_json=$(printf '%s' "$full_messages_json" | jq -c --slurpfile seen_file "$seen_src" '
                 ($seen_file[0] // {}) as $seen
                 | $seen + ([.[] | .step_ids[]?] | map({key: ., value: true}) | from_entries)
-            ')
+            ') || die "could not compute Responses sent-step acknowledgement"
         fi
         # Nothing past this line may carry step_ids to a provider.
         full_messages_json=$(printf '%s' "$full_messages_json" | jq -c 'map(del(.step_ids))')
         new_messages_json=$(printf '%s' "$new_messages_json" | jq -c 'map(del(.step_ids))')
         request_messages_json="$full_messages_json"
         if [[ "$stateless" == "1" || ( -n "$disabled_file" && -e "$disabled_file" ) ]]; then
+            replay_mode=1
             if [[ "$replay_has_history" -eq 1 ]]; then
                 request_messages_json=$(printf '%s' "$new_messages_json" \
                     | jq --slurpfile history "$replay_file" '($history[0] // []) + .')
             else
                 request_messages_json="$new_messages_json"
             fi
-        elif [[ -n "$previous_response_id" ]]; then
+        elif [[ -n "$previous_response_id" || -n "$conversation" ]]; then
             request_messages_json="$new_messages_json"
         fi
     else
         unset LLM_RESPONSE_FILE LLM_RESPONSES_BODY_FILE LLM_PREVIOUS_RESPONSE_ID \
-            2>/dev/null || true
+            LLM_RESPONSES_BACKGROUND LLM_RESPONSES_COMPACT_THRESHOLD \
+            LLM_RESPONSES_CONVERSATION 2>/dev/null || true
     fi
 
     while true; do
@@ -1680,7 +1906,17 @@ call_llm() {
             else
                 unset LLM_PREVIOUS_RESPONSE_ID 2>/dev/null || true
             fi
+            if [[ "${_SHELLM_COMPACT_MODE:-auto}" == server && -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ]]; then
+                export LLM_RESPONSES_COMPACT_THRESHOLD="$SHELLM_RESPONSES_COMPACT_THRESHOLD"
+            else
+                unset LLM_RESPONSES_COMPACT_THRESHOLD 2>/dev/null || true
+            fi
             [[ -z "$response_file" ]] || rm -f "$response_file"
+        fi
+
+        if [[ -n "$conversation" ]]; then
+            conversation_checkpoint in_flight "$context_file" \
+                || die "could not persist Conversation in-flight state; no request sent"
         fi
 
         # Run llm, capturing stdout to text_file and stderr to stderr_file.
@@ -1705,7 +1941,9 @@ call_llm() {
         if [[ "$llm_exit" -eq 0 ]]; then
             if [[ "$api_format" == "responses" ]] \
                 && { [[ -z "$response_file" || ! -s "$response_file" ]] \
-                    || ! jq -e '.status == "completed" or .status == "incomplete"' \
+                    || ! jq -e '(.status == "completed" or .status == "incomplete")
+                        and .error == null and (.id | type == "string" and length > 0)
+                        and (.output | type == "array")' \
                         "$response_file" >/dev/null 2>&1; }; then
                 rm -f "$text_file" "$stderr_file" "$messages_file"
                 die "llm returned Responses output without a terminal response"
@@ -1728,20 +1966,34 @@ call_llm() {
                     turn_tmp=$(mktemp)
                     chmod 600 "$replay_tmp"
                     printf '%s' "$new_messages_json" > "$turn_tmp"
-                    jq -s '.[0] + .[1] + (.[2].output // [])' \
+                    # Do not carry a malformed compaction marker into the
+                    # otherwise known-good replay. compact_replay_chain below
+                    # will warn and refuse pruning; ordinary output items from
+                    # the same terminal response remain part of the turn.
+                    jq -s '.[0] + .[1] + ((.[2].output // [])
+                        | map(select(.type? != "compaction"
+                            or ((.encrypted_content | type) == "string"
+                                and (.encrypted_content | length) > 0))))' \
                         "$replay_file" "$turn_tmp" "$response_file" > "$replay_tmp"
                     mv -f "$replay_tmp" "$replay_file"
                     rm -f "$turn_tmp"
+                    compact_replay_chain "$replay_file" "$response_file" "$replay_mode"
                 fi
                 if [[ -n "$context_file" && "$messages_are_delta" != "1" ]]; then
                     local context_dir context_tmp
                     context_dir=$(dirname "$context_file")
                     mkdir -p "$context_dir"
                     chmod 700 "$context_dir" 2>/dev/null || true
-                    context_tmp=$(mktemp "$context_dir/.responses-sent-ids.XXXXXX")
-                    chmod 600 "$context_tmp"
-                    printf '%s' "$sent_ids_json" > "$context_tmp"
-                    mv -f "$context_tmp" "$context_file"
+                    context_tmp=$(mktemp "$context_dir/.responses-sent-ids.XXXXXX") \
+                        || die "could not allocate Responses acknowledgement"
+                    chmod 600 "$context_tmp" \
+                        && printf '%s' "$sent_ids_json" > "$context_tmp" \
+                        && mv -f "$context_tmp" "$context_file" \
+                        || die "could not persist Responses acknowledgement; reconciliation required"
+                fi
+                if [[ -n "$conversation" ]]; then
+                    conversation_checkpoint ready "$context_file" \
+                        || die "could not acknowledge Conversation delivery; reconciliation required"
                 fi
 
                 local terminal_response_id
@@ -1812,6 +2064,7 @@ call_llm() {
                 request_messages_json="$full_messages_json"
             fi
             fallback_used=1
+            replay_mode=1
             rm -f "$text_file" "$stderr_file" "$messages_file"
             [[ -z "$thinking_output_file" ]] || : > "$thinking_output_file"
             progress "responses continuation rejected; retrying once with exact replay context"
@@ -2277,6 +2530,9 @@ ${combined}"
     rm -f "$_prompt_tmp"
 
     local text
+    # Summaries are independent calls, never a turn in the run's Conversation.
+    unset LLM_RESPONSES_CONVERSATION LLM_PREVIOUS_RESPONSE_ID LLM_RESPONSE_FILE
+    export LLM_RESPONSES_BODY_FILE="$SHELLM_RESPONSES_BODY_FILE"
     text=$(llm -m "$summary_model" -t 2048 \
         -s "You produce concise summaries as JSON. Output only valid JSON. No markdown fences. No preamble." \
         -M "$msg_json" 2>/dev/null) || true
@@ -2346,6 +2602,67 @@ run_loop() {
     local context_files=("$@")
     local num_files=${#context_files[@]}
 
+    # Resolve the underlying provider after --model parsing, before lifecycle
+    # operations, summary generation, or the transport's adapter override.
+    if [[ -z "$_SHELLM_HOST_PROVIDER" ]]; then
+        case "$SHELLM_MODEL" in
+            claude-*) _SHELLM_HOST_PROVIDER=anthropic ;;
+            gpt-*|o1*|o3*|o4*|chatgpt-*) _SHELLM_HOST_PROVIDER=openai ;;
+            gemini-*) _SHELLM_HOST_PROVIDER=gemini ;;
+            opencode-go/*) _SHELLM_HOST_PROVIDER=opencode-go ;;
+            opencode/*) _SHELLM_HOST_PROVIDER=opencode ;;
+            */*) _SHELLM_HOST_PROVIDER=openrouter ;;
+        esac
+    fi
+    local _SHELLM_COMPACT_MODE="$SHELLM_RESPONSES_COMPACT_MODE"
+    if [[ "$_SHELLM_COMPACT_MODE" == auto ]]; then
+        _SHELLM_COMPACT_MODE=standalone
+        if [[ "$_SHELLM_HOST_PROVIDER" == openai \
+            && ( -z "$SHELLM_API_URL" || "$(_shellm_url_host "$SHELLM_API_URL")" == api.openai.com ) ]]; then
+            _SHELLM_COMPACT_MODE=server
+        fi
+    fi
+    # Conversation ownership is keyed by the effective remote route, not by
+    # the caller-selected trajectory root. Spell provider defaults explicitly
+    # so an unset URL and its equivalent configured URL contend on one lock.
+    local _SHELLM_CONVERSATION_ENDPOINT="${SHELLM_API_URL%/}"
+    case "$_SHELLM_HOST_PROVIDER:$_SHELLM_CONVERSATION_ENDPOINT" in
+        openai:) _SHELLM_CONVERSATION_ENDPOINT="https://api.openai.com/v1/responses" ;;
+        openrouter:) _SHELLM_CONVERSATION_ENDPOINT="https://openrouter.ai/api/v1/responses" ;;
+    esac
+    if [[ "$SHELLM_API_FORMAT" == responses ]]; then
+        case "$_SHELLM_HOST_PROVIDER" in
+            openai|openai-compatible|openrouter|adapter) ;;
+            *) die "Responses format is not supported for this provider" ;;
+        esac
+    fi
+    if [[ "$SHELLM_API_TRANSPORT" == websocket ]]; then
+        case "$_SHELLM_HOST_PROVIDER" in
+            openai|openai-compatible) ;;
+            *) die "SHELLM_API_TRANSPORT=websocket does not support this provider" ;;
+        esac
+        [[ -z "${LLM_OR_ONLY:-}${LLM_OR_ZDR:-}${LLM_OR_DATA_COLLECTION:-}" ]] \
+            || die "WebSocket transport does not support OpenRouter routing/privacy options"
+        [[ -z "${RESPONSES_WS_URL:-}" ]] \
+            || die "shellm WebSocket transport uses SHELLM_API_URL/LLM_API_URL, not RESPONSES_WS_URL, so lifecycle and completion share a destination"
+        if [[ -n "$SHELLM_RESPONSES_BODY_FILE" ]]; then
+            jq -e --arg background "$SHELLM_RESPONSES_BACKGROUND" \
+                '($background == "0" or .background == null or .background == false)
+                and (has("provider") | not) and (has("stream_options") | not)' \
+                "$SHELLM_RESPONSES_BODY_FILE" >/dev/null \
+                || die "WebSocket body configuration does not support background, provider, or stream_options; remove these options or use HTTPS"
+        fi
+        case "$SHELLM_RESPONSES_BACKGROUND" in
+            ""|0) ;;
+            *) die "WebSocket transport does not support background Responses" ;;
+        esac
+        export RESPONSES_WS_PROVIDER="$_SHELLM_HOST_PROVIDER"
+        # The broker validates endpoint/auth and effective body policy before
+        # exposing its socket. Pass the same configuration as each llm turn.
+        export LLM_RESPONSES_BODY_FILE="$SHELLM_RESPONSES_BODY_FILE"
+        export LLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
+    fi
+
     local rundir
     local workdir
     local messages_json
@@ -2360,6 +2677,8 @@ run_loop() {
     mkdir -p "$_run_traj_dir"
 
     local _run_traj_id _new_output run_name
+    # A conversation carried by the trajectory this run resumes.
+    local _resume_conversation=""
 
     if [[ -n "$_use_traj" ]]; then
         # --- Use existing trajectory (--traj / --resume) ---
@@ -2379,13 +2698,14 @@ run_loop() {
         # not kill the run — jq exits 5 on a parse error and set -e would
         # abort silently. The || true shields against traj tail's SIGPIPE.
         local _orig_meta
-        _orig_meta=$(traj tail -n 50 --raw --traj_dir "$_run_traj_dir" "$_use_traj" \
+        _orig_meta=$(traj cat --raw --traj_dir "$_run_traj_dir" "$_use_traj" \
             | jq -cR 'fromjson? | select(.type=="shellm-run")' 2>/dev/null | tail -1) || true
         if [[ -n "$_orig_meta" ]]; then
             local _orig_workdir _orig_env _orig_image
             _orig_workdir=$(printf '%s' "$_orig_meta" | jq -r '.workdir // empty')
             _orig_env=$(printf '%s' "$_orig_meta" | jq -r '.env.name // empty')
             _orig_image=$(printf '%s' "$_orig_meta" | jq -r '.env.docker_image // empty')
+            _resume_conversation=$(printf '%s' "$_orig_meta" | jq -r '.conversation // empty')
             [[ -z "$_SHELLM_WORKDIR_USER" && -n "$_orig_workdir" ]] && _SHELLM_WORKDIR_USER="$_orig_workdir"
             [[ -z "$_SHELLM_ENV_NAME" && -n "$_orig_env" ]] && _SHELLM_ENV_NAME="$_orig_env"
             SHELLM_DOCKER_IMAGE=$(_resume_docker_image \
@@ -2598,6 +2918,146 @@ run_loop() {
         _ctx_files_json=$(printf '%s' "$_ctx_files_json" | jq --arg f "$_cf" '. + [$f]')
     done
 
+    # Install early cleanup before starting the broker or taking a durable
+    # Conversation lock. Later startup failures must release our own lock.
+    _cleanup_rundir="$rundir"
+    _SHELLM_CONVERSATION_LOCK=""
+    early_responses_cleanup() {
+        release_conversation_lock
+        if [[ -n "${_SHELLM_WS_PID:-}" ]]; then
+            "$_SHELLM_WS_TOOL" stop --socket "$_SHELLM_WS_SOCKET" >/dev/null 2>&1 || true
+            kill "$_SHELLM_WS_PID" 2>/dev/null || true
+        fi
+        rm -rf "$_cleanup_rundir"
+    }
+    trap early_responses_cleanup EXIT
+
+    # Start/validate transport BEFORE any Conversation create or model call.
+    if [[ "$SHELLM_API_TRANSPORT" == "websocket" ]]; then
+        local _ws_tool
+        _ws_tool=$(resolve_shellm_tool_path "$_SHELLM_SCRIPT_PATH" "responses-ws" || true)
+        [[ -n "$_ws_tool" ]] \
+            || die "SHELLM_API_TRANSPORT=websocket needs tools/responses-ws, which was not found next to bin/shellm"
+        if head -n 1 "$_ws_tool" | grep -q 'uv run'; then
+            command -v uv >/dev/null 2>&1 \
+                || die "WebSocket transport requires uv; install uv or select SHELLM_API_TRANSPORT=https"
+        fi
+        _SHELLM_WS_SOCKET="$rundir/.responses-ws.sock"
+        _SHELLM_WS_TOOL="$_ws_tool"
+        "$_ws_tool" serve --socket "$_SHELLM_WS_SOCKET" \
+            > "$rundir/.responses-ws.log" 2>&1 &
+        _SHELLM_WS_PID=$!
+        local _ws_wait=0
+        while [[ ! -e "$_SHELLM_WS_SOCKET" && "$_ws_wait" -lt 60 ]]; do
+            kill -0 "$_SHELLM_WS_PID" 2>/dev/null || break
+            sleep 0.5
+            _ws_wait=$((_ws_wait + 1))
+        done
+        [[ -e "$_SHELLM_WS_SOCKET" ]] \
+            || die "responses-ws broker failed configuration/startup validation"
+        export LLM_PROVIDER=adapter
+        export LLM_ADAPTER="$_ws_tool"
+        export RESPONSES_WS_SOCKET="$_SHELLM_WS_SOCKET"
+    fi
+
+    # Resolve the conversation before the header row, because the row is where
+    # the id becomes durable. "new" means one per run, except on a resume of a
+    # run that already has one: reusing it is the whole point of recording it.
+    # A literal id always wins, so an operator can redirect a resumed run.
+    local _run_conversation=""
+    # Empty/unset and "new" both reuse the latest header's Conversation on
+    # --resume/--traj. Use a different literal id to intentionally redirect.
+    if [[ "$SHELLM_API_FORMAT" == responses && -z "$SHELLM_RESPONSES_CONVERSATION" ]]; then
+        SHELLM_RESPONSES_CONVERSATION="$_resume_conversation"
+    fi
+    if [[ -n "$SHELLM_RESPONSES_CONVERSATION" \
+        && -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" && "$_SHELLM_COMPACT_MODE" == standalone ]]; then
+        die "Conversation compaction requires declared server support (SHELLM_RESPONSES_COMPACT_MODE=server)"
+    fi
+    if [[ -n "$SHELLM_RESPONSES_CONVERSATION" ]]; then
+        if [[ "$SHELLM_RESPONSES_CONVERSATION" != "new" ]]; then
+            _run_conversation="$SHELLM_RESPONSES_CONVERSATION"
+        elif [[ -n "$_resume_conversation" ]]; then
+            _run_conversation="$_resume_conversation"
+            progress "Reusing conversation $_run_conversation from the resumed run"
+        else
+            local _conv_tool _conv_json _conv_err
+            _conv_tool=$(resolve_shellm_tool_path "$_SHELLM_SCRIPT_PATH" "responses" || true)
+            [[ -n "$_conv_tool" ]] \
+                || die "SHELLM_RESPONSES_CONVERSATION=new needs bin/responses, which was not found next to bin/shellm"
+            _conv_err=$(mktemp)
+            _conv_json=$("$_conv_tool" conversations create --provider "$_SHELLM_HOST_PROVIDER" \
+                --metadata "$(jq -nc --arg run "$_run_traj_id" '{shellm_run: $run}')" \
+                2>"$_conv_err") || {
+                local _conv_msg=""
+                [[ -s "$_conv_err" ]] && _conv_msg=$(tail -c 500 "$_conv_err")
+                rm -f "$_conv_err"
+                die "could not create a Responses conversation: $_conv_msg"
+            }
+            rm -f "$_conv_err"
+            _run_conversation=$(printf '%s' "$_conv_json" | jq -r '.id // empty')
+            [[ -n "$_run_conversation" ]] \
+                || die "responses conversations create returned no conversation id"
+            progress "Created conversation $_run_conversation"
+        fi
+    fi
+
+    local SHELLM_CONVERSATION_CHECKPOINT=""
+    local SHELLM_RESPONSES_CONVERSATION_ID="$_run_conversation"
+    local _SHELLM_CONVERSATION_TRAJECTORY=""
+    if [[ -n "$_run_conversation" ]]; then
+        [[ "$_run_conversation" =~ ^conv_[A-Za-z0-9_-]+$ ]] \
+            || die "invalid Conversation id returned or configured"
+        _SHELLM_CONVERSATION_TRAJECTORY=$(traj show "$_run_traj_id" --traj_dir "$_run_traj_dir" \
+            | sed -n 's/^File:[[:space:]]*//p')
+        [[ -f "$_SHELLM_CONVERSATION_TRAJECTORY" ]] || die "cannot resolve Conversation trajectory"
+        _SHELLM_CONVERSATION_TRAJECTORY=$(realpath "$_SHELLM_CONVERSATION_TRAJECTORY")
+        local _ack_dir="$_run_traj_dir/.responses-conversations" _lock_path
+        ( umask 077; mkdir -p "$_ack_dir" )
+        chmod 700 "$_ack_dir"
+        # Checkpoints remain trajectory-bound, but the ownership lock lives in
+        # the canonical state home. Hash the route because endpoints may carry
+        # unsafe path/query bytes (and credentials must never appear in names).
+        local _lock_root="$_shellm_home/run/responses-conversations"
+        local _lock_identity _lock_digest
+        ( umask 077; mkdir -p "$_lock_root" )
+        chmod 700 "$_lock_root"
+        _lock_identity=$(jq -nc --arg provider "$_SHELLM_HOST_PROVIDER" \
+            --arg endpoint "$_SHELLM_CONVERSATION_ENDPOINT" \
+            --arg conversation "$_run_conversation" \
+            '[$provider,$endpoint,$conversation]')
+        if command -v sha256sum >/dev/null 2>&1; then
+            _lock_digest=$(printf '%s' "$_lock_identity" | sha256sum)
+        elif command -v shasum >/dev/null 2>&1; then
+            _lock_digest=$(printf '%s' "$_lock_identity" | shasum -a 256)
+        else
+            die "Conversation locking requires sha256sum or shasum"
+        fi
+        _lock_digest=${_lock_digest%%[[:space:]]*}
+        _lock_path="$_lock_root/$_run_conversation-$_lock_digest.lock"
+        ( umask 077; mkdir "$_lock_path" ) 2>/dev/null \
+            || die "Conversation is locked by another run or a crash; reconcile before reuse"
+        _SHELLM_CONVERSATION_LOCK="$_lock_path"
+        SHELLM_CONVERSATION_CHECKPOINT="$_ack_dir/$_run_conversation.json"
+        if [[ -e "$SHELLM_CONVERSATION_CHECKPOINT" ]]; then
+            jq -e --arg conv "$_run_conversation" --arg traj "$_SHELLM_CONVERSATION_TRAJECTORY" \
+                --arg provider "$_SHELLM_HOST_PROVIDER" --arg endpoint "$_SHELLM_CONVERSATION_ENDPOINT" \
+                '.version == 1 and .state == "ready" and .conversation == $conv
+                 and .trajectory == $traj and .provider == $provider and .endpoint == $endpoint
+                 and (.sent | type == "object") and ([.sent[] | . == true] | all)' \
+                "$SHELLM_CONVERSATION_CHECKPOINT" >/dev/null 2>&1 \
+                || die "Conversation checkpoint is ambiguous or belongs to another trajectory/provider; reconcile before reuse"
+        elif jq -neR --arg conv "$_run_conversation" \
+            'any(inputs | fromjson?; .type == "shellm-run" and .conversation == $conv)' \
+            < "$_SHELLM_CONVERSATION_TRAJECTORY" >/dev/null; then
+            die "Conversation acknowledgement is missing; reconcile before reuse or choose a different Conversation"
+        else
+            ( umask 077; printf '{}' > "$rundir/.initial-sent.json" )
+            conversation_checkpoint ready "$rundir/.initial-sent.json" \
+                || die "could not initialize Conversation acknowledgement"
+        fi
+    fi
+
     # Write shellm-run step
     local _shellm_run_json
     _shellm_run_json=$(jq -nc \
@@ -2606,6 +3066,7 @@ run_loop() {
         --arg model "$SHELLM_MODEL" \
         --arg effort "$SHELLM_EFFORT" \
         --arg api_format "$SHELLM_API_FORMAT" \
+        --arg conversation "$_run_conversation" \
         --arg max_iter "${SHELLM_MAX_ITERATIONS:-}" \
         --arg max_tok "${SHELLM_MAX_TOKENS:-}" \
         --arg inactivity_timeout "$SHELLM_INACTIVITY_TIMEOUT" \
@@ -2616,6 +3077,7 @@ run_loop() {
         --arg launched_by "${SHELLM_LAUNCHED_BY:-}" \
         --arg wake "${SHELLM_WAKE:-}" \
         '{type:"shellm-run", command:$cmd, workdir:$wd, model:$model, effort:$effort, api_format:$api_format, max_iterations:$max_iter, max_tokens:$max_tok, inactivity_timeout:$inactivity_timeout, context_files:$ctx, env:$env, resumed:$resumed}
+         + (if $conversation == "" then {} else {conversation: $conversation} end)
          + (if $trigger == "" then {} else {trigger_step: $trigger} end)
          + (if $launched_by == "" then {} else {launched_by: $launched_by} end)
          + (if $wake == "" then {} else {wake: $wake} end)')
@@ -2625,9 +3087,10 @@ run_loop() {
     local _run_step_id _prompt_step_id=""
     _run_step_id=$(printf '%s' "$_shellm_run_json" | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id")
 
-    # Responses continuation belongs to this process only. A resumed shellm
-    # starts a fresh chain from its trajectory; remote response IDs and exact
-    # output-item replay state disappear with rundir at process cleanup.
+    # Non-Conversation continuation belongs to this process only. A resumed
+    # shellm starts a fresh chain from its trajectory; remote response IDs and
+    # exact output-item replay disappear with rundir. Conversation sent-step
+    # acknowledgements instead survive in the private checkpoint above.
     local SHELLM_RESPONSE_FILE=""
     local SHELLM_RESPONSE_ID_FILE=""
     local SHELLM_RESPONSES_DISABLED_FILE=""
@@ -2636,20 +3099,31 @@ run_loop() {
     local SHELLM_RESPONSES_STATELESS=0
     if [[ "$SHELLM_API_FORMAT" == "responses" ]]; then
         SHELLM_RESPONSE_FILE="$rundir/.last_response.json"
-        SHELLM_RESPONSE_ID_FILE="$rundir/.response-id"
-        SHELLM_RESPONSES_DISABLED_FILE="$rundir/.continuation-disabled"
-        SHELLM_RESPONSES_REPLAY_FILE="$rundir/.responses-replay.json"
         SHELLM_RESPONSES_CONTEXT_FILE="$rundir/.responses-sent-ids.json"
-        ( umask 077; printf '[]' > "$SHELLM_RESPONSES_REPLAY_FILE" )
-        chmod 600 "$SHELLM_RESPONSES_REPLAY_FILE"
+        if [[ -n "$_run_conversation" ]]; then
+            # The conversation holds the history, so none of the local chain
+            # applies: no response id to carry, no replay to keep, and no
+            # fallback, because the operator asked for durable server state
+            # and there is nothing safe to quietly downgrade to.
+            SHELLM_RESPONSES_CONVERSATION_ID="$_run_conversation"
+            ( umask 077; jq '.sent' "$SHELLM_CONVERSATION_CHECKPOINT" > "$SHELLM_RESPONSES_CONTEXT_FILE" )
+        else
+            SHELLM_RESPONSE_ID_FILE="$rundir/.response-id"
+            SHELLM_RESPONSES_DISABLED_FILE="$rundir/.continuation-disabled"
+            SHELLM_RESPONSES_REPLAY_FILE="$rundir/.responses-replay.json"
+            ( umask 077; printf '[]' > "$SHELLM_RESPONSES_REPLAY_FILE" )
+            chmod 600 "$SHELLM_RESPONSES_REPLAY_FILE"
 
-        # OpenRouter documents /responses as stateless: store=true and a
-        # non-null previous_response_id are rejected. Native OpenAI and
-        # generic compatible endpoints optimistically use continuation and
-        # fall back to this same exact replay chain when needed.
-        if [[ "${LLM_PROVIDER:-}" == "openrouter" \
-            || ( -z "${LLM_PROVIDER:-}" && "$SHELLM_MODEL" == */* ) ]]; then
-            SHELLM_RESPONSES_STATELESS=1
+            # OpenRouter documents /responses as stateless: store=true and a
+            # non-null previous_response_id are rejected. Native OpenAI and
+            # generic compatible endpoints optimistically use continuation and
+            # fall back to this same exact replay chain when needed.
+            if [[ "$_SHELLM_HOST_PROVIDER" == openrouter \
+                || ( "$_SHELLM_COMPACT_MODE" == standalone && -n "$SHELLM_RESPONSES_COMPACT_THRESHOLD" ) ]] \
+                || { [[ -n "$SHELLM_RESPONSES_BODY_FILE" ]] \
+                     && jq -e '.store == false' "$SHELLM_RESPONSES_BODY_FILE" >/dev/null; }; then
+                SHELLM_RESPONSES_STATELESS=1
+            fi
         fi
     fi
 
@@ -2690,6 +3164,22 @@ run_loop() {
     _cleanup_ctx_pid="${_ctx_summary_pid:-}"
     cleanup() {
         stop_activity_beacon
+        release_conversation_lock
+        # Stop the WebSocket broker before rundir goes, so it can unlink its
+        # own socket and close the upstream connection rather than being
+        # killed with a response still in flight.
+        if [[ -n "${_SHELLM_WS_SOCKET:-}" ]]; then
+            [[ -n "${_SHELLM_WS_TOOL:-}" ]] \
+                && "$_SHELLM_WS_TOOL" stop --socket "$_SHELLM_WS_SOCKET" >/dev/null 2>&1
+            if [[ -n "${_SHELLM_WS_PID:-}" ]]; then
+                local _ws_grace=0
+                while kill -0 "$_SHELLM_WS_PID" 2>/dev/null && [[ "$_ws_grace" -lt 5 ]]; do
+                    sleep 1
+                    _ws_grace=$((_ws_grace + 1))
+                done
+                kill "$_SHELLM_WS_PID" 2>/dev/null || true
+            fi
+        fi
         # Give run-summary background process time to finish
         if [[ -n "$_cleanup_ctx_pid" ]] && kill -0 "$_cleanup_ctx_pid" 2>/dev/null; then
             local _ctx_wait=0
@@ -2771,7 +3261,15 @@ run_loop() {
                 --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")
             [[ -n "$_prompt_step_id" ]] && _ctx_args+=(--pin "$_prompt_step_id")
         fi
-        messages_json=$(context "${_ctx_args[@]}" 2>/dev/null) || messages_json='[]'
+        if ! messages_json=$(context "${_ctx_args[@]}" 2>/dev/null); then
+            # A Conversation has no replay fallback: dispatching after a
+            # failed render would send none of the newly appended rows while
+            # leaving the ready acknowledgement unchanged. Keep that evidence
+            # and stop before call_llm can mark delivery in flight.
+            [[ -z "$_run_conversation" ]] \
+                || die "could not render Conversation context; no model call was dispatched"
+            messages_json='[]'
+        fi
 
         # Call Claude (capture thinking/reasoning to file)
         local thinking_file="$rundir/.last_thinking"
@@ -2946,7 +3444,11 @@ exit \$__shellm_rc
             # The generic openai-compatible provider is configured entirely by
             # env (never auto-detected), so llm calls inside generated code
             # need these two like they need the vendor keys above/below.
-            LLM_PROVIDER="${LLM_PROVIDER:-}"
+            # The run's own provider, not the websocket override: the broker's
+            # unix socket is on the host and a nested llm inside the sandbox
+            # cannot reach it, so sandboxed calls take the ordinary HTTPS
+            # Responses path.
+            LLM_PROVIDER="$_SHELLM_HOST_PROVIDER"
             LLM_API_KEY="${LLM_API_KEY:-}"
             SHELLM_MODEL="$SHELLM_MODEL"
             SHELLM_MAX_TOKENS="$SHELLM_MAX_TOKENS"
@@ -2957,6 +3459,15 @@ exit \$__shellm_rc
             LLM_API_FORMAT="$SHELLM_API_FORMAT"
             SHELLM_RESPONSES_BODY_FILE="$SHELLM_RESPONSES_BODY_FILE"
             LLM_RESPONSES_BODY_FILE="$SHELLM_RESPONSES_BODY_FILE"
+            SHELLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
+            LLM_RESPONSES_BACKGROUND="$SHELLM_RESPONSES_BACKGROUND"
+            # Child calls have independent context. Sharing the parent's
+            # Conversation would mutate server state behind its checkpoint.
+            SHELLM_RESPONSES_CONVERSATION=""
+            LLM_RESPONSES_CONVERSATION=""
+            LLM_PREVIOUS_RESPONSE_ID=""
+            LLM_RESPONSE_FILE=""
+            SHELLM_API_TRANSPORT=https
             SHELLM_API_URL="$execution_api_url"
             LLM_API_URL="$execution_api_url"
             SHELLM_DOCKER_IMAGE="$SHELLM_DOCKER_IMAGE"

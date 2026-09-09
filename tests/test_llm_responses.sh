@@ -405,23 +405,70 @@ else
 fi
 
 printf '{"background":true}' > "$WORK/body.json"
+reset
+export CURL_MODE=stream-completed
 LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
-    "$LLM" --provider openai -m gpt-5.4-mini "no" >"$WORK/stdout" 2>"$WORK/stderr"
+    "$LLM" --provider openai -m gpt-5.4-mini "yes" >"$WORK/stdout" 2>"$WORK/stderr"
 rc=$?
-if [[ "$rc" -ne 0 ]] && grep -q 'background responses require lifecycle operations' "$WORK/stderr"; then
-    ok "background Responses are rejected until lifecycle support exists"
+if [[ "$rc" -eq 0 ]] && jq -e '.background == true' "$CURL_PAYLOAD" >/dev/null; then
+    ok "background:true in the body file rides the create (tests/test_llm_responses_background.sh has the lifecycle)"
 else
-    bad "background Responses are rejected until lifecycle support exists" "rc=$rc stderr=$(cat "$WORK/stderr")"
+    bad "background:true in the body file rides the create (tests/test_llm_responses_background.sh has the lifecycle)" "rc=$rc payload=$(jq -c . "$CURL_PAYLOAD" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
 fi
 
+# A Conversation is the other way to carry state: on its own it rides the
+# create, and the two ways are refused together.
+reset
+export CURL_MODE=buffered-completed
 printf '{"conversation":"conv_123"}' > "$WORK/body.json"
 LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
-    "$LLM" --provider openai -m gpt-5.4-mini "no" >"$WORK/stdout" 2>"$WORK/stderr"
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "yes" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
 rc=$?
-if [[ "$rc" -ne 0 ]] && grep -q 'conversation state cannot be combined' "$WORK/stderr"; then
-    ok "conversation state is rejected before continuation can conflict"
+if [[ "$rc" -eq 0 ]] \
+    && jq -e '.conversation == "conv_123" and (has("previous_response_id") | not)' \
+        "$CURL_PAYLOAD" >/dev/null; then
+    ok "a body-file conversation rides the create on its own"
 else
-    bad "conversation state is rejected before continuation can conflict" "rc=$rc stderr=$(cat "$WORK/stderr")"
+    bad "a body-file conversation rides the create on its own" "rc=$rc payload=$(jq -c . "$CURL_PAYLOAD" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+reset
+LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
+LLM_RESPONSES_CONVERSATION="conv_env" \
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "yes" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 ]] && jq -e '.conversation == "conv_env"' "$CURL_PAYLOAD" >/dev/null; then
+    ok "LLM_RESPONSES_CONVERSATION owns the body file's conversation"
+else
+    bad "LLM_RESPONSES_CONVERSATION owns the body file's conversation" "rc=$rc payload=$(jq -c . "$CURL_PAYLOAD" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+reset
+LLM_API_FORMAT=responses LLM_RESPONSES_CONVERSATION="conv_env" \
+LLM_PREVIOUS_RESPONSE_ID="resp_previous" \
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "no" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && ! -s "$CURL_CALLS" ]] \
+    && grep -q 'conversation and previous_response_id cannot both be set' "$WORK/stderr"; then
+    ok "conversation and previous_response_id are refused as a pair before curl"
+else
+    bad "conversation and previous_response_id are refused as a pair before curl" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+reset
+LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
+LLM_PREVIOUS_RESPONSE_ID="resp_previous" \
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "no" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && ! -s "$CURL_CALLS" ]] \
+    && grep -q 'conversation and previous_response_id cannot both be set' "$WORK/stderr"; then
+    ok "a body-file conversation conflicts with LLM_PREVIOUS_RESPONSE_ID too"
+else
+    bad "a body-file conversation conflicts with LLM_PREVIOUS_RESPONSE_ID too" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
 fi
 
 # OpenRouter has its own Responses endpoint but remains a separate stateless
@@ -510,6 +557,67 @@ else
     fi
 fi
 chmod 700 "$WORK/locked"
+
+# Compaction. LLM_RESPONSES_COMPACT_THRESHOLD owns context_management when it
+# is set; otherwise whatever the body file says stands.
+reset
+export CURL_MODE=buffered-completed
+LLM_RESPONSES_COMPACT_THRESHOLD=200000 \
+    run_openai --no-stream "compact me" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 ]] && jq -e '
+    (.context_management | length) == 1 and
+    .context_management[0].type == "compaction" and
+    .context_management[0].compact_threshold == 200000
+' "$CURL_PAYLOAD" >/dev/null; then
+    ok "LLM_RESPONSES_COMPACT_THRESHOLD adds a compaction context_management entry"
+else
+    bad "LLM_RESPONSES_COMPACT_THRESHOLD adds a compaction context_management entry" "rc=$rc payload=$(jq -c .context_management "$CURL_PAYLOAD" 2>/dev/null)"
+fi
+
+reset
+cat > "$WORK/compact-body.json" <<'JSON'
+{"context_management":[{"type":"compaction","compact_threshold":50000}]}
+JSON
+LLM_RESPONSES_BODY_FILE="$WORK/compact-body.json" \
+    run_openai --no-stream "body owns it" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 ]] \
+   && jq -e '.context_management[0].compact_threshold == 50000' "$CURL_PAYLOAD" >/dev/null; then
+    ok "a body-file context_management survives an unset compaction threshold"
+else
+    bad "a body-file context_management survives an unset compaction threshold" "rc=$rc payload=$(jq -c .context_management "$CURL_PAYLOAD" 2>/dev/null)"
+fi
+
+reset
+LLM_RESPONSES_BODY_FILE="$WORK/compact-body.json" LLM_RESPONSES_COMPACT_THRESHOLD=9000 \
+    run_openai --no-stream "env wins" >"$WORK/stdout" 2>"$WORK/stderr"
+if jq -e '(.context_management | length) == 1 and .context_management[0].compact_threshold == 9000' \
+        "$CURL_PAYLOAD" >/dev/null; then
+    ok "an explicit compaction threshold overrides the body file"
+else
+    bad "an explicit compaction threshold overrides the body file" "payload=$(jq -c .context_management "$CURL_PAYLOAD" 2>/dev/null)"
+fi
+
+reset
+LLM_RESPONSES_COMPACT_THRESHOLD=0 \
+    run_openai --no-stream "bad threshold" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && ! -e "$CURL_CALLS" ]] \
+   && grep -q 'Invalid LLM_RESPONSES_COMPACT_THRESHOLD' "$WORK/stderr"; then
+    ok "a non-positive compaction threshold fails before any request"
+else
+    bad "a non-positive compaction threshold fails before any request" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+reset
+LLM_RESPONSES_COMPACT_THRESHOLD=200000 LLM_API_FORMAT=chat \
+    "$LLM" --provider openai -m gpt-5.4-mini --no-stream "chat" >"$WORK/stdout" 2>"$WORK/stderr"
+if grep -q 'LLM_RESPONSES_COMPACT_THRESHOLD ignored' "$WORK/stderr"; then
+    ok "a compaction threshold under chat format says it is ignored"
+else
+    bad "a compaction threshold under chat format says it is ignored" "stderr=$(cat "$WORK/stderr")"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

@@ -72,6 +72,9 @@ jobs:
         # image; uuidgen (uuid-runtime) is installed explicitly so a nested
         # shellm run never depends on the image's package set.
         run: sudo apt-get install -y -qq uuid-runtime >/dev/null
+      - uses: astral-sh/setup-uv@v7
+        # tools/responses-ws is a uv script (websockets); its test requires
+        # uv so the WebSocket transport cannot silently remain unexercised.
       - name: Run tests/test_*.sh
         run: tests/run-all.sh
 
@@ -171,6 +174,7 @@ jobs:
         run: |
           brew list coreutils >/dev/null 2>&1 || brew install -q coreutils
           brew list jq >/dev/null 2>&1 || brew install -q jq
+          brew list uv >/dev/null 2>&1 || brew install -q uv
       - name: Make Apple's /bin/bash the `bash` on PATH
         # The image also has Homebrew bash 5 on PATH, which would hide every
         # 3.2 problem. A shim dir ahead of everything else makes `bash` and
@@ -274,7 +278,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      LOC_LIMIT: 11000
+      LOC_LIMIT: 12000
     steps:
       - uses: actions/checkout@v5
       - name: Install cloc

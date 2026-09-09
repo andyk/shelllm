@@ -47,6 +47,8 @@ make_install() {  # make_install <home>
     local home="$1" app="$1/.headlong/app"
     mkdir -p "$home/.headlong" "$home/.local/bin"
     git clone -q --local "$REPO" "$app" 2>/dev/null || { bad "local clone"; return 1; }
+    # Exercise the working-tree inventory too, before changes are committed.
+    cp "$REPO/install.sh" "$app/install.sh"
     rm -rf "$app/tui"   # no cargo build in a test
     ( cd "$app" && HOME="$home" HEADLONG_HOME="$home/.headlong" PREFIX="$home/.local/bin" \
         bash install.sh --symlinks --no-init >/dev/null 2>&1 ) || { bad "install.sh --symlinks"; return 1; }
@@ -61,6 +63,7 @@ make_install() {  # make_install <home>
 H1="$WORK/h1"
 make_install "$H1" || exit 1
 check "fixture: tools linked"            test -L "$H1/.local/bin/shellm"
+check "fixture: optional adapter linked" test -L "$H1/.local/bin/responses-ws"
 check "fixture: persona link"            test -L "$H1/.local/bin/ada"
 check "fixture: skills"                  test -d "$H1/.skills/core-skills"
 check "fixture: thinker templates"       test -d "$H1/.headlong-thinkers"
@@ -96,6 +99,7 @@ out=$(run_uninstall "$H1" --yes --no-stop 2>&1); rc=$?
 check "uninstall --yes exits 0"                  test "$rc" -eq 0
 check "state home gone"                          test ! -e "$H1/.headlong"
 check "tool links gone"                          test ! -e "$H1/.local/bin/shellm" -a ! -L "$H1/.local/bin/shellm"
+check "optional adapter link gone"               test ! -e "$H1/.local/bin/responses-ws" -a ! -L "$H1/.local/bin/responses-ws"
 check "persona link gone"                        test ! -L "$H1/.local/bin/ada"
 check "all our entries gone from prefix"         bash -c '[[ -z "$(ls -A "$1" 2>/dev/null)" ]]' _ "$H1/.local/bin"
 check "skills gone"                              test ! -e "$H1/.skills/core-skills"
@@ -122,6 +126,7 @@ check "--delete-identities: state home gone"     test ! -e "$H2/.headlong"
 H3="$WORK/h3"; CLONE="$WORK/myclone"
 mkdir -p "$H3/.local/bin"
 git clone -q --local "$REPO" "$CLONE" 2>/dev/null || { bad "clone for h3"; exit 1; }
+cp "$REPO/install.sh" "$CLONE/install.sh"
 rm -rf "$CLONE/tui"
 ( cd "$CLONE" && HOME="$H3" HEADLONG_HOME="$H3/.headlong" PREFIX="$H3/.local/bin" bash install.sh --symlinks --no-init >/dev/null 2>&1 ) || { bad "install from own clone"; exit 1; }
 ( cd "$CLONE" && HOME="$H3" PATH="$CLONE/bin:$CLONE/tools:$PATH" identity new bob --default >/dev/null 2>&1 ) || { bad "identity new bob"; exit 1; }

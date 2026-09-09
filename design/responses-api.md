@@ -13,7 +13,11 @@ This change covers synchronous buffered and SSE response creation, including
 reasoning summaries, function call items and outputs, structured and
 multimodal input items, terminal status and errors, usage, and continuation.
 Response retrieval/deletion/cancellation, input-item listing, Conversations,
-background responses, and WebSocket mode are separate lifecycle work.
+and WebSocket mode are separate lifecycle work (design/responses-lifecycle.md).
+Background responses live in `bin/llm` because the caller still receives one
+terminal object per call: llm polls or resumes the stream itself and cancels
+the job best effort when it is killed or out of time; the contract is in that
+document. Cancellation requests do not guarantee server settlement.
 
 ## Wire contract
 
@@ -32,8 +36,10 @@ background responses, and WebSocket mode are separate lifecycle work.
 - `LLM_RESPONSES_BODY_FILE` may name a JSON object containing other synchronous
   create fields. `bin/llm` owns and overwrites `model`, `input`, `instructions`,
   `max_output_tokens`, `stream`, and `previous_response_id` so command-line and
-  continuation semantics remain deterministic. Conversation state is rejected
-  because it conflicts with this continuation contract.
+  continuation semantics remain deterministic. A body-file `conversation` or
+  `LLM_RESPONSES_CONVERSATION` selects Conversation state instead, and cannot be
+  combined with `LLM_PREVIOUS_RESPONSE_ID`. Shellm requires its dedicated
+  `SHELLM_RESPONSES_CONVERSATION` setting rather than a body-file Conversation.
 - Every create requests `reasoning.encrypted_content`, preserving exact
   reasoning-item replay for stateless and Zero Data Retention paths while
   retaining any other caller-supplied `include` values.
@@ -77,6 +83,13 @@ explicit replay fallback. A known response, terminal failure, or typed unknown
 outcome cannot enter that fallback merely because its diagnostic mentions a
 previous response. This decision does not depend on visible text alone.
 
+The fork's background Responses may be retrieved/resumed, not recreated. One
+absolute `LLM_MAX_TIME` budget covers create, polling, reconnects, and backoff,
+plus up to five additional seconds for best-effort cancellation. Confirmation
+requires the same response ID and a terminal status; otherwise the unknown-
+outcome sidecar and known ID remain available for reconciliation. See
+[the lifecycle contract](responses-lifecycle.md#background-responses-binllm).
+
 `LLM_STOP_AFTER_CODE_BLOCK` keeps its contract in Responses mode: the stream
 is cut when the first fenced block closes and the cut is a clean finish. The
 terminal event never arrives, so no sidecar is written and usage is estimated.
@@ -85,7 +98,8 @@ continuation needs the terminal object.
 
 ## shellm continuation
 
-Responses mode keeps completion state only for the current `shellm` process:
+Without Conversation mode, Responses keeps completion state only for the current
+`shellm` process:
 
 1. The first call sends the trajectory-derived context in full.
 2. Later calls send only newly appended user-side context plus the stable
@@ -108,13 +122,22 @@ Responses mode keeps completion state only for the current `shellm` process:
 5. A resumed process starts a new chain from the durable trajectory. Remote
    response IDs are not persisted as durable trajectory state.
 
+Conversation mode instead restores local atomic mode-0600 sent-step checkpoints
+and holds a local exclusive lock for the whole run. Ambiguous delivery and
+stale locks fail closed without automatic stealing; this is not fsync-backed
+power-loss durability or distributed coordination. See
+[Conversations](responses-lifecycle.md#conversations) for resume and ownership.
+
 `SHELLM_RESPONSES_BODY_FILE` is mounted read-only into the Docker sandbox at
 its host path, so nested `llm` and `shellm` calls inside the container read
 the same file.
 
-OpenRouter's Responses endpoint is stateless and therefore starts directly in
-replay mode. Native OpenAI and generic compatible endpoints use automatic
-stateful continuation with the safe replay fallback.
+OpenRouter's Responses endpoint and explicit `store:false` start directly in
+replay mode. Otherwise native OpenAI and generic compatible endpoints use
+automatic stateful continuation with the safe replay fallback. Compaction
+capability is independent: native OpenAI supports server compaction with
+stateless replay; see [compaction](responses-lifecycle.md#compaction) for
+`SHELLM_RESPONSES_COMPACT_MODE=auto|server|standalone`.
 
 The existing thinking-text empty-response workaround remains the Chat
 Completions behavior. In Responses mode, an incomplete reasoning-only Response
