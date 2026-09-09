@@ -14,6 +14,25 @@ fail=0
 ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 
+# Inspect the live run and durable home, including dotfiles. A failed inspector
+# is an error, never evidence that Responses state is absent.
+cat > "$WORK/check-chat-state" <<'CHECK'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ "${LLM_API_FORMAT:-}" != chat || -n "${LLM_PREVIOUS_RESPONSE_ID:-}" \
+      || -n "${LLM_RESPONSE_FILE:-}" || -n "${LLM_RESPONSES_CONVERSATION:-}" ]]; then
+    exit 1
+fi
+[[ -d "$1" && ! -L "$1" && -d "$2" && ! -L "$2" ]] || exit 2
+if ! find "$1" "$2" \( -name .last_response.json -o -name .responses-sent-ids.json \
+    -o -name .response-id -o -name .continuation-disabled -o -name .responses-replay.json \
+    -o -name .responses-conversations -o -name responses-conversations \) -print > "$3"; then
+    exit 2
+fi
+[[ ! -s "$3" ]]
+CHECK
+chmod +x "$WORK/check-chat-state"
+
 mkdir -p "$WORK/home" "$WORK/wd"
 cp -R "$REPO/bin" "$WORK/toolbin"
 mv "$WORK/toolbin/context" "$WORK/toolbin/context.real"
@@ -260,7 +279,16 @@ case "$LLM_STUB_MODE:$n" in
         printf '%s\n' '```bash' "touch '$LLM_STUB_DIR/executed'" '```'
         ;;
     chat:1)
-        [[ -z "${LLM_RESPONSE_FILE:-}" ]] || { echo "chat unexpectedly received LLM_RESPONSE_FILE" >&2; exit 2; }
+        chat_runs=( "${TEST_CHAT_TMP_ROOT:?}"/shellm-run.* )
+        [[ "${#chat_runs[@]}" -eq 1 && -d "${chat_runs[0]}" ]] || exit 2
+        printf '%s\n' "${chat_runs[0]}" > "$LLM_STUB_DIR/chat-rundir"
+        if [[ "${TEST_CHAT_INJECT_RESPONSE_STATE:-0}" == 1 ]]; then
+            : > "${chat_runs[0]}/.response-id"
+        fi
+        "${TEST_CHAT_STATE_CHECK:?}" "${chat_runs[0]}" "$HEADLONG_HOME" "$LLM_STUB_DIR/chat-state-paths"
+        chat_state_rc=$?
+        printf '%s\n' "$chat_state_rc" > "$LLM_STUB_DIR/chat-state-rc"
+        [[ "$chat_state_rc" -eq 0 ]] || exit "$chat_state_rc"
         printf '%s\n' '```bash' 'FINAL=chat-done' '```'
         ;;
     *)
@@ -883,15 +911,92 @@ else
     bad "an id that is not a conversation is refused before the run starts" "rc=$rc stderr=$(cat "$WORK/err")"
 fi
 
-# Default chat mode does not create or pass Responses state.
-run_shellm chat chat
+# Default chat mode must be inspected in the llm stub while its run still exists.
+mkdir -p "$WORK/chat-tmp"
+TMPDIR="$WORK/chat-tmp" TEST_CHAT_TMP_ROOT="$WORK/chat-tmp" \
+    TEST_CHAT_STATE_CHECK="$WORK/check-chat-state" run_shellm chat chat
 rc=$?
 if [[ "$rc" -eq 0 && "$(cat "$WORK/stub/format-1")" == chat \
       && -z "$(cat "$WORK/stub/previous-1")" \
-      && -z "$(rg --files "$HEADLONG_HOME/trajectories" 2>/dev/null | rg '/responses/' | head -1)" ]]; then
+      && "$(cat "$WORK/stub/chat-state-rc")" == 0 ]]; then
     ok "default chat mode remains stateless"
 else
     bad "default chat mode remains stateless" "rc=$rc format=$(cat "$WORK/stub/format-1")"
+fi
+
+# A state file created in the actual live rundir must fail before cleanup hides it.
+TMPDIR="$WORK/chat-tmp" TEST_CHAT_TMP_ROOT="$WORK/chat-tmp" \
+    TEST_CHAT_STATE_CHECK="$WORK/check-chat-state" TEST_CHAT_INJECT_RESPONSE_STATE=1 \
+    run_shellm chat chat
+rc=$?
+if [[ "$rc" -ne 0 && "$(cat "$WORK/stub/chat-state-rc")" == 1 \
+      && -s "$WORK/stub/chat-state-paths" ]]; then
+    ok "chat oracle rejects an injected live Responses state file before cleanup"
+else
+    bad "chat oracle rejects an injected live Responses state file before cleanup" "rc=$rc"
+fi
+
+# Exercise the same inspector against every source-owned state name and config.
+chat_probe="$WORK/chat-oracle-control"
+mkdir -p "$chat_probe/run" "$chat_probe/home" "$chat_probe/no-tools"
+check_chat_probe() {
+    LLM_API_FORMAT="${1:-chat}" LLM_PREVIOUS_RESPONSE_ID="${2:-}" \
+        LLM_RESPONSE_FILE="${3:-}" LLM_RESPONSES_CONVERSATION="${4:-}" \
+        "$WORK/check-chat-state" "$chat_probe/run" "$chat_probe/home" "$chat_probe/found"
+}
+if check_chat_probe; then
+    ok "chat oracle accepts an inspected empty run and home"
+else
+    bad "chat oracle accepts an inspected empty run and home"
+fi
+for state_name in .last_response.json .responses-sent-ids.json .response-id \
+    .continuation-disabled .responses-replay.json; do
+    : > "$chat_probe/run/$state_name"
+    check_chat_probe
+    probe_rc=$?
+    if [[ "$probe_rc" -eq 1 ]]; then
+        ok "chat oracle rejects transient state $state_name"
+    else
+        bad "chat oracle rejects transient state $state_name" "rc=$probe_rc"
+    fi
+    rm "$chat_probe/run/$state_name"
+done
+for state_path in trajectories/.responses-conversations run/responses-conversations; do
+    mkdir -p "$chat_probe/home/$state_path"
+    check_chat_probe
+    probe_rc=$?
+    if [[ "$probe_rc" -eq 1 ]]; then
+        ok "chat oracle rejects durable state $state_path"
+    else
+        bad "chat oracle rejects durable state $state_path" "rc=$probe_rc"
+    fi
+    rm -rf "$chat_probe/home/$state_path"
+done
+for state_field in format previous response conversation; do
+    probe_format=chat; probe_previous=""; probe_response=""; probe_conversation=""
+    case "$state_field" in
+        format) probe_format=responses ;;
+        previous) probe_previous=resp_forbidden ;;
+        response) probe_response="$chat_probe/forbidden-response.json" ;;
+        conversation) probe_conversation=conv_forbidden ;;
+    esac
+    check_chat_probe "$probe_format" "$probe_previous" "$probe_response" "$probe_conversation"
+    probe_rc=$?
+    if [[ "$probe_rc" -eq 1 ]]; then
+        ok "chat oracle rejects Responses configuration $state_field"
+    else
+        bad "chat oracle rejects Responses configuration $state_field" "rc=$probe_rc"
+    fi
+done
+PATH="$chat_probe/no-tools" LLM_API_FORMAT=chat LLM_PREVIOUS_RESPONSE_ID= \
+    LLM_RESPONSE_FILE= LLM_RESPONSES_CONVERSATION= \
+    /bin/bash "$WORK/check-chat-state" "$chat_probe/run" "$chat_probe/home" "$chat_probe/found" \
+    > "$chat_probe/missing-tool.out" 2> "$chat_probe/missing-tool.err"
+probe_rc=$?
+if [[ "$probe_rc" -eq 2 ]]; then
+    ok "chat oracle fails closed when its inspection tool is unavailable"
+else
+    bad "chat oracle fails closed when its inspection tool is unavailable" "rc=$probe_rc"
 fi
 
 # Compaction in replay mode. Once a terminal response reports input tokens at
