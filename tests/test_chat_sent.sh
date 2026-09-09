@@ -64,7 +64,7 @@ msg m2 "$ME" slack-... "lost papers"                 5400
 dlv  d2 m2 failed 5399 ',"reason":"unknown slack address form"'
 msg m3 "$ME" slack-U0BFD9NDVE3 "no bridge answer yet" 3600
 msg m4 "$ME" pwa-andy "phone note"                    1800
-msg in1 slack-U0BFD9NDVE3-D0BNW58GP5W "$ME" "inbound, not ours" 900
+msg in1 slack-U095QV3JKA6-D0BNW58GP5X "$ME" "inbound, not ours" 900   # another person: must not count as an unanswered question from THEM below
 msg m5 "$ME" telegram-1-1 "tg note"                   600
 dlv  d5a m5 failed 599 ',"reason":"first try"'
 dlv  d5b m5 delivered 598
@@ -110,6 +110,8 @@ msg in3 "$THEM" "$ME" "status??" 20
 # --reply-to given explicitly: the inference path needs `timeout`, which a
 # stock Mac lacks, and the exemption is about the stamp, not how it got there.
 chat reply --reply-to in3 "$THEM" "still running" >/dev/null 2>&1 && ok "the same answer to a second question is allowed" || bad "answer exempt"
+# Every inbound from THEM is now answered, so the next reply answers nothing
+# whether inference runs (CI, the box) or not (a Mac without `timeout`).
 before=$(grep -c '"type":"message"' "$TRAJ")
 chat reply "$THEM" "still running" >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 && $(grep -c '"type":"message"' "$TRAJ") -eq $before ]] && ok "a proactive reply (nothing left to answer) with the same text is refused" || bad "proactive reply refused" "rc=$rc"
