@@ -106,7 +106,7 @@ class DurableJobs(unittest.TestCase):
         self.env = dict(os.environ, IDENTITY_DIR=str(self.identity), JOB_TEST_TOOL=str(JOBS),
                         PATH=str(REPO / "bin") + os.pathsep + os.environ["PATH"], HEADLONG_JOBS_MAX_CONCURRENT="4",
                         HEADLONG_JOB_CANCEL_GRACE="0.2", HEADLONG_HOME=str(self.identity / "framework-home"),
-                        LLM_USAGE_LEDGER=str(self.identity / "usage.jsonl"))
+                        LLM_USAGE_LEDGER=str(self.identity / "usage.jsonl"), TMPDIR=self.temp.name)
         self.handler = Path(self.temp.name) / "handler"
         self.handler.write_text(HANDLER)
         self.handler.chmod(0o700)
