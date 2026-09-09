@@ -21,6 +21,22 @@ _require_env
 THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
 THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-20}"
 REPLY_MODEL="${MONOLITH_REPLY_MODEL:-$THINK_MODEL}"
+RESPONDER_PARTIALS_DIR="responder-partials"
+RESPONDER_PARTIAL_META_FILE="meta.json"
+RESPONDER_PARTIAL_CONTENT_FILE="content.txt"
+
+partial_dir=""
+partial_content_file=""
+
+_partial_key() {
+    printf '%s' "$1" | sed -E 's/[^A-Za-z0-9_-]/_/g'
+}
+
+_partial_cleanup() {
+    [[ -n "$partial_dir" && -d "$partial_dir" ]] || return 0
+    find "$partial_dir" -type f -delete 2>/dev/null || true
+    find "$partial_dir" -depth -type d -delete 2>/dev/null || true
+}
 
 # Wall-clock milliseconds, for compose_ms. Same perl path bin/traj uses for
 # its timestamps; the fallback is whole seconds, still a valid number.
@@ -112,6 +128,30 @@ jq -nc \
     '{type:"reply_claim", content:("handling reply to " + $from), source:$source}
      + (if $trigger == "" then {} else {trigger_step: $trigger} end)' \
     | traj append >/dev/null || true
+
+if [[ -n "$trigger_step_id" ]]; then
+    partial_key=$(_partial_key "$trigger_step_id")
+    partial_dir="$IDENTITY_DIR/run/$RESPONDER_PARTIALS_DIR/$partial_key"
+    partial_content_file="$partial_dir/$RESPONDER_PARTIAL_CONTENT_FILE"
+    partial_meta_file="$partial_dir/$RESPONDER_PARTIAL_META_FILE"
+    if mkdir -p "$partial_dir"; then
+        if jq -nc \
+            --arg from "$IDENTITY_NAME" \
+            --arg to "$msg_from" \
+            --arg reply_to "$trigger_step_id" \
+            '{from:$from, to:$to, reply_to:$reply_to}' \
+            > "$partial_meta_file" && : > "$partial_content_file"; then
+            trap _partial_cleanup EXIT
+        else
+            _partial_cleanup
+            partial_dir=""
+            partial_content_file=""
+        fi
+    else
+        partial_dir=""
+        partial_content_file=""
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Compose and send the reply
@@ -415,15 +455,32 @@ if [[ "${RESPONDER_LOG_PROMPT:-0}" == "1" && -n "${IDENTITY_DIR:-}" ]]; then
 fi
 
 printf '  replying to %s...\n' "$msg_from" >&2
-reply=$(llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system") || true
+llm_rc=0
+if [[ -n "$partial_content_file" ]]; then
+    set +e
+    llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system" > "$partial_content_file"
+    llm_rc=$?
+    set -e
+    reply=$(cat "$partial_content_file") || reply=""
+else
+    set +e
+    reply=$(llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system")
+    llm_rc=$?
+    set -e
+fi
 
 # Strip a leaked delivery command if a model echoes one.
 reply=$(printf '%s' "$reply" | sed -E '1s/^[[:space:]]*chat reply [A-Za-z0-9._-]+[[:space:]]*//')
+
+if [[ $llm_rc -ne 0 ]]; then
+    reply=""
+fi
 
 # The model may judge that no reply is needed.
 first_line=$(printf '%s' "$reply" | head -n 1 | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
 if [[ "$first_line" == "NO_REPLY" ]]; then
     printf '  model declined to reply (NO_REPLY)\n' >&2
+    _partial_cleanup
     _obs "Chose not to reply to $msg_from — their message needed no reply (already answered, or a bare acknowledgment). Their message was: $(printf '%.200s' "$trigger_content")" no-reply "$(_finish_metrics)"
     exit 0
 fi
@@ -454,7 +511,9 @@ fi
 
 reply_args=()
 [[ -n "$trigger_step_id" ]] && reply_args+=(--reply-to "$trigger_step_id")
-if [[ -n "$reply" ]] && printf '%s' "$reply" | chat reply ${reply_args[@]+"${reply_args[@]}"} "$msg_from"; then
+if [[ $llm_rc -eq 0 && -n "$reply" ]] \
+    && printf '%s' "$reply" | chat reply ${reply_args[@]+"${reply_args[@]}"} "$msg_from"; then
+    _partial_cleanup
     _extra=$(_finish_metrics)
     if [[ -n "$deferred_request" ]]; then
         _extra=$(printf '%s' "$_extra" | jq -c --arg r "$deferred_request" '. + {deferred: true, request: $r}')
@@ -469,4 +528,5 @@ fi
 
 # Reply failed — surface it so the monolith can pick it up.
 printf '  reply failed — appending failure observation\n' >&2
+_partial_cleanup
 _obs "reply failed: could not send a reply to $msg_from (empty model output or chat error — see responder log). Their message was: $(printf '%.200s' "$trigger_content")" reply-failed "$(_finish_metrics)"

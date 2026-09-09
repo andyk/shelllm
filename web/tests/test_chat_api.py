@@ -1,11 +1,13 @@
 """Chat conversation filter and PWA static-file route tests."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from headlong_web import chat
 from headlong_web.server import create_app
 
 ROOT_TRAJ = "ffffffff-6666-4666-8666-666666666666"
@@ -134,6 +136,150 @@ def test_chat_outcomes(client: TestClient):
     assert body["outcomes"]["m7"] == "no-reply"
     assert body["outcomes"]["m8"] == "failed"
     assert "s0" not in body["outcomes"]
+
+
+def test_chat_includes_active_partial_reply(client: TestClient, chat_identity: Path):
+    traj = chat_identity / "trajectories" / "ffffffff-root" / "trajectory.jsonl"
+    unanswered = _msg("m9", "pwa-boss", "chatty", "are you there?")
+    with traj.open("a") as stream:
+        stream.write(json.dumps(unanswered) + "\n")
+    partial = chat_identity / "run" / "responder-partials" / "m9"
+    partial.mkdir(parents=True)
+    (partial / "meta.json").write_text(
+        json.dumps({"from": "chatty", "to": "pwa-boss", "reply_to": "m9"})
+    )
+    (partial / "content.txt").write_text("partial reply")
+
+    body = client.get(
+        "/api/identities/.identities~chatty/chat", params={"with": "pwa-boss"}
+    ).json()
+
+    last = body["messages"][-1]
+    assert last == {
+        "ts": None,
+        "step_id": "partial:m9",
+        "from": "chatty",
+        "to": "pwa-boss",
+        "content": "partial reply",
+        "reply_to": "m9",
+        "filename": None,
+        "partial": True,
+    }
+
+
+def test_chat_view_omits_partial_after_final_outcome():
+    partial = {
+        "step_id": "partial:m10",
+        "from": "chatty",
+        "to": "pwa-boss",
+        "content": "ghost",
+        "reply_to": "m10",
+        "filename": None,
+        "partial": True,
+    }
+    view = chat.chat_view(
+        [
+            _msg("m10", "pwa-boss", "chatty", "question"),
+            _msg("m11", "chatty", "pwa-boss", "answer", reply_to="m10"),
+        ],
+        "chatty",
+        partials=[partial],
+    )
+
+    assert [message["step_id"] for message in view["messages"]] == ["m10", "m11"]
+
+
+def test_chat_view_keeps_partial_after_failed_outcome():
+    partial = {
+        "step_id": "partial:m10",
+        "from": "chatty",
+        "to": "pwa-boss",
+        "content": "retry draft",
+        "reply_to": "m10",
+        "filename": None,
+        "partial": True,
+    }
+    view = chat.chat_view(
+        [
+            _msg("m10", "pwa-boss", "chatty", "question"),
+            {
+                "type": "observation",
+                "step_id": "o10",
+                "content": "reply failed: transport error",
+                "trigger_step": "m10",
+            },
+        ],
+        "chatty",
+        partials=[partial],
+    )
+
+    assert [message["step_id"] for message in view["messages"]] == [
+        "m10",
+        "partial:m10",
+    ]
+
+
+def test_active_partial_replies_ignores_invalid_entries(tmp_path: Path):
+    identity = tmp_path / ".identities" / "chatty"
+    partials_root = identity / "run" / "responder-partials"
+    partials_root.mkdir(parents=True)
+    (partials_root / "not-a-dir").write_text("ignored")
+    stale = partials_root / "stale"
+    stale.mkdir()
+    (stale / "meta.json").write_text(json.dumps({"from": "chatty", "to": "pwa-boss"}))
+    stale_content = stale / "content.txt"
+    stale_content.write_text("too old")
+    os.utime(stale_content, (1, 1))
+    malformed = partials_root / "malformed"
+    malformed.mkdir()
+    (malformed / "meta.json").write_text("{")
+    (malformed / "content.txt").write_text("bad meta")
+    empty = partials_root / "empty"
+    empty.mkdir()
+    (empty / "meta.json").write_text(json.dumps({"from": "chatty", "to": "pwa-boss"}))
+    (empty / "content.txt").write_text("")
+
+    assert chat.active_partial_replies(identity, "chatty", now=400) == []
+
+
+def test_active_partial_replies_filters_and_uses_defaults(tmp_path: Path):
+    identity = tmp_path / ".identities" / "chatty"
+    current = identity / "run" / "responder-partials" / "m12"
+    current.mkdir(parents=True)
+    (current / "meta.json").write_text(json.dumps({}))
+    (current / "content.txt").write_text("draft")
+
+    assert chat.active_partial_replies(identity, "chatty", with_name="someone") == []
+    assert chat.active_partial_replies(identity, "chatty", with_name="chatty") == [
+        {
+            "ts": None,
+            "step_id": "partial:m12",
+            "from": "chatty",
+            "to": "",
+            "content": "draft",
+            "reply_to": "m12",
+            "filename": None,
+            "partial": True,
+        }
+    ]
+
+
+def test_active_partial_replies_tolerates_partial_utf8_write(tmp_path: Path):
+    identity = tmp_path / ".identities" / "chatty"
+    current = identity / "run" / "responder-partials" / "m13"
+    current.mkdir(parents=True)
+    (current / "meta.json").write_text(
+        json.dumps({"from": "chatty", "to": "pwa-boss", "reply_to": "m13"})
+    )
+    (current / "content.txt").write_bytes(b"hello \xe2")
+
+    [partial] = chat.active_partial_replies(identity, "chatty", with_name="pwa-boss")
+
+    assert partial["content"] == "hello \ufffd"
+
+
+def test_active_partial_replies_missing_root_returns_empty(tmp_path: Path):
+    assert chat.active_partial_replies(tmp_path / ".identities" / "chatty", "chatty") == []
 
 
 def test_chat_with_rejects_bad_name(client: TestClient):
