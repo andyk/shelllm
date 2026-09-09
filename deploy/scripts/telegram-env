@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # deploy/scripts/telegram-env — write /etc/shellm/telegram.env on the box.
 #
-# Usage: deploy/scripts/telegram-env [-y]
+# Usage: deploy/scripts/telegram-env [-y] [--identity NAME]
 #
 # Prompts for the bot token (hidden) and the admin's numeric Telegram user
 # id, then creates the root-owned env file the Telegram bridge reads. Run
 # deploy/scripts/update afterwards to install/restart the bridge.
+#
+# The file also pins the identity the bridge serves
+# (HEADLONG_TELEGRAM_IDENTITY, default audel). Without the pin the bridge
+# follows whatever `.identities/default` points at, and on 2026-09-08 a
+# nested test run of Audel's repointed that link to a scratch identity, so
+# the next bridge restart silently served the wrong mind and Nick's
+# Telegram messages went unanswered (2026-09-09).
 #
 # The token is prompted, not an argument, so it stays out of your shell
 # history. It does transit SSM RunCommand, whose command history is
@@ -17,10 +24,16 @@ export SHELLM_TF_STACK="${SHELLM_TF_STACK:-terraform-slack}"
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 yes=0
-case "${1:-}" in
-    -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    -y) yes=1; shift ;;
-esac
+identity=audel
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -y) yes=1; shift ;;
+        --identity) identity="${2:?--identity requires a name}"; shift 2 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+[[ "$identity" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "identity name must be [A-Za-z0-9._-]"
 
 require_tools terraform aws jq
 require_state
@@ -34,7 +47,7 @@ read -rs -p "Telegram bot token (from @BotFather, hidden): " token; echo
 read -r -p "Admin numeric Telegram user id (from @userinfobot): " admin_id
 [[ "$admin_id" =~ ^[0-9]+$ ]] || die "admin id must be digits only"
 
-info "Will write /etc/shellm/telegram.env (root:root 600) on $(instance_id) ($(region))"
+info "Will write /etc/shellm/telegram.env (root:root 600, identity $identity) on $(instance_id) ($(region))"
 if [[ "$yes" -ne 1 ]]; then
     read -r -p "Proceed? [y/N] " answer
     [[ "$answer" == y || "$answer" == Y ]] || die "aborted"
@@ -44,7 +57,7 @@ run_script_on_box "
     set -euo pipefail
     umask 077
     mkdir -p /etc/shellm
-    printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_ADMIN_ID=%s\n' '$token' '$admin_id' \
+    printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_ADMIN_ID=%s\nHEADLONG_TELEGRAM_IDENTITY=%s\n' '$token' '$admin_id' '$identity' \
         > /etc/shellm/telegram.env
     chown root:root /etc/shellm/telegram.env
     chmod 600 /etc/shellm/telegram.env

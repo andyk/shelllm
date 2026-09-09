@@ -228,6 +228,31 @@ acknowledges, the web server can write the same step.
 - `mem add` rejects a flag it does not know instead of storing it as the
   memory's first word.
 
+## Incident on the first day (2026-09-09) and what it changed
+
+Switching the Telegram bridge back from a scratch identity to Audel at 10:55
+UTC handed it a cursor written for the other trajectory (its state dir is
+shared across identities). `follow` treated the small offset as valid and
+read Audel's whole 1.5 GB log, so the bridge re-sent 130 of the 183
+historical Telegram messages to Nick before it was stopped at 11:29. Each
+send took 31 seconds because the notice writer ran `bin/traj append` as the
+bridge user, which has read-only access to the trajectory, and traj's lock
+loop spun for the whole subprocess timeout instead of failing. Three
+changes:
+
+- `mindlog.follow` (both bridges) writes `<offset> <trajectory path>` and
+  ignores a cursor for any other trajectory; a shrunk file resumes at its
+  end instead of replaying from zero. A bridge must never replay.
+- The notice writer checks that the trajectory and its directory are
+  writable before spawning traj, and after one `PermissionError` disables
+  notices for the run with a single log line. `bin/traj append` dies at
+  once when it cannot create its lock directory.
+- Because the Telegram bridge user cannot write the log by design (it keeps
+  the bot token out of the agent's reach), Telegram notices are off on the
+  box and `chat sent` shows Telegram sends as `unconfirmed`, not `pending`.
+  Giving that user append rights on the trajectory, or routing the notice
+  through the web API, would turn them on; neither is decided.
+
 ## What this does not do
 
 - It does not give recurring goals a progress log. That is a separate design.

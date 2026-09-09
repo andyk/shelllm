@@ -544,9 +544,21 @@ cmd_append() {
     # portable atomic lock primitive (macOS has no flock); it also works
     # across Docker bind mounts since it's the same filesystem path.
     local lock_dir="${traj_file}.lock"
-    local _lock_tries=0
+    local _lock_tries=0 _lock_absent=0
     until mkdir "$lock_dir" 2>/dev/null; do
         _lock_tries=$((_lock_tries + 1))
+        # mkdir failing while no lock dir exists is not contention: the
+        # directory is not writable (or gone). Spinning here hung a bridge
+        # user with read-only access for its whole timeout, per send
+        # (2026-09-09). A few retries cover the holder's rmdir racing us.
+        if [[ ! -d "$lock_dir" ]]; then
+            _lock_absent=$((_lock_absent + 1))
+            if [[ "$_lock_absent" -ge 5 ]]; then
+                die "append: cannot create lock $lock_dir (directory not writable by $(id -un 2>/dev/null || echo this user))"
+            fi
+        else
+            _lock_absent=0
+        fi
         # Every ~0.5s of spinning, steal locks older than 5s — the holder
         # was killed mid-append (e.g. thinkers stop kills process trees).
         if [[ $((_lock_tries % 50)) -eq 0 ]]; then

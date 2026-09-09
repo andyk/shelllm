@@ -682,7 +682,11 @@ cmd_pending() {
 # transport that confirms deliveries has not yet), or unconfirmed (a transport
 # with no delivery notices, e.g. the phone chat). This is the sent folder the
 # mind checks before sending again (design/outbound_delivery.md, part 5).
-_SENT_CONFIRMING_RE='^(slack|telegram)-'
+# Transports whose bridge writes delivery notices on a production box. The
+# Telegram bridge can (same code) but runs as a user with read-only access to
+# the trajectory, so on Audel's box its sends would sit "pending" forever and
+# read as a bridge outage; they are "unconfirmed" until that changes.
+_SENT_CONFIRMING_RE='^(slack)-'
 cmd_sent() {
     local since="" n=50 as_json=0
     while [[ $# -gt 0 ]]; do

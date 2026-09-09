@@ -12,4 +12,5 @@ def notices(monkeypatch):
         written.append(step)
 
     monkeypatch.setattr(outbound, "append_step", collect)
+    monkeypatch.setattr(outbound, "_notices_disabled", False)
     return written

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -193,20 +194,27 @@ def _append_step_via_traj(serve_root: Path, traj_path: Path, step: dict[str, Any
         if not found:
             raise FileNotFoundError("bin/traj not found; cannot write delivery notice")
         traj_bin = Path(found)
-    traj_dir = traj_path.parent.parent
-    traj_id = traj_path.parent.name[:8]
+    # bin/traj takes a mkdir lock beside the file, so the directory must be
+    # writable too. Fail here, not by spinning: the Telegram bridge runs as
+    # a user with read-only access to the trajectory, and its first notices
+    # each hung for the full timeout (2026-09-09).
+    if not (os.access(traj_path, os.W_OK) and os.access(traj_path.parent, os.W_OK)):
+        raise PermissionError(f"{traj_path} is not writable by this user")
     subprocess.run(
-        [str(traj_bin), "append", "--traj_dir", str(traj_dir), traj_id],
+        [str(traj_bin), "append", "--traj_dir", str(traj_path.parent.parent), traj_path.parent.name[:8]],
         input=json.dumps(step),
         text=True,
         check=True,
         capture_output=True,
-        timeout=30,
+        timeout=10,
     )
 
 
 # Tests replace this with a collector; production writes through bin/traj.
 append_step = _append_step_via_traj
+# Set after the first PermissionError so a bridge that cannot write the log
+# says so once and stops trying, instead of paying a timeout per send.
+_notices_disabled = False
 
 
 def _notice(
@@ -243,8 +251,14 @@ def _notice(
     for key, value in fields.items():
         if value is not None and value != "":
             record[key] = value
+    global _notices_disabled
+    if _notices_disabled:
+        return
     try:
         append_step(cfg.serve_root, traj_path, record)
+    except PermissionError as exc:
+        _notices_disabled = True
+        log.error("delivery notices disabled for this run: %s", exc)
     except Exception:
         log.exception("could not write delivery notice for step %s", step.get("step_id"))
 

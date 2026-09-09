@@ -479,3 +479,17 @@ def test_duplicate_is_a_skipped_notice(tmp_path, monkeypatch, notices):
     _drive(tmp_path, monkeypatch, [_msg("m1", "telegram-1-1", "x"), _msg("m2", "telegram-1-1", "x")], bot)
     assert bot.sent == ["x"]
     assert [n["status"] for n in notices] == ["delivered", "skipped"]
+
+
+def test_unwritable_trajectory_disables_notices_after_one_error(tmp_path, monkeypatch, notices, caplog):
+    calls = []
+
+    def denied(serve_root, traj_path, step):
+        calls.append(step)
+        raise PermissionError("not writable")
+    monkeypatch.setattr(outbound, "append_step", denied)
+    bot = Bot()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "telegram-1-1", "a"), _msg("m2", "telegram-1-1", "b")], bot)
+    assert bot.sent == ["a", "b"]
+    assert len(calls) == 1
+    assert sum("delivery notices disabled" in r.message for r in caplog.records) == 1

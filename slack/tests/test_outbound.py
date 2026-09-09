@@ -691,6 +691,7 @@ def test_append_step_via_traj_uses_bin_traj(tmp_path, monkeypatch):
             returncode = 0
         return R()
     monkeypatch.setattr(outbound.subprocess, "run", fake_run)
+    monkeypatch.setattr(outbound.os, "access", lambda p, mode: True)
     (tmp_path / "bin").mkdir()
     (tmp_path / "bin" / "traj").write_text("#!/bin/sh\n")
     traj_path = tmp_path / "trajectories" / "455a2181-root" / "trajectory.jsonl"
@@ -700,3 +701,32 @@ def test_append_step_via_traj_uses_bin_traj(tmp_path, monkeypatch):
     assert argv[1:] == ["append", "--traj_dir", str(tmp_path / "trajectories"), "455a2181"]
     assert '"type": "delivery"' in kw["input"]
     assert kw["check"] is True
+
+
+def test_unwritable_trajectory_disables_notices_after_one_error(tmp_path, monkeypatch, caplog):
+    """The Telegram bridge user is read-only on the trajectory; a notice must
+    fail at once, be logged once, and not be retried per send."""
+    calls = []
+
+    def denied(serve_root, traj_path, step):
+        calls.append(step)
+        raise PermissionError("not writable")
+    monkeypatch.setattr(outbound, "append_step", denied)
+    client = RecordingClient()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "slack-C1", "a"), _msg("m2", "slack-C1", "b")], client)
+    assert [p["text"] for p in client.posts] == ["a", "b"], "delivery itself is unaffected"
+    assert len(calls) == 1
+    assert sum("delivery notices disabled" in r.message for r in caplog.records) == 1
+
+
+def test_append_step_refuses_an_unwritable_log_without_spawning(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(outbound.subprocess, "run", lambda *a, **k: ran.append(a))
+    monkeypatch.setattr(outbound.os, "access", lambda p, mode: False)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "traj").write_text("#!/bin/sh\n")
+    traj_path = tmp_path / "trajectories" / "455a2181-root" / "trajectory.jsonl"
+    import pytest
+    with pytest.raises(PermissionError):
+        outbound._append_step_via_traj(tmp_path, traj_path, {"type": "delivery"})
+    assert ran == []

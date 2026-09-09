@@ -42,11 +42,15 @@ def read_new(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
     """Read complete JSONL lines appended since offset.
 
     Returns (steps, new_offset). Corrupt lines are skipped. If the file
-    shrank (rebuilt/truncated) reading restarts from the beginning.
+    shrank (rebuilt/truncated) reading resumes at its END: a bridge that
+    replays a rebuilt log re-sends every old message to real people, which
+    is never what anyone wants (2026-09-09: 130 historical Telegram
+    messages re-sent after an identity switch handed the bridge a stale
+    offset).
     """
     size = path.stat().st_size
     if size < offset:
-        offset = 0
+        return [], size
     if size == offset:
         return [], offset
     with path.open("rb") as f:
@@ -72,19 +76,38 @@ def follow(
     poll_interval: float = 0.4,
     should_stop: Callable[[], bool] = lambda: False,
 ) -> Iterator[dict[str, Any]]:
-    """Yield steps appended to the trajectory, starting at EOF (no replay)."""
-    if cursor_file.is_file():
-        try:
-            offset = int(cursor_file.read_text().strip())
-        except ValueError:
-            offset = path.stat().st_size
-    else:
-        offset = path.stat().st_size
+    """Yield steps appended to the trajectory, starting at EOF (no replay).
+
+    The cursor file holds "<offset> <trajectory path>". A cursor written for
+    a different trajectory (the bridge was pointed at another identity, or
+    the state dir is shared) is ignored and reading starts at EOF; an old
+    offset-only cursor is honoured only if it does not exceed the file.
+    """
+    offset = _load_cursor(cursor_file, path)
     while not should_stop():
         steps, new_offset = read_new(path, offset)
         if new_offset != offset:
             offset = new_offset
             cursor_file.parent.mkdir(parents=True, exist_ok=True)
-            cursor_file.write_text(str(offset))
+            cursor_file.write_text(f"{offset} {path.resolve()}")
         yield from steps
         time.sleep(poll_interval)
+
+
+def _load_cursor(cursor_file: Path, path: Path) -> int:
+    size = path.stat().st_size
+    if not cursor_file.is_file():
+        return size
+    try:
+        raw = cursor_file.read_text().strip()
+    except OSError:
+        return size
+    parts = raw.split(None, 1)
+    if not parts or not parts[0].isdigit():
+        return size
+    offset = int(parts[0])
+    if len(parts) == 2 and parts[1] != str(path.resolve()):
+        return size  # another trajectory's cursor: never replay this one
+    if offset > size:
+        return size
+    return offset

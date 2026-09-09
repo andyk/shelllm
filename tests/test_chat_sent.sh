@@ -76,9 +76,11 @@ printf '%s\n' "$out" | head -1 | grep -q 'telegram-1-1  delivered' && ok "newest
 printf '%s\n' "$out" | grep -q 'slack-\.\.\.  failed (unknown slack address form)  lost papers' && ok "a failed send shows its reason" || bad "failed reason shown" "$out"
 printf '%s\n' "$out" | grep -qE 'slack-U0BFD9NDVE3  pending (59m|1h)  no bridge answer yet' && ok "a Slack send with no notice is pending with its age" || bad "pending with age" "$out"
 printf '%s\n' "$out" | grep -q 'pwa-andy  unconfirmed  phone note' && ok "a phone-chat send is unconfirmed (no bridge writes notices)" || bad "unconfirmed" "$out"
+msg m6 "$ME" telegram-2-2 "tg no notice" 300
+chat sent --since 24h | grep -q 'telegram-2-2  unconfirmed  tg no notice' && ok "a Telegram send with no notice is unconfirmed, not pending" || bad "telegram unconfirmed" "$(chat sent --since 24h | head -3)"
 printf '%s\n' "$out" | grep -q 'inbound, not ours' && bad "inbound messages are excluded" || ok "inbound messages are excluded"
 printf '%s\n' "$out" | grep -q 'two days ago' && bad "--since excludes old sends" || ok "--since excludes old sends"
-[[ "$(chat sent | grep -c .)" -eq 6 ]] && ok "without --since every send is listed" || bad "no --since lists all" "$(chat sent)"
+[[ "$(chat sent | grep -c .)" -eq 7 ]] && ok "without --since every send is listed" || bad "no --since lists all" "$(chat sent)"
 [[ "$(chat sent -n 2 | grep -c .)" -eq 2 ]] && ok "-n bounds the list" || bad "-n bounds"
 j=$(chat sent --since 24h --json)
 [[ "$(printf '%s' "$j" | jq -r '.[] | select(.step_id=="m1") | .state + " " + .permalink')" == "delivered https://x.slack.com/archives/C0BMVH6LM4K/p1" ]] \
