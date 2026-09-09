@@ -410,16 +410,19 @@ def run(
         if failure is not None and first_ts is None:
             _notice(cfg, traj, step, "failed", reason=failure)
         elif failure is not None:
+            # message_ts, not ts: traj append stamps its own ts on every
+            # step and would overwrite the Slack timestamp (seen on the first
+            # live notice, 2026-09-09).
             _notice(
                 cfg, traj, step, "failed",
                 reason=f"partly posted, then {failure}",
-                channel=conv.channel, ts=first_ts,
+                channel=conv.channel, message_ts=first_ts,
                 permalink=_permalink(client, conv.channel, first_ts),
             )
         else:
             _notice(
                 cfg, traj, step, "delivered",
-                channel=conv.channel, ts=first_ts,
+                channel=conv.channel, message_ts=first_ts,
                 permalink=_permalink(client, conv.channel, first_ts),
             )
 

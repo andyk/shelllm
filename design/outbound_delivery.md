@@ -96,7 +96,7 @@ appends one step to the root trajectory:
 ```json
 {"type": "delivery", "source": "slack-bridge", "transport": "slack",
  "trigger_step": "<message step_id>", "to": "<the to name>",
- "status": "delivered", "channel": "C0BMVH6LM4K", "ts": "1757372480.123456",
+ "status": "delivered", "channel": "C0BMVH6LM4K", "message_ts": "1757372480.123456",
  "permalink": "https://…/archives/C0BMVH6LM4K/p1757372480123456",
  "content": "delivered to slack-C0BMVH6LM4K"}
 ```
@@ -130,8 +130,9 @@ Rules:
 - The permalink comes from `chat.getPermalink` and is best effort. It also
   gives `chat react --reply-to` a message timestamp for an outbound message,
   closing the gap where a reaction fell back to the thread root.
-- Slack's `chat.postMessage` response carries `ts`; the notice records it so
-  later tooling can find the post.
+- Slack's `chat.postMessage` response carries `ts`; the notice records it as
+  `message_ts` (`ts` belongs to `traj append`, which stamps every step; the
+  first live notice on 2026-09-09 had the Slack value overwritten).
 
 ### 4. Who wakes up, and who sees it
 

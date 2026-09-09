@@ -527,7 +527,7 @@ _index_apply() {
             | grep -F '"type":"delivery"' \
             | jq -c 'fromjson? // empty
                 | select(.type == "delivery" and (.trigger_step // "") != "")
-                | {step_id, ts, trigger_step, status, transport, reason, permalink, channel}
+                | {step_id, ts, trigger_step, status, transport, reason, permalink, channel, message_ts}
                 | with_entries(select(.value != null))' -R >> "$(_deliveries_path "$idx")" 2>/dev/null || true
     fi
     printf '%s %s\n' "$((have_off + new_bytes - partial))" "$header" > "$off"

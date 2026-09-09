@@ -592,7 +592,8 @@ def test_bare_channel_posts_top_level_and_is_confirmed(tmp_path, monkeypatch, no
     n = notices[0]
     assert n["type"] == "delivery" and n["source"] == "slack-bridge" and n["transport"] == "slack"
     assert n["status"] == "delivered" and n["trigger_step"] == "m1" and n["to"] == "slack-C0BMVH6LM4K"
-    assert n["channel"] == "C0BMVH6LM4K" and n["ts"] == "1757372480.000001"
+    assert n["channel"] == "C0BMVH6LM4K" and n["message_ts"] == "1757372480.000001"
+    assert "ts" not in n, "traj append owns ts; the Slack timestamp is message_ts"
     assert n["permalink"].endswith("/archives/C0BMVH6LM4K/p1757372480000001")
     assert n["content"] == "delivered to slack-C0BMVH6LM4K"
 
@@ -632,7 +633,7 @@ def test_slack_api_failure_is_a_failed_notice(tmp_path, monkeypatch, notices):
     _drive(tmp_path, monkeypatch, [_msg("m1", "slack-U1-C1-1.2")], client)
     assert notices[0]["status"] == "failed"
     assert "channel_not_found" in notices[0]["reason"]
-    assert "ts" not in notices[0]
+    assert "message_ts" not in notices[0]
 
 
 def test_duplicate_within_window_is_a_skipped_notice(tmp_path, monkeypatch, notices):
@@ -675,7 +676,7 @@ def test_client_without_ts_still_confirms(tmp_path, monkeypatch, notices):
             return None
     _drive(tmp_path, monkeypatch, [_msg("m1", "slack-U1-C1")], Bare())
     assert notices[0]["status"] == "delivered"
-    assert "ts" not in notices[0] and "permalink" not in notices[0]
+    assert "message_ts" not in notices[0] and "permalink" not in notices[0]
 
 
 def test_append_step_via_traj_uses_bin_traj(tmp_path, monkeypatch):
