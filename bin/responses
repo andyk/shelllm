@@ -361,21 +361,41 @@ run_list() {
     emit "$merged"
 }
 
+# One object-returning request owns provider setup, query includes, transport,
+# and output. Command-specific validation/body construction precedes this call.
+request_object() {
+    resolve_provider; net_args
+    QUERY=""
+    qadd_includes
+    do_request "$@"
+    emit "$RESP_FILE"
+}
+
+# Stored-resource operations share the same id validation and URL shape.
+# Build the path only after want_pos succeeds, including under bash set -u.
+request_ids() {  # allowed-options count what method collection [suffix]
+    allow_opts "$1"
+    want_pos "$2" "$3"
+    local path="$5/${POS[0]}${6:-}"
+    [[ "$2" -ne 2 ]] || path="$path/${POS[1]}"
+    request_object "$4" "$path"
+}
+
 # --- streaming get ----------------------------------------------------------
 
-# The SSE resume channel for a background response: every data payload becomes
-# one JSON line, and only a terminal event makes this a success. Anything the
-# server sent that was not an SSE data line is kept so an HTTP error body can
-# still be reported as the reason.
+# The SSE resume channel returns typed JSON events for the requested response.
+# A terminal tag succeeds only with that response's matching terminal status.
+# Keep non-data lines separately so an HTTP error body can explain a refusal.
 stream_get() {
-    local url="$BASE$1" line payload etype terminal=0 other msg rc=0
+    local url="$BASE$1" wanted="$2" line payload etype terminal=0 other msg rc=0
     [[ -n "$QUERY" ]] && url="$url?$QUERY"
     other=$(mktmp)
     mkfifo "$_tmp_dir/stream"
     curl --globoff -sS -N ${NET[@]+"${NET[@]}"} "${HEADERS[@]}" "$url" \
         > "$_tmp_dir/stream" 2>/dev/null &
     _curl_pid=$!
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
         case "$line" in
             data:*) ;;
             *) printf '%s\n' "$line" >> "$other"; continue ;;
@@ -383,12 +403,23 @@ stream_get() {
         payload="${line#data:}"
         payload="${payload# }"
         [[ -z "$payload" || "$payload" == "[DONE]" ]] && continue
-        etype=$(printf '%s' "$payload" | jq -r '.type // empty' 2>/dev/null) || etype=""
-        printf '%s' "$payload" | jq -c . 2>/dev/null || printf '%s\n' "$payload"
+        payload=$(printf '%s' "$payload" | jq -cs --arg wanted "$wanted" '
+            if length != 1 then error("event cardinality") else .[0] end
+            | if type != "object" then error("event object")
+              elif (.type | type) != "string" or .type == "" then error("event type")
+              elif has("response") and (.response | type) != "object" then error("response object")
+              elif has("response") and .response.id != $wanted then error("response identity")
+              elif has("response_id") and .response_id != $wanted then error("response identity")
+              else . end' 2>/dev/null) || die "invalid or foreign response stream event"
+        etype=$(printf '%s' "$payload" | jq -r '.type')
         case "$etype" in
             response.completed|response.incomplete|response.failed|response.cancelled)
+                printf '%s' "$payload" | jq -e --arg wanted "$wanted" --arg status "${etype#response.}" \
+                    '.response.id == $wanted and .response.status == $status' >/dev/null 2>&1 \
+                    || die "terminal response identity or status does not match"
                 terminal=1 ;;
         esac
+        printf '%s\n' "$payload"
     done < "$_tmp_dir/stream"
     wait "$_curl_pid" || rc=$?
     _curl_pid=""
@@ -405,27 +436,21 @@ stream_get() {
 # These validators run in the caller's shell rather than returning their input
 # through a command substitution, so a usage_error inside one really does end
 # the process with exit 2 instead of only ending a subshell.
-require_json_array() {  # require_json_array <file> <what>
-    [[ -f "$1" ]] || usage_error "$2: no such file: $1"
-    jq -e 'type == "array"' < "$1" >/dev/null 2>&1 \
-        || usage_error "$2 must hold a JSON array: $1"
-}
-
-require_json_object_file() {  # require_json_object_file <file> <what>
-    [[ -f "$1" ]] || usage_error "$2: no such file: $1"
-    jq -e 'type == "object"' < "$1" >/dev/null 2>&1 \
-        || usage_error "$2 must hold a JSON object: $1"
+require_json_file() {  # file kind what
+    [[ -f "$1" ]] || usage_error "$3: no such file: $1"
+    jq -es --arg kind "$2" 'length == 1 and (.[0] | type == $kind)' < "$1" >/dev/null 2>&1 \
+        || usage_error "$3 must hold a JSON $2: $1"
 }
 
 require_json_object() {  # require_json_object <json> <what>
-    printf '%s' "$1" | jq -e 'type == "object"' >/dev/null 2>&1 \
+    printf '%s' "$1" | jq -es 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1 \
         || usage_error "$2 must be a JSON object"
 }
 
 # Sets BODY to {"items": [...]}. The API takes 20 items at a time, so a longer
 # file is a usage error here rather than a rejected request.
 build_items_body() {  # build_items_body <file>
-    require_json_array "$1" "--items-file"
+    require_json_file "$1" array "--items-file"
     local count
     count=$(jq 'length' < "$1")
     [[ "$count" -le 20 ]] \
@@ -458,7 +483,7 @@ case "$COMMAND" in
             qadd stream true
             [[ -n "$OPT_STARTING_AFTER" ]] && qadd starting_after "$OPT_STARTING_AFTER"
             qadd_includes
-            stream_get "/responses/${POS[0]}"
+            stream_get "/responses/${POS[0]}" "${POS[0]}"
         else
             [[ -n "$OPT_STARTING_AFTER" ]] && usage_error "--starting-after only means something with --stream"
             qadd_includes
@@ -467,18 +492,10 @@ case "$COMMAND" in
         fi
         ;;
     cancel)
-        allow_opts ""
-        want_pos 1 "one response id"
-        resolve_provider; net_args
-        do_request POST "/responses/${POS[0]}/cancel"
-        emit "$RESP_FILE"
+        request_ids "" 1 "one response id" POST /responses /cancel
         ;;
     delete)
-        allow_opts ""
-        want_pos 1 "one response id"
-        resolve_provider; net_args
-        do_request DELETE "/responses/${POS[0]}"
-        emit "$RESP_FILE"
+        request_ids "" 1 "one response id" DELETE /responses
         ;;
     input-items)
         allow_opts "--after --limit --order --include --all"
@@ -496,13 +513,13 @@ case "$COMMAND" in
             && usage_error "compact takes --input-file or --previous-response-id, not both"
         _base_body='{}'
         if [[ -n "$OPT_BODY_FILE" ]]; then
-            require_json_object_file "$OPT_BODY_FILE" "--body-file"
+            require_json_file "$OPT_BODY_FILE" object "--body-file"
             _base_body=$(cat "$OPT_BODY_FILE")
         fi
         _filter='$body + {model: $model}'
         _jq_args=(--argjson body "$_base_body" --arg model "$OPT_MODEL")
         if [[ -n "$OPT_INPUT_FILE" ]]; then
-            require_json_array "$OPT_INPUT_FILE" "--input-file"
+            require_json_file "$OPT_INPUT_FILE" array "--input-file"
             _jq_args+=(--slurpfile input "$OPT_INPUT_FILE")
             _filter="$_filter + {input: \$input[0]}"
         else
@@ -550,22 +567,14 @@ case "$COMMAND" in
                 want_pos 0 "no positional arguments"
                 BODY='{}'
                 [[ -n "$OPT_ITEMS_FILE" ]] && build_items_body "$OPT_ITEMS_FILE"
-                if [[ -n "$OPT_METADATA" ]]; then
+                if [[ " $OPT_SEEN " == *" --metadata "* ]]; then
                     require_json_object "$OPT_METADATA" "--metadata"
                     BODY=$(printf '%s' "$BODY" | jq -c --argjson m "$OPT_METADATA" '. + {metadata: $m}')
                 fi
-                resolve_provider; net_args
-                QUERY=""
-                do_request POST "/conversations"
-                emit "$RESP_FILE"
+                request_object POST /conversations
                 ;;
             get)
-                allow_opts ""
-                want_pos 1 "one conversation id"
-                resolve_provider; net_args
-                QUERY=""
-                do_request GET "/conversations/${POS[0]}"
-                emit "$RESP_FILE"
+                request_ids "" 1 "one conversation id" GET /conversations
                 ;;
             update)
                 allow_opts "--metadata"
@@ -573,18 +582,10 @@ case "$COMMAND" in
                 [[ -n "$OPT_METADATA" ]] || usage_error "conversations update requires --metadata"
                 require_json_object "$OPT_METADATA" "--metadata"
                 BODY=$(jq -nc --argjson m "$OPT_METADATA" '{metadata: $m}')
-                resolve_provider; net_args
-                QUERY=""
-                do_request POST "/conversations/${POS[0]}"
-                emit "$RESP_FILE"
+                request_object POST "/conversations/${POS[0]}"
                 ;;
             delete)
-                allow_opts ""
-                want_pos 1 "one conversation id"
-                resolve_provider; net_args
-                QUERY=""
-                do_request DELETE "/conversations/${POS[0]}"
-                emit "$RESP_FILE"
+                request_ids "" 1 "one conversation id" DELETE /conversations
                 ;;
             items)
                 allow_opts "--after --limit --order --include --all"
@@ -597,26 +598,13 @@ case "$COMMAND" in
                 want_pos 1 "one conversation id"
                 [[ -n "$OPT_ITEMS_FILE" ]] || usage_error "conversations add requires --items-file"
                 build_items_body "$OPT_ITEMS_FILE"
-                resolve_provider; net_args
-                QUERY=""; qadd_includes
-                do_request POST "/conversations/${POS[0]}/items"
-                emit "$RESP_FILE"
+                request_object POST "/conversations/${POS[0]}/items"
                 ;;
             item)
-                allow_opts "--include"
-                want_pos 2 "a conversation id and an item id"
-                resolve_provider; net_args
-                QUERY=""; qadd_includes
-                do_request GET "/conversations/${POS[0]}/items/${POS[1]}"
-                emit "$RESP_FILE"
+                request_ids "--include" 2 "a conversation id and an item id" GET /conversations /items
                 ;;
             remove)
-                allow_opts ""
-                want_pos 2 "a conversation id and an item id"
-                resolve_provider; net_args
-                QUERY=""
-                do_request DELETE "/conversations/${POS[0]}/items/${POS[1]}"
-                emit "$RESP_FILE"
+                request_ids "" 2 "a conversation id and an item id" DELETE /conversations /items
                 ;;
             *)
                 usage_error "unknown conversations subcommand: $SUB"
