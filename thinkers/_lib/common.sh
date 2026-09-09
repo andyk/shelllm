@@ -191,6 +191,35 @@ _workspace_section() {  # _workspace_section <workdir>
     return 0
 }
 
+# Sent section for the wake prompt: what the identity said outward in the
+# last OUTBOUND_SINCE (24h), newest first, each with what the bridge reported
+# back. Keyed by time, not by step count, so it survives any number of idle
+# wakes; the 20-step recent stream lost a send after 16 idle runs on
+# 2026-09-08 and the mind re-sent it three times (design/outbound_delivery.md,
+# part 5). Empty output means no section. `chat sent` failing is reported by
+# _prompt_section like any other section.
+_outbound_section() {
+    command -v chat >/dev/null 2>&1 || return 0
+    local since="${OUTBOUND_SINCE:-24h}" max="${OUTBOUND_MAX:-10}" rows
+    rows=$(chat sent --since "$since" -n 200 --json) || return 1
+    [[ -n "$rows" && "$rows" != "[]" ]] || return 0
+    printf '%s' "$rows" | jq -r --arg since "$since" --argjson max "$max" '
+        def age_text: if . < 3600 then "\(. / 60 | floor)m"
+                      elif . < 86400 then "\(. / 3600 | floor)h"
+                      else "\(. / 86400 | floor)d" end;
+        def line: "- \((.ts // "?")[0:16] | sub("T"; " "))Z to \(.to): "
+                  + (if .state == "delivered" then "delivered"
+                     elif .state == "failed" then "FAILED, never arrived (\(.reason // "no reason given"))"
+                     elif .state == "skipped" then "not sent (\(.reason // "skipped"))"
+                     elif .state == "pending" then (if .age_s > 300 then "PENDING \(.age_s | age_text), no delivery confirmation yet (the bridge may be down)" else "pending" end)
+                     else "sent (this transport does not confirm delivery)" end)
+                  + " \"" + ((.filename // .content // "") | gsub("\n"; " ") | if length > 70 then .[0:70] + "…" else . end) + "\"";
+        "Sent in the last \($since) (newest first; `chat sent` shows more; a FAILED line means the message never reached anyone, fix the address and send again; do not send again anything listed as delivered or pending):",
+        (.[:$max][] | line),
+        (if length > $max then "- and \(length - $max) more: `chat sent --since \($since)`" else empty end)'
+    return 0
+}
+
 # Build the common system prompt prefix shared by all thinkers.
 # Calls `identity prompt` and `skills prompt` to assemble identity context.
 _build_system_prompt() {

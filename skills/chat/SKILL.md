@@ -36,12 +36,25 @@ IMPORTANT: if I use `chat send` it sends a message to myself, so I must NEVER us
     chat history --with <name> [--since 7d]   # my whole conversation with one person
     chat history --with <name> -n 50 --json   # same, as JSON with timestamps
     chat pending                              # requests the responder deferred to me that I have not delivered yet
+    chat sent [--since 24h] [-n N] [--json]  # what I sent, newest first, with what the bridge reported back
 
 `--with` groups a person across every name a bridge has used for them (a
 Slack user's DM and every channel thread, a phone chat name), so it is the
 way to check what someone and I said before, even days ago. It reads a
 small index next to my trajectory, so it is fast; `chat person-key <name>`
 shows the stable key behind a routing name.
+
+## Knowing what I already sent
+
+`chat sent` is my sent folder. Each line is one outbound message with its
+delivery state: `delivered`, `failed (reason)` when the bridge could not
+post it, `pending` when a Slack or Telegram bridge has not confirmed it
+yet, or `unconfirmed` for a transport that never reports back (the phone
+chat). My wake prompt shows the last day of it. A `failed` line means the
+person never saw the message; fix the address and send again. `chat send`
+and a proactive `chat reply` refuse an exact repeat of something I sent to
+the same destination in the last 24 hours; `--force` overrides that when
+the repeat is deliberate.
 
 ## When to reply
 

@@ -313,6 +313,11 @@ fi
 # bin/ and thinkers/ that took ~64% of reasoning steps on 2026-09-04.
 runtime_line=$(_prompt_section runtime _runtime_line) || runtime_line=""
 workspace_section=$(_prompt_section workspace _workspace_section "$run_dir") || workspace_section=""
+# Sent section: outbound messages of the last day with their delivery state,
+# so "did I already send this" is answered by the prompt, not by memory
+# (design/outbound_delivery.md, part 5). Sits after the recent stream, so the
+# cached prefix does not change when a send lands.
+outbound_section=$(_prompt_section outbound _outbound_section) || outbound_section=""
 
 route_prompt="<context>
 $system_prompt
@@ -324,7 +329,9 @@ ${runtime_line:+$runtime_line
 }${life_section}Recent stream (last $THINK_CONTEXT_TAIL durable steps; \`traj tail -n 200\` shows more, verbatim):
 $recent_context
 
-${related_section}Routing signals:
+${outbound_section:+$outbound_section
+
+}${related_section}Routing signals:
 $hints
 
 $think_prompt

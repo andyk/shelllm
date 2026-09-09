@@ -1,14 +1,18 @@
 # Outbound delivery: deliverable addresses, delivery notices, and a sent ledger
 
-Status: Delivery 1 BUILT 2026-09-09, tests green, pending commit and deploy
-(`slack/src/headlong_slack/naming.py`, `outbound.py`, `bin/chat`,
-`thinkers/_lib/common.sh`, `skills/slack/SKILL.md`, `trajectory_spec.md`;
-tests `slack/tests/test_naming.py`, `test_outbound.py`, `conftest.py`,
-`tests/test_chat_target_validation.sh`, `test_recent_stream_filter.sh`).
-Deploy needs the bridge restart deploy/update.sh already does; `chat` and
-`_lib` reach Audel through the normal thinker sync. Delivery 2 (the sent
-ledger, the wake prompt section, send-time dedup, Telegram and phone chat
-notices) follows once notices are landing on Audel's box.
+Status: Delivery 1 COMMITTED 2026-09-09 (address grammar, Slack notices,
+chat validation). Delivery 2 BUILT the same day, tests green, pending commit
+and deploy: `chat sent` over a `deliveries.jsonl` index (`bin/chat`), the
+"Sent in the last 24h" wake prompt section (`_outbound_section` in
+`thinkers/_lib/common.sh`, wired in `thinkers/monolith/step`, rule in
+`prompt.md`), the 24h repeat refusal with `--force` in `chat send` and
+proactive `chat reply`, and Telegram notices
+(`telegram/src/headlong_telegram/outbound.py`). Tests:
+`tests/test_chat_sent.sh`, `tests/test_monolith_wake_sections.sh`,
+`telegram/tests/test_outbound.py`. The phone chat has no bridge process, so
+its sends show as `unconfirmed` rather than `pending` (see part 7). Deploy
+restarts both bridges through deploy/update.sh; `chat`, `_lib`, and the
+monolith prompt reach Audel through the thinker sync.
 
 Related: [conversation_memory.md](conversation_memory.md) part 5 is the
 deferral index this design copies. [monolith_thinker.md](monolith_thinker.md)
@@ -181,19 +185,30 @@ day and nothing on a quiet one.
 
 ### 6. Send-time dedup (delivery 2)
 
-`chat send` and `chat reply` consult the same index and refuse to append a
-message whose content matches one already sent to the same destination in
-the last 24 hours, unless `--force` is given. The refusal names the earlier
-send. The bridge's five-minute dedup stays as a backstop for the case where
-the same step is replayed. This moves the check the mind failed to make on
-2026-09-08 into the tool, so the mind does not have to remember to check.
+`chat send` consults the same index and refuses to append a message whose
+content matches one already sent to the same destination in the last 24
+hours (`CHAT_REPEAT_WINDOW`), unless `--force` is given. The refusal names
+the earlier send and points at `chat sent`. `chat reply` gets the same check
+only when it answers nothing, i.e. no `reply_to` was given or inferred, which
+makes it a proactive send into a conversation. A reply stamped to a specific
+inbound is exempt, because two questions may deserve the same answer and the
+responder must not be blocked from saying "still running" twice in a day.
+The bridge's five-minute dedup stays as a backstop for a replayed step. This
+moves the check the mind failed to make on 2026-09-08 into the tool, so the
+mind does not have to remember to check.
 
 ### 7. Other transports (delivery 2)
 
-The Telegram bridge and the phone chat write the same `delivery` step with
-their own `transport` and `source` values, once the shape has proven itself
-on Slack. Until then their sends show as `pending` in the ledger, which is
-honest.
+The Telegram bridge writes the same `delivery` step with `transport:
+telegram` and `source: telegram-bridge`, including failed notices for an
+address that is not on its allowlist or names a group chat. The phone chat
+has no bridge process: the web server serves messages straight from the
+trajectory when the phone polls, so there is no moment that means
+"delivered" short of the phone acknowledging, which it does not do today.
+Its sends are shown as `unconfirmed` (a transport that never reports back)
+rather than `pending` (a bridge that has not reported yet), so a stale
+phone-chat send does not read as a bridge outage. If the phone client ever
+acknowledges, the web server can write the same step.
 
 ## What this does not do
 
@@ -223,8 +238,12 @@ and one to a bare user id from an identity shell, confirm both land in Slack,
 confirm two `delivery` steps with `status: delivered` and a permalink, then
 send one to `slack-bogus` and confirm a failed notice and a journal warning.
 
-Delivery 2: `chat sent` and `sent.jsonl`, the prompt section, `--force`
-dedup, then Telegram and phone chat notices.
+Delivery 2 (built): `chat sent` over `deliveries.jsonl` (the index file is
+named for what it holds, not `sent.jsonl` as first proposed), the prompt
+section, `--force` dedup, Telegram notices. Verification on the box: after
+the deploy, `chat sent --since 24h` from an identity shell should list the
+day's sends with `delivered` beside the Slack ones and the next wake prompt
+should carry the "Sent in the last 24h" section (check a `prompt` step).
 
 ## Open questions
 

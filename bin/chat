@@ -87,12 +87,13 @@ Create a .chatrc file with:
 }
 
 cmd_send() {
-    local message="" from="" to="${IDENTITY_NAME:-}" source_url=""
+    local message="" from="" to="${IDENTITY_NAME:-}" source_url="" force=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires a name}"; shift 2 ;;
             --to)   to="${2:?--to requires a name}"; shift 2 ;;
             --source-url) source_url="${2:?--source-url requires a URL}"; shift 2 ;;
+            --force) force=1; shift ;;
             *)      message="${message:+$message }$1"; shift ;;
         esac
     done
@@ -114,6 +115,8 @@ cmd_send() {
 To message someone else: chat reply <their-name> <message>
 To keep a note for yourself, append a thought step instead of a message."
 
+    [[ "$force" -eq 1 ]] || _refuse_repeat "$from" "$to" "$message"
+
     # source_url records where a bridged message came from. It is optional
     # metadata for operators and never affects routing or model context.
     printf '%s' "$message" \
@@ -129,7 +132,7 @@ To keep a note for yourself, append a thought step instead of a message."
 }
 
 cmd_reply() {
-    local reply_to="" follow_up=0
+    local reply_to="" follow_up=0 force=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --reply-to) reply_to="${2:?--reply-to requires a step id}"; shift 2 ;;
@@ -139,6 +142,7 @@ cmd_reply() {
             # but skips the answered guard below, which exists for races,
             # not for follow-ups (design/conversation_memory.md, part 5).
             --follow-up) follow_up=1; shift ;;
+            --force) force=1; shift ;;
             *) break ;;
         esac
     done
@@ -180,6 +184,14 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
                    | .step_id // "" | select(. != "")
                    | select(. as $id | $answered | index($id) | not)]
                 | last // ""' 2>/dev/null) || reply_to=""
+    fi
+
+    # A reply that answers nothing (no inbound to stamp) is a proactive send
+    # into the conversation, and gets the same repeat check as `chat send`.
+    # A reply stamped to a specific inbound is an answer, and two people (or
+    # one person twice) may deserve the same answer, so those are exempt.
+    if [[ -z "$reply_to" && "$force" -eq 0 ]]; then
+        _refuse_repeat "$from" "$to_name" "$message"
     fi
 
     # Answered guard: if a reply from us stamped to this step is already in
@@ -441,6 +453,11 @@ _person_aliases() {
 _INDEX_CONTENT_CAP=8000
 
 _deferrals_path() { printf '%s/deferrals.jsonl' "$(dirname "$1")"; }
+# deliveries.jsonl, also built in the same pass: every `delivery` step a
+# bridge wrote back for one of our outbound messages (design/outbound_delivery.md).
+# `chat sent` joins it to messages.jsonl by trigger_step to show whether a send
+# was delivered, failed, or is still unconfirmed.
+_deliveries_path() { printf '%s/deliveries.jsonl' "$(dirname "$1")"; }
 
 # _index_update <trajectory file> <index file>
 # Brings the index up to date. Only complete lines are consumed: a line still
@@ -454,13 +471,15 @@ _index_update() {
         read -r have_off have_header < "$off" || true
         [[ "$have_off" =~ ^[0-9]+$ ]] || have_off=0
     fi
-    local dfr; dfr=$(_deferrals_path "$idx")
-    if [[ ! -f "$idx" || ! -f "$dfr" || "$have_header" != "$header" ]]; then
+    local dfr dlv; dfr=$(_deferrals_path "$idx"); dlv=$(_deliveries_path "$idx")
+    if [[ ! -f "$idx" || ! -f "$dfr" || ! -f "$dlv" || "$have_header" != "$header" ]]; then
         have_off=0
         : > "$idx.rebuild" || return 1
         mv -f "$idx.rebuild" "$idx"
         : > "$dfr.rebuild" || return 1
         mv -f "$dfr.rebuild" "$dfr"
+        : > "$dlv.rebuild" || return 1
+        mv -f "$dlv.rebuild" "$dlv"
     fi
     size=$(wc -c < "$tf" | tr -d ' ')
     (( size > have_off )) || return 0
@@ -504,6 +523,12 @@ _index_apply() {
                     {kind: "resolve", step_id, ts, resolves}
                   else empty end
                 | with_entries(select(.value != null))' -R >> "$(_deferrals_path "$idx")" 2>/dev/null || true
+        head -c "$((new_bytes - partial))" "$tmp" \
+            | grep -F '"type":"delivery"' \
+            | jq -c 'fromjson? // empty
+                | select(.type == "delivery" and (.trigger_step // "") != "")
+                | {step_id, ts, trigger_step, status, transport, reason, permalink, channel}
+                | with_entries(select(.value != null))' -R >> "$(_deliveries_path "$idx")" 2>/dev/null || true
     fi
     printf '%s %s\n' "$((have_off + new_bytes - partial))" "$header" > "$off"
     rm -f "$tmp"
@@ -651,6 +676,91 @@ cmd_pending() {
           end' -R < "$dfr"
 }
 
+# chat sent [--since 24h] [-n N] [--json]
+# The identity's outbound messages, newest first, each with what the bridge
+# reported back: delivered, failed (with the reason), skipped, pending (a
+# transport that confirms deliveries has not yet), or unconfirmed (a transport
+# with no delivery notices, e.g. the phone chat). This is the sent folder the
+# mind checks before sending again (design/outbound_delivery.md, part 5).
+_SENT_CONFIRMING_RE='^(slack|telegram)-'
+cmd_sent() {
+    local since="" n=50 as_json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --since) since="${2:?--since requires a duration like 24h}"; shift 2 ;;
+            -n)      n="${2:?-n requires a count}"; shift 2 ;;
+            --json)  as_json=1; shift ;;
+            *)       die "sent: unknown argument '$1'" ;;
+        esac
+    done
+    [[ "$n" =~ ^[0-9]+$ ]] || die "sent: count must be a number, got '$n'"
+    local me="${IDENTITY_NAME:-agent}" tf idx dlv since_s
+    tf=$(traj path "${ROOT_TRAJ_ID:-$TRAJ_ID}" 2>/dev/null) || tf=""
+    [[ -n "$tf" && -f "$tf" ]] || die "sent: cannot resolve the root trajectory file"
+    idx="$(dirname "$tf")/messages.jsonl"
+    _index_update "$tf" "$idx" || true
+    dlv=$(_deliveries_path "$idx")
+    [[ -f "$idx" ]] || { [[ $as_json -eq 1 ]] && printf '[]\n'; return 0; }
+    [[ -f "$dlv" ]] || : > "$dlv"
+    since_s=0
+    [[ -n "$since" ]] && since_s=$(_duration_s "$since")
+    jq -rcn --arg me "$me" --argjson since "$since_s" --argjson n "$n" --argjson json "$as_json" \
+           --arg confirming "$_SENT_CONFIRMING_RE" --slurpfile dlv "$dlv" '
+        def secs: (.ts // "")[0:19] + "Z" | try fromdateiso8601 catch 0;
+        def age_text: if . < 3600 then "\(. / 60 | floor)m"
+                      elif . < 86400 then "\(. / 3600 | floor)h"
+                      else "\(. / 86400 | floor)d" end;
+        # the newest notice per message wins (a replayed step may write two)
+        ($dlv | map(select((.trigger_step // "") != ""))
+              | group_by(.trigger_step)
+              | map({key: .[0].trigger_step, value: (sort_by(.ts // "") | last)})
+              | from_entries) as $d
+        | [inputs | fromjson? // empty]
+        | unique_by(.step_id)
+        | map(select(.from == $me and ($since == 0 or secs >= (now - $since))))
+        | sort_by(.ts // "") | reverse | .[:$n]
+        | map(. as $m | ($d[$m.step_id] // {}) as $n
+              | $m + {age_s: ((now - ($m | secs)) | floor),
+                      state: ($n.status // (if ($m.to | test($confirming)) then "pending" else "unconfirmed" end)),
+                      reason: $n.reason, permalink: $n.permalink, transport: $n.transport}
+              | with_entries(select(.value != null)))
+        | if $json == 1 then map({step_id, ts, to, content, state, reason, permalink, transport, age_s, reply_to, filename})
+          else .[] | "\(.ts // "?") \(.to)  \(.state)"
+                     + (if .state == "pending" then " \(.age_s | age_text)" else "" end)
+                     + (if .reason then " (\(.reason))" else "" end)
+                     + "  " + ((.filename // .content // "") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end)
+          end' -R < "$idx"
+}
+
+# _refuse_repeat <from> <to> <message>: die if this exact message already went
+# to this destination inside CHAT_REPEAT_WINDOW (default 24h). The check the
+# mind failed to make on 2026-09-08 (four sends of the same two papers) now
+# lives in the tool; `--force` overrides it (design/outbound_delivery.md, part 6).
+_refuse_repeat() {
+    local from="$1" to="$2" message="$3" tf idx window_s hit
+    tf=$(traj path "${ROOT_TRAJ_ID:-$TRAJ_ID}" 2>/dev/null) || return 0
+    [[ -n "$tf" && -f "$tf" ]] || return 0
+    idx="$(dirname "$tf")/messages.jsonl"
+    _index_update "$tf" "$idx" || true
+    [[ -f "$idx" ]] || return 0
+    window_s=$(_duration_s "${CHAT_REPEAT_WINDOW:-24h}")
+    [[ "$window_s" =~ ^[0-9]+$ && "$window_s" -gt 0 ]] || return 0
+    local msg_file; msg_file=$(mktemp) || return 0
+    printf '%s' "$message" > "$msg_file"
+    hit=$(jq -rn --arg me "$from" --arg to "$to" --argjson w "$window_s" --argjson cap "$_INDEX_CONTENT_CAP" \
+              --rawfile msg "$msg_file" '
+        def secs: (.ts // "")[0:19] + "Z" | try fromdateiso8601 catch 0;
+        ($msg | if length > $cap then .[0:$cap] + "…[truncated]" else . end) as $want
+        | [inputs | fromjson? // empty
+           | select(.from == $me and .to == $to and (.content // "") == $want and secs >= (now - $w))]
+        | sort_by(.ts // "") | last // empty
+        | "\(.ts) \(.step_id)"' -R < "$idx" 2>/dev/null) || hit=""
+    rm -f "$msg_file"
+    [[ -z "$hit" ]] && return 0
+    die "refusing to send: this exact message already went to '$to' at ${hit% *} (step ${hit#* }).
+\`chat sent\` shows recent sends and whether each was delivered. If the repeat is deliberate, add --force."
+}
+
 cmd_person_key() {
     [[ -n "${1:-}" ]] || die "Usage: chat person-key <name>"
     _person_key "$1"; echo
@@ -673,15 +783,21 @@ usage() {
 chat — Messaging for an activated identity
 
 Usage:
-  chat send [--from <name>] [--to <name>] [--source-url <url>] <message>
+  chat send [--from <name>] [--to <name>] [--source-url <url>] [--force] <message>
                              Send a message (from defaults to .chatrc
-                             default_send_from, to defaults to $IDENTITY_NAME)
+                             default_send_from, to defaults to $IDENTITY_NAME).
+                             Refuses a message identical to one sent to the
+                             same destination in the last 24h
+                             (CHAT_REPEAT_WINDOW) unless --force.
+                             A slack-* destination must be a form the bridge
+                             delivers: slack-<user>-<channel>[-<ts>],
+                             slack-C<id> (channel), or slack-U<id> (DM)
   chat send-file [--from <name>] [--to <name>] <file>
                              Send a file's contents as a message
   chat react [--reply-to <step_id>] [--source-url <url>] <to_name> <emoji>
                              Add a Slack emoji reaction (name, not unicode).
                              Stamps reaction on a chat-sourced message step.
-  chat reply [--reply-to <step_id>] [--follow-up] <to_name> <message>
+  chat reply [--reply-to <step_id>] [--follow-up] [--force] <to_name> <message>
                              Agent sends a reply (from is $IDENTITY_NAME).
                              Stamps reply_to with the step it answers —
                              inferred (latest unanswered message from
@@ -690,6 +806,17 @@ Usage:
                              already answered message (delivering work the
                              first reply promised); skips the duplicate
                              guard and marks the step follow_up:true.
+                             --force: send even if the same text already
+                             went to <to_name> in the last 24h (only a
+                             reply that answers no specific inbound is
+                             checked; answers are exempt).
+  chat sent [--since 24h] [-n N] [--json]
+                             Outbound messages, newest first, with what the
+                             bridge reported back: delivered, failed (with
+                             the reason), skipped, pending (no confirmation
+                             yet from a bridge that sends them), or
+                             unconfirmed (a transport that never does).
+                             From deliveries.jsonl beside messages.jsonl
   chat history [N]           Show last N messages (default 20)
   chat history --with <name> [--since 7d] [-n N] [--json]
                              This person's conversation with the identity,
@@ -719,6 +846,8 @@ Config file ($CHATRC, default ./.chatrc):
 
 Environment:
   CHATRC          Path to config file (default: ./.chatrc)
+  CHAT_REPEAT_WINDOW  How far back `send`/`reply` look for an identical
+                  message to the same destination (default 24h; 0 disables)
   TRAJ_DIR        Trajectory directory (set by `identity shell`)
   TRAJ_ID         Trajectory ID (set by `identity shell`)
   IDENTITY_NAME   Identity name (for reply attribution and --to default)
@@ -740,6 +869,7 @@ case "${1:-}" in
     reply)     shift; cmd_reply "$@" ;;
     history) shift; cmd_history "$@" ;;
     pending)   shift; cmd_pending "$@" ;;
+    sent)       shift; cmd_sent "$@" ;;
     person-key) shift; cmd_person_key "$@" ;;
     thread-key) shift; cmd_thread_key "$@" ;;
     repl)    shift; cmd_repl "$@" ;;

@@ -408,3 +408,74 @@ def test_slack_reaction_step_is_not_posted(tmp_path, monkeypatch):
 
     outbound.run(_cfg(tmp_path), FakeBot(), ApproveAll(), threading.Event())
     assert sent == ["later reply"]
+
+
+# --- delivery notices (design/outbound_delivery.md, part 7) -------------------
+
+def _drive(tmp_path, monkeypatch, steps, bot, approve=True):
+    monkeypatch.setattr(outbound.mindlog, "find_trajectory", lambda d: tmp_path / "t.jsonl")
+    monkeypatch.setattr(outbound.mindlog, "follow", lambda *a, **k: iter(steps))
+
+    class Allow:
+        def is_approved(self, user):
+            return approve
+    cfg = Config(
+        serve_root=tmp_path, identity="audel", identity_dir=tmp_path,
+        bot_token="x", admin_id=1, web_url="http://x", state_dir=tmp_path,
+    )
+    outbound.run(cfg, bot, Allow(), threading.Event())
+
+
+def _msg(step_id, to, content="hello"):
+    return {"type": "message", "from": "audel", "to": to, "source": "chat",
+            "content": content, "step_id": step_id}
+
+
+class Bot:
+    def __init__(self, fail=False):
+        self.sent = []
+        self.fail = fail
+
+    def send_message(self, chat, text, html=False):
+        if self.fail:
+            raise ApiError("chat not found")
+        self.sent.append(text)
+
+
+def test_delivered_notice_names_the_message_step(tmp_path, monkeypatch, notices):
+    bot = Bot()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "telegram-1-1", "hi")], bot)
+    assert bot.sent == ["hi"]
+    n = notices[0]
+    assert n["type"] == "delivery" and n["source"] == "telegram-bridge" and n["transport"] == "telegram"
+    assert n["status"] == "delivered" and n["trigger_step"] == "m1" and n["chat"] == "1"
+    assert n["content"] == "delivered to telegram-1-1"
+
+
+def test_send_failure_is_a_failed_notice(tmp_path, monkeypatch, notices):
+    _drive(tmp_path, monkeypatch, [_msg("m1", "telegram-1-1")], Bot(fail=True))
+    assert notices[0]["status"] == "failed" and "chat not found" in notices[0]["reason"]
+
+
+def test_unapproved_and_group_and_malformed_are_failed_notices(tmp_path, monkeypatch, notices):
+    bot = Bot()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "telegram-1-1")], bot, approve=False)
+    _drive(tmp_path, monkeypatch, [_msg("m2", "telegram-1-2"), _msg("m3", "telegram-bogus")], bot)
+    assert bot.sent == []
+    assert [n["trigger_step"] for n in notices] == ["m1", "m2", "m3"]
+    assert "allowlist" in notices[0]["reason"]
+    assert "group" in notices[1]["reason"]
+    assert "unknown telegram address form" in notices[2]["reason"]
+
+
+def test_other_transports_get_no_notice(tmp_path, monkeypatch, notices):
+    bot = Bot()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "slack-U1-C1"), _msg("m2", "pwa-andy")], bot)
+    assert bot.sent == [] and notices == []
+
+
+def test_duplicate_is_a_skipped_notice(tmp_path, monkeypatch, notices):
+    bot = Bot()
+    _drive(tmp_path, monkeypatch, [_msg("m1", "telegram-1-1", "x"), _msg("m2", "telegram-1-1", "x")], bot)
+    assert bot.sent == ["x"]
+    assert [n["status"] for n in notices] == ["delivered", "skipped"]

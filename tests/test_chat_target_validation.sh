@@ -38,6 +38,9 @@ export HOME="$WORK/home"; mkdir -p "$HOME"
 printf 'default_send_from=%s\n' "$ME" > "$WORK/home/.chatrc"
 export CHATRC="$WORK/home/.chatrc"
 printf 'hello\n' > "$WORK/note.txt"
+# This test sends the same text to the same destination on purpose; the
+# repeat refusal (tests/test_chat_sent.sh) is not what it is checking.
+export CHAT_REPEAT_WINDOW=0
 
 messages() { grep -c '"type":"message"' "$TRAJ"; }
 

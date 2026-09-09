@@ -12,10 +12,16 @@ can't be used as a courier out.
 
 from __future__ import annotations
 
+import json
 import logging
-import httpx
+import shutil
+import subprocess
 import threading
 import time
+from pathlib import Path
+from typing import Any
+
+import httpx
 
 from . import mindlog, naming
 from .filepayload import file_payload, file_signature
@@ -27,6 +33,8 @@ from .tgfmt import chunk, strip_leaked_command, to_html
 log = logging.getLogger(__name__)
 
 DUPLICATE_WINDOW_SECONDS = 300
+SOURCE = "telegram-bridge"
+TRANSPORT = "telegram"
 
 
 class RecentPosts:
@@ -46,6 +54,62 @@ class RecentPosts:
             return True
         self._last[conversation] = (text, now)
         return False
+
+
+# --- delivery notices -------------------------------------------------------
+# Copied from headlong_slack.outbound (the bridges are independent uv
+# projects) — keep the step shape in sync. See design/outbound_delivery.md.
+
+def _append_step_via_traj(serve_root: Path, traj_path: Path, step: dict[str, Any]) -> None:
+    """Append a step to the root trajectory through bin/traj, the same lock
+    every other writer uses. The bridge never opens the file for writing."""
+    traj_bin = serve_root / "bin" / "traj"
+    if not traj_bin.is_file():
+        found = shutil.which("traj")
+        if not found:
+            raise FileNotFoundError("bin/traj not found; cannot write delivery notice")
+        traj_bin = Path(found)
+    subprocess.run(
+        [str(traj_bin), "append", "--traj_dir", str(traj_path.parent.parent), traj_path.parent.name[:8]],
+        input=json.dumps(step),
+        text=True,
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+# Tests replace this with a collector; production writes through bin/traj.
+append_step = _append_step_via_traj
+
+
+def _notice(cfg: Config, traj_path: Path, step: dict[str, Any], status: str, **fields: Any) -> None:
+    """One `delivery` step per outbound message: delivered, failed (with the
+    reason), or skipped. trigger_step names the message step. Never raises."""
+    to = str(step.get("to") or "")
+    if status == "delivered":
+        content = f"delivered to {to}"
+    elif status == "skipped":
+        content = f"not sent to {to}: {fields.get('reason', 'skipped')}"
+    else:
+        content = f"not delivered to {to}: {fields.get('reason', 'unknown error')}"
+    record: dict[str, Any] = {
+        "type": "delivery", "source": SOURCE, "transport": TRANSPORT,
+        "status": status, "to": to, "content": content,
+    }
+    if step.get("step_id"):
+        record["trigger_step"] = step["step_id"]
+    for key, value in fields.items():
+        if value is not None and value != "":
+            record[key] = value
+    try:
+        append_step(cfg.serve_root, traj_path, record)
+    except Exception:
+        log.exception("could not write delivery notice for step %s", step.get("step_id"))
+
+
+def _exc_reason(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"[:200]
 
 
 def run(cfg: Config, bot: Bot, allowlist: Allowlist, stop_event: threading.Event) -> None:
@@ -69,7 +133,12 @@ def run(cfg: Config, bot: Bot, allowlist: Allowlist, stop_event: threading.Event
             )
             continue
         to = step.get("to")
+        if not isinstance(to, str) or not to.startswith(naming.PREFIX + "-"):
+            continue  # another transport's message; its bridge owns it
         if not naming.is_telegram_name(to):
+            log.warning("undeliverable address %r on step %s", to, step.get("step_id"))
+            _notice(cfg, traj, step, "failed",
+                    reason="unknown telegram address form; accepted: telegram-<user id>-<chat id>")
             continue
         conv = naming.decode(to)
         if "reaction" in step:
@@ -77,9 +146,11 @@ def run(cfg: Config, bot: Bot, allowlist: Allowlist, stop_event: threading.Event
             continue
         if not allowlist.is_approved(conv.user):
             log.warning("dropping reply to unapproved user %s", conv.user)
+            _notice(cfg, traj, step, "failed", reason="recipient is not on the Telegram allowlist")
             continue
         if conv.user != conv.chat:
             log.warning("dropping reply to group chat %s", conv.chat)
+            _notice(cfg, traj, step, "failed", reason="group chats are not supported; DMs only")
             continue
         payload = file_payload(step)
         if payload is not None:
@@ -89,10 +160,13 @@ def run(cfg: Config, bot: Bot, allowlist: Allowlist, stop_event: threading.Event
             data = payload["content"]
             caption = payload.get("caption")
             sent_file = False
+            reason = ""
             if payload.get("decode_error") or data is None:
+                reason = f"undecodable file payload ({name})"
                 log.error("undecodable file payload for %s (%s)", to, name)
             elif recent.is_duplicate(to, file_signature(name, data)):
                 log.warning("skipping duplicate file post to %s", to)
+                _notice(cfg, traj, step, "skipped", reason="duplicate of a file sent within 5 minutes", filename=name)
                 continue
             else:
                 try:
@@ -109,10 +183,14 @@ def run(cfg: Config, bot: Bot, allowlist: Allowlist, stop_event: threading.Event
                         bot.send_document(conv.chat, data, name, caption=caption)
                         sent_file = True
                     else:
+                        reason = "bot cannot send files"
                         log.error("bot cannot send files for %s", to)
-                except (ApiError, httpx.HTTPError):
+                except (ApiError, httpx.HTTPError) as exc:
+                    reason = _exc_reason(exc)
                     log.exception("file send failed for %s", to)
-            if not sent_file:
+            if sent_file:
+                _notice(cfg, traj, step, "delivered", chat=str(conv.chat), filename=name)
+            else:
                 # Cursor already advanced past this step; tell the user
                 # the upload was lost rather than failing silently.
                 notice = f"(failed to deliver file {name})"
@@ -120,24 +198,41 @@ def run(cfg: Config, bot: Bot, allowlist: Allowlist, stop_event: threading.Event
                     bot.send_message(conv.chat, notice)
                 except (ApiError, httpx.HTTPError):
                     log.exception("delivery-failed notice also failed for %s", to)
+                _notice(cfg, traj, step, "failed", reason=reason, filename=name)
             continue
         text = strip_leaked_command(str(step.get("content") or "")).strip()
         if not text:
             continue
         if recent.is_duplicate(to, text):
             log.warning("skipping duplicate post to %s", to)
+            _notice(cfg, traj, step, "skipped", reason="duplicate of a message sent within 5 minutes")
             continue
+        failure: str | None = None
+        sent_parts = 0
         for part in chunk(text):
             try:
                 bot.send_message(conv.chat, to_html(part), html=True)
+                sent_parts += 1
             except ApiError:
                 # Bad HTML from an odd reply must not eat the message —
                 # fall back to plain text before giving up.
                 try:
                     bot.send_message(conv.chat, part)
-                except ApiError:
+                    sent_parts += 1
+                except (ApiError, httpx.HTTPError) as exc:
+                    failure = _exc_reason(exc)
                     log.exception("sendMessage failed for %s", to)
                     break
+            except httpx.HTTPError as exc:
+                failure = _exc_reason(exc)
+                log.exception("sendMessage failed for %s", to)
+                break
+        if failure is None:
+            _notice(cfg, traj, step, "delivered", chat=str(conv.chat))
+        elif sent_parts:
+            _notice(cfg, traj, step, "failed", reason=f"partly sent, then {failure}", chat=str(conv.chat))
+        else:
+            _notice(cfg, traj, step, "failed", reason=failure)
 
 
 def start(

@@ -45,8 +45,19 @@ run_step() {  # $1 = trigger json, then env overrides
 }
 WAKE='{"type":"monolith-wake","content":"wake","source":"monolith-timer"}'
 
+# Two outbound messages before the first wake: one the bridge confirmed, one
+# it could not deliver (design/outbound_delivery.md, part 5).
+now_ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+printf '{"step_id":"m1","type":"message","from":"testid","to":"slack-C0BMVH6LM4K","content":"papers for today","source":"chat","ts":"%s"}\n' "$now_ts" >> "$TRAJ"
+printf '{"step_id":"d1","type":"delivery","source":"slack-bridge","transport":"slack","trigger_step":"m1","status":"delivered","channel":"C0BMVH6LM4K","ts":"%s"}\n' "$now_ts" >> "$TRAJ"
+printf '{"step_id":"m2","type":"message","from":"testid","to":"slack-nick","content":"lost note","source":"chat","ts":"%s"}\n' "$now_ts" >> "$TRAJ"
+printf '{"step_id":"d2","type":"delivery","source":"slack-bridge","transport":"slack","trigger_step":"m2","status":"failed","reason":"unknown slack address form","ts":"%s"}\n' "$now_ts" >> "$TRAJ"
+
 run_step "$WAKE"
 p=$(cat "$STUB_CAPTURE" 2>/dev/null)
+grep -q '^Sent in the last 24h' <<<"$p" && ok "the sent section is in the wake prompt" || bad "sent section present"
+grep -q 'to slack-C0BMVH6LM4K: delivered "papers for today"' <<<"$p" && ok "a delivered send is listed as delivered" || bad "delivered line" "$(grep 'to slack-' <<<"$p")"
+grep -q 'to slack-nick: FAILED, never arrived (unknown slack address form) "lost note"' <<<"$p" && ok "a failed send is listed with its reason" || bad "failed line" "$(grep 'to slack-' <<<"$p")"
 grep -q '^Related memories' <<<"$p" && ok "the related-memories section is in the wake prompt" || bad "related section present" "$(grep -c . <<<"$p") lines"
 grep -q '^Runtime: headlong [0-9a-f]\{7,\} (' <<<"$p" && ok "the runtime line names the checked-out commit" || bad "runtime line present"
 grep -q '^Workspace: ' <<<"$p" && ok "the workspace section is in the wake prompt" || bad "workspace section present"
@@ -55,7 +66,7 @@ grep -q 'No WORKSPACE.md yet' <<<"$p" && ok "the workspace section invites a WOR
 grep -q 'a1_gh \[fact, ' <<<"$p" && ok "the memory matched to the stream is listed with its type" || bad "matched memory listed"
 grep -q 'GOAL REVIEW (about once a week)' <<<"$p" && ok "the goal-review hint fires on the first wake" || bad "goal review hint fires"
 grep -q '\[todo, ' <<<"$p" && ok "the active-goals section shows the todo with its type" || bad "goals section shows todo"
-[[ "$(jq -r '.related_prev[0]' "$STATE" 2>/dev/null)" == 2026-08-20-00-00-00_a1_gh ]] && ok "the names shown are saved in the state file" || bad "state file has related_prev" "$(cat "$STATE" 2>/dev/null)"
+jq -e '.related_prev | index("2026-08-20-00-00-00_a1_gh")' "$STATE" >/dev/null 2>&1 && ok "the names shown are saved in the state file" || bad "state file has related_prev" "$(cat "$STATE" 2>/dev/null)"
 [[ "$(jq -r '.goal_review_at' "$STATE" 2>/dev/null)" -gt 0 ]] && ok "the goal-review time is saved" || bad "goal_review_at saved"
 
 run_step "$WAKE"
