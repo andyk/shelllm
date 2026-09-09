@@ -970,7 +970,7 @@ for state_path in trajectories/.responses-conversations run/responses-conversati
     else
         bad "chat oracle rejects durable state $state_path" "rc=$probe_rc"
     fi
-    rm -rf "$chat_probe/home/$state_path"
+    rm -rf "${chat_probe:?}/home/${state_path:?}"
 done
 for state_field in format previous response conversation; do
     probe_format=chat; probe_previous=""; probe_response=""; probe_conversation=""
@@ -988,8 +988,8 @@ for state_field in format previous response conversation; do
         bad "chat oracle rejects Responses configuration $state_field" "rc=$probe_rc"
     fi
 done
-PATH="$chat_probe/no-tools" LLM_API_FORMAT=chat LLM_PREVIOUS_RESPONSE_ID= \
-    LLM_RESPONSE_FILE= LLM_RESPONSES_CONVERSATION= \
+PATH="$chat_probe/no-tools" LLM_API_FORMAT=chat LLM_PREVIOUS_RESPONSE_ID='' \
+    LLM_RESPONSE_FILE='' LLM_RESPONSES_CONVERSATION='' \
     /bin/bash "$WORK/check-chat-state" "$chat_probe/run" "$chat_probe/home" "$chat_probe/found" \
     > "$chat_probe/missing-tool.out" 2> "$chat_probe/missing-tool.err"
 probe_rc=$?
